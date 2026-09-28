@@ -1,0 +1,48 @@
+sources:
+  company_careers:
+    enabled: false
+
+  greenhouse:
+    enabled: true
+
+  lever:
+    enabled: true
+
+  ashby:
+    enabled: true
+
+  smartrecruiters:
+    enabled: false
+
+  naukri:
+    enabled: false
+
+  linkedin:
+    enabled: false
+
+  indeed:
+    enabled: false
+
+  internshala:
+    enabled: false
+
+  cutshort:
+    enabled: false
+
+  hirist:
+    enabled: false
+
+  instahyre:
+    enabled: false
+
+  wellfound:
+    enabled: true
+
+  unstop:
+    enabled: false
+
+  telegram:
+    enabled: false
+
+  whatsapp:
+    enabled: false

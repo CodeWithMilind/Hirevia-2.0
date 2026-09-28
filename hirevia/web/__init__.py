@@ -1,0 +1,1 @@
+"""Web Control Panel for Hirevia 2.0"""

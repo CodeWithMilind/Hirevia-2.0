@@ -1,0 +1,71 @@
+roles:
+  - Python Developer
+  - Backend Developer
+  - AI Engineer
+  - ML Engineer
+  - Data Scientist
+  - Software Engineer
+  - Full Stack Developer
+
+locations:
+  - Pune
+  - Mumbai
+  - Bangalore
+  - Hyderabad
+  - Delhi
+  - Remote
+  - India
+  - Work from Home
+
+experience:
+  max_years: 2
+  fresher: true
+
+skills:
+  - Python
+  - FastAPI
+  - Flask
+  - Django
+  - SQL
+  - PostgreSQL
+  - MySQL
+  - MongoDB
+  - Redis
+  - Docker
+  - Kubernetes
+  - AWS
+  - GCP
+  - Azure
+  - Machine Learning
+  - Deep Learning
+  - TensorFlow
+  - PyTorch
+  - Scikit-learn
+  - Pandas
+  - NumPy
+  - Selenium
+  - BeautifulSoup
+  - Requests
+  - AsyncIO
+  - Git
+  - CI/CD
+  - REST API
+  - GraphQL
+
+employment:
+  - full_time
+  - internship
+  - contract
+
+exclude_keywords:
+  - senior
+  - lead
+  - principal
+  - architect
+  - manager
+  - director
+  - vp
+  - head
+  - staff
+  - chief
+  - executive

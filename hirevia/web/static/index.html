@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hirevia 2.0 - Web Control Panel</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-left">
+                <h1>🤖 Hirevia 2.0</h1>
+            </div>
+            <div class="header-center">
+                <span class="status-badge" id="statusBadge">● STOPPED</span>
+            </div>
+            <div class="header-right">
+                <button class="btn btn-primary" id="btnStart" onclick="startScanner()">▶ Start</button>
+                <button class="btn btn-danger" id="btnStop" onclick="stopScanner()" disabled>■ Stop</button>
+                <button class="btn btn-secondary" id="btnScanNow" onclick="triggerScan()" disabled>🔄 Scan Now</button>
+            </div>
+        </header>
+
+        <!-- Stats Cards -->
+        <section class="stats-grid" id="statsGrid">
+            <div class="stat-card">
+                <div class="stat-value" id="statJobsFound">0</div>
+                <div class="stat-label">Jobs Found</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="statNewJobs">0</div>
+                <div class="stat-label">New Jobs</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="statAIMatches">0</div>
+                <div class="stat-label">AI Matches</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="statNotified">0</div>
+                <div class="stat-label">Notified</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="statExpired">0</div>
+                <div class="stat-label">Expired</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="statDuration">0s</div>
+                <div class="stat-label">Last Scan</div>
+            </div>
+        </section>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Left Panel: Status & Sources -->
+            <aside class="sidebar">
+                <!-- System Status -->
+                <section class="panel">
+                    <h2>📊 System Status</h2>
+                    <div class="status-grid">
+                        <div class="status-row">
+                            <span class="status-key">Status</span>
+                            <span class="status-value" id="sysStatus">Stopped</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="status-key">Operation</span>
+                            <span class="status-value" id="sysOperation">Idle</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="status-key">Last Scan</span>
+                            <span class="status-value" id="sysLastScan">—</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="status-key">Next Scan</span>
+                            <span class="status-value" id="sysNextScan">—</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="status-key">Scan Duration</span>
+                            <span class="status-value" id="sysScanDuration">—</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="status-key">Interval</span>
+                            <span class="status-value" id="sysInterval">30 min</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Sources -->
+                <section class="panel">
+                    <h2>🔗 Sources</h2>
+                    <div class="source-list" id="sourceList">
+                        <div class="loading">Loading sources...</div>
+                    </div>
+                </section>
+            </aside>
+
+            <!-- Right Panel: Jobs -->
+            <section class="jobs-panel">
+                <!-- Jobs Header with Search & Filters -->
+                <div class="jobs-header">
+                    <h2>💼 Jobs</h2>
+                    <div class="jobs-toolbar">
+                        <input type="text" class="search-input" id="searchInput" placeholder="Search jobs..." oninput="debounceSearch()">
+                        <div class="filter-group">
+                            <select id="filterSource" onchange="applyFilters()">
+                                <option value="">All Sources</option>
+                            </select>
+                            <select id="filterStatus" onchange="applyFilters()">
+                                <option value="">All Status</option>
+                                <option value="open">Open</option>
+                                <option value="closed">Closed</option>
+                                <option value="unknown">Unknown</option>
+                                <option value="expired">Expired</option>
+                            </select>
+                            <select id="filterMatch" onchange="applyFilters()">
+                                <option value="">All Match</option>
+                                <option value="90">90%+</option>
+                                <option value="70">70%+</option>
+                                <option value="50">50%+</option>
+                            </select>
+                            <select id="filterLocation" onchange="applyFilters()">
+                                <option value="">All Locations</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Jobs List -->
+                <div class="jobs-list" id="jobsList">
+                    <div class="loading">Loading jobs...</div>
+                </div>
+
+                <!-- Pagination -->
+                <div class="pagination" id="pagination">
+                    <button class="btn btn-sm" id="btnPrev" onclick="prevPage()" disabled>← Prev</button>
+                    <span id="pageInfo">Page 1</span>
+                    <button class="btn btn-sm" id="btnNext" onclick="nextPage()" disabled>Next →</button>
+                </div>
+            </section>
+        </main>
+
+        <!-- Activity Panel -->
+        <footer class="activity-panel">
+            <div class="activity-header">
+                <h3>📋 Activity Log</h3>
+                <label class="auto-refresh">
+                    <input type="checkbox" id="autoRefresh" checked> Auto-refresh
+                </label>
+            </div>
+            <div class="activity-list" id="activityList">
+                <div class="loading">Loading activity...</div>
+            </div>
+        </footer>
+    </div>
+
+    <!-- Job Detail Modal -->
+    <div class="modal-overlay" id="jobModal" onclick="closeModal(event)">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3 id="modalTitle">Job Details</h3>
+                <button class="modal-close" onclick="closeModal()">×</button>
+            </div>
+            <div class="modal-body" id="modalBody">
+                <div class="loading">Loading...</div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+                <a class="btn btn-primary" id="modalApply" href="#" target="_blank">Apply Now</a>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

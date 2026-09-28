@@ -1,0 +1,10 @@
+click>=8.1.0
+pydantic>=2.6.0
+pyyaml>=6.0
+httpx>=0.26.0
+openai>=1.10.0
+python-telegram-bot>=20.0
+apscheduler>=3.10.0
+python-dotenv>=1.0.0
+fastapi>=0.110.0
+uvicorn>=0.29.0

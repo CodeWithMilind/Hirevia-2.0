@@ -1,0 +1,42 @@
+name: "Your Name"
+summary: "Python backend developer with experience in FastAPI, SQL, and ML basics. Looking for entry-level backend or AI roles."
+skills:
+  - Python
+  - FastAPI
+  - Flask
+  - SQL
+  - PostgreSQL
+  - Machine Learning
+  - Pandas
+  - NumPy
+  - Git
+  - Docker
+  - REST API
+
+experience_years: 1
+
+preferred_roles:
+  - Python Developer
+  - Backend Developer
+  - AI Engineer
+  - ML Engineer
+  - Data Scientist
+  - Software Engineer
+
+preferred_locations:
+  - Pune
+  - Mumbai
+  - Bangalore
+  - Remote
+  - India
+
+# Optional: specific companies to prioritize or avoid
+preferred_companies: []
+avoid_companies: []
+
+# Optional: salary expectations (annual in INR)
+salary_min: 600000
+salary_max: 2000000
+
+# Optional: notice period in days
+notice_period_days: 30
