@@ -22,6 +22,7 @@ wheels/
 
 # Virtual environments
 .venv/
+.env
 venv/
 env/
 ENV/
@@ -54,3 +55,8 @@ htmlcov/
 # Distribution
 *.tar.gz
 *.whl
+
+# Telegram MTProto session (login state - never commit)
+*.session
+*.session-journal
+sessions/

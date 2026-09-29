@@ -10,6 +10,20 @@ from typing import Any, Dict, List, Optional, Tuple
 from hirevia.core.models import Job, ApplicationStatus, ScanStats
 
 
+# Canonical persisted column order. INSERT/UPDATE columns, placeholders and
+# values are ALL generated from this list - a manual VALUES list drifted once
+# ("25 values for 24 columns") and this structure makes that impossible.
+JOB_COLUMNS = [
+    "id", "source", "source_job_id", "title", "company", "location",
+    "description", "url", "application_url", "posted_at", "detected_at",
+    "deadline", "employment_type", "experience", "skills", "raw_data",
+    "application_status", "fingerprint", "first_seen", "last_seen",
+    "expires_at", "notified_at", "notification_channel", "ai_decision",
+]
+
+# Columns never overwritten on the UPDATE path (identity + lifecycle anchors).
+UPSERT_IMMUTABLE_COLUMNS = {"id", "source", "source_job_id", "first_seen"}
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
@@ -45,7 +59,18 @@ CREATE INDEX IF NOT EXISTS idx_jobs_fingerprint ON jobs(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_jobs_expires_at ON jobs(expires_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(application_status);
 CREATE INDEX IF NOT EXISTS idx_jobs_company_title ON jobs(company, title);
+
+-- Small key/value store so collectors can resume where they stopped even
+-- after a restart (e.g. telegram last message id per channel).
+CREATE TABLE IF NOT EXISTS source_state (
+    source TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (source, key)
+);
 """
+
 
 # Triggers for updated_at
 TRIGGERS = """
@@ -66,7 +91,23 @@ class JobRepository:
         with self._get_conn() as conn:
             conn.executescript(SCHEMA)
             conn.executescript(TRIGGERS)
+            self._migrate_schema(conn)
             conn.commit()
+
+    def _migrate_schema(self, conn: sqlite3.Connection):
+        """Lightweight additive migration: CREATE TABLE IF NOT EXISTS never
+        touches a pre-existing table, so an old DB missing newer columns
+        (e.g. ai_decision) would break INSERTs. Add anything missing."""
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+        for column in JOB_COLUMNS:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
+
+        # Fail fast on any remaining model/schema drift.
+        final = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+        missing = [c for c in JOB_COLUMNS if c not in final]
+        if missing:
+            raise RuntimeError(f"jobs table missing required columns: {missing}")
 
     @contextmanager
     def _get_conn(self):
@@ -105,37 +146,51 @@ class JobRepository:
             ai_decision=json.loads(row["ai_decision"]) if row["ai_decision"] else None,
         )
 
-    def _job_to_row(self, job: Job) -> Tuple:
+    def _job_to_dict(self, job: Job) -> Dict[str, Any]:
+        """Single canonical Job -> column mapping. Every persisted column is
+        keyed by name here, so INSERT/UPDATE arity can never drift again."""
         now = datetime.utcnow().isoformat()
-        return (
-            job.id,
-            job.source,
-            job.source_job_id,
-            job.title,
-            job.company,
-            job.location,
-            job.description,
-            str(job.url),
-            str(job.application_url) if job.application_url else None,
-            job.posted_at.isoformat() if job.posted_at else None,
-            job.detected_at.isoformat() if job.detected_at else now,
-            job.deadline.isoformat() if job.deadline else None,
-            job.employment_type.value if job.employment_type else None,
-            job.experience,
-            json.dumps(job.skills),
-            json.dumps(job.raw_data),
-            job.application_status.value,
-            job.fingerprint,
-            job.first_seen.isoformat() if job.first_seen else now,
-            job.last_seen.isoformat() if job.last_seen else now,
-            job.expires_at.isoformat() if job.expires_at else None,
-            job.notified_at.isoformat() if job.notified_at else None,
-            job.notification_channel,
-            json.dumps(job.ai_decision) if job.ai_decision else None,
-        )
+        return {
+            "id": job.id,
+            "source": job.source,
+            "source_job_id": job.source_job_id,
+            "title": job.title,
+            "company": job.company,
+            "location": job.location,
+            "description": job.description,
+            "url": str(job.url),
+            "application_url": str(job.application_url) if job.application_url else None,
+            "posted_at": job.posted_at.isoformat() if job.posted_at else None,
+            "detected_at": job.detected_at.isoformat() if job.detected_at else now,
+            "deadline": job.deadline.isoformat() if job.deadline else None,
+            "employment_type": job.employment_type.value if job.employment_type else None,
+            "experience": job.experience,
+            "skills": json.dumps(job.skills),
+            "raw_data": json.dumps(job.raw_data),
+            "application_status": job.application_status.value,
+            "fingerprint": job.fingerprint,
+            "first_seen": job.first_seen.isoformat() if job.first_seen else now,
+            "last_seen": job.last_seen.isoformat() if job.last_seen else now,
+            "expires_at": job.expires_at.isoformat() if job.expires_at else None,
+            "notified_at": job.notified_at.isoformat() if job.notified_at else None,
+            "notification_channel": job.notification_channel,
+            "ai_decision": json.dumps(job.ai_decision) if job.ai_decision else None,
+        }
+
+    def _job_to_row(self, job: Job) -> Tuple:
+        values = self._job_to_dict(job)
+        row = tuple(values[col] for col in JOB_COLUMNS)
+        if len(row) != len(JOB_COLUMNS):  # defensive - cannot happen by construction
+            raise ValueError(f"Job row arity mismatch: {len(row)} values / {len(JOB_COLUMNS)} columns")
+        return row
 
     def upsert_job(self, job: Job) -> bool:
-        """Insert or update job. Returns True if newly inserted."""
+        """Insert or update job. Returns True if newly inserted.
+
+        Columns, placeholders and values are all derived from JOB_COLUMNS so
+        the old '25 values for 24 columns' class of bug is structurally
+        impossible now.
+        """
         with self._get_conn() as conn:
             cursor = conn.execute(
                 "SELECT id, first_seen FROM jobs WHERE source = ? AND source_job_id = ?",
@@ -149,24 +204,18 @@ class JobRepository:
                 job.first_seen = datetime.fromisoformat(existing["first_seen"])
                 job.last_seen = datetime.utcnow()
                 if job.expires_at is None:
-                    job.expires_at = job.first_seen.replace(hour=23, minute=59, second=59)
-                    # Add 24 hours from first_seen
                     from datetime import timedelta
                     job.expires_at = job.first_seen + timedelta(hours=24)
 
-                conn.execute(
-                    """
-                    UPDATE jobs SET
-                        title = ?, company = ?, location = ?, description = ?,
-                        url = ?, application_url = ?, posted_at = ?, detected_at = ?,
-                        deadline = ?, employment_type = ?, experience = ?,
-                        skills = ?, raw_data = ?, application_status = ?,
-                        fingerprint = ?, last_seen = ?, expires_at = ?,
-                        notified_at = ?, notification_channel = ?, ai_decision = ?
-                    WHERE id = ?
-                    """,
-                    self._job_to_row(job)[3:18] + self._job_to_row(job)[19:] + (job.id,),
+                values = self._job_to_dict(job)
+                update_cols = [c for c in JOB_COLUMNS if c not in UPSERT_IMMUTABLE_COLUMNS]
+                sql = (
+                    f"UPDATE jobs SET {', '.join(f'{c} = ?' for c in update_cols)} WHERE id = ?"
                 )
+                params = tuple(values[c] for c in update_cols) + (job.id,)
+                if len(params) != len(update_cols) + 1:  # defensive
+                    raise ValueError("Job update arity mismatch")
+                conn.execute(sql, params)
                 conn.commit()
                 return False
             else:
@@ -176,18 +225,11 @@ class JobRepository:
                 from datetime import timedelta
                 job.expires_at = job.first_seen + timedelta(hours=24)
 
-                conn.execute(
-                    """
-                    INSERT INTO jobs (
-                        id, source, source_job_id, title, company, location, description,
-                        url, application_url, posted_at, detected_at, deadline,
-                        employment_type, experience, skills, raw_data,
-                        application_status, fingerprint, first_seen, last_seen,
-                        expires_at, notified_at, notification_channel, ai_decision
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    self._job_to_row(job),
+                sql = (
+                    f"INSERT INTO jobs ({', '.join(JOB_COLUMNS)}) "
+                    f"VALUES ({', '.join('?' for _ in JOB_COLUMNS)})"
                 )
+                conn.execute(sql, self._job_to_row(job))
                 conn.commit()
                 return True
 
@@ -314,6 +356,29 @@ class JobRepository:
                 "SELECT source, COUNT(*) as cnt FROM jobs GROUP BY source"
             )
             return {row["source"]: row["cnt"] for row in cursor.fetchall()}
+
+    def get_source_state(self, source: str, key: str, default: Any = None) -> Any:
+        """Read a persisted collector cursor/value."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM source_state WHERE source = ? AND key = ?",
+                (source, key),
+            ).fetchone()
+            return row["value"] if row else default
+
+    def set_source_state(self, source: str, key: str, value: Any) -> None:
+        """Persist a collector cursor/value (idempotent)."""
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO source_state (source, key, value, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT(source, key) DO UPDATE
+                SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (source, key, None if value is None else str(value)),
+            )
+            conn.commit()
 
     def cleanup_old_jobs(self, days: int = 30) -> int:
         """Remove jobs older than N days that are expired/closed."""

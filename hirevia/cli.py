@@ -1,8 +1,8 @@
 """CLI for Hirevia"""
 
 import asyncio
-import getpass
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -13,6 +13,8 @@ from rich.table import Table
 
 from hirevia.config import Config, load_config, get_nvidia_api_key, get_telegram_token
 from hirevia.core.models import ScanStats
+from hirevia.core.freshness import freshness_label
+from hirevia.core.verification import classify_application_url
 from hirevia.core.pipeline import run_single_scan
 from hirevia.storage.state import JobRepository
 from hirevia.ai.matcher import AIMatcher
@@ -28,6 +30,53 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _resolve_nvidia_key() -> Optional[str]:
+    """Env first (automation friendly), then an interactive prompt."""
+    key = (os.getenv("NVIDIA_API_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        return (get_nvidia_api_key() or "").strip() or None
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def _build_notifier(config: Config, token: Optional[str], chat_id: Optional[str]):
+    """Build a TelegramNotifier from flags/env, prompting only when needed.
+
+    Returns None (with a hint) instead of crashing when credentials are
+    missing: a scan without alerts is still a useful scan.
+    """
+    token = (token or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = (chat_id or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+
+    if not token:
+        try:
+            token = (get_telegram_token() or "").strip()
+        except (EOFError, KeyboardInterrupt):
+            token = ""
+    if not chat_id:
+        try:
+            chat_id = (click.prompt("Telegram chat ID", default=os.getenv("TELEGRAM_CHAT_ID", "")) or "").strip()
+        except (EOFError, KeyboardInterrupt):
+            chat_id = ""
+
+    if not token or not chat_id:
+        console.print(
+            "[yellow]Notifications skipped - provide a bot token and chat id via "
+            "--telegram-token/--chat-id or TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID[/yellow]"
+        )
+        return None
+
+    return TelegramNotifier(
+        token,
+        chat_id,
+        retry_attempts=config.notification_retry_attempts,
+        retry_delay=config.notification_retry_delay_seconds,
+    )
+
+
+
 @click.group()
 @click.version_option(version="2.0.0", prog_name="hirevia")
 def cli():
@@ -39,8 +88,10 @@ def cli():
 @click.option("--db-path", default="hirevia.db", help="SQLite database path")
 @click.option("--interval", default=30, help="Scan interval in minutes")
 @click.option("--no-ai", is_flag=True, help="Run without AI matching")
-@click.option("--no-notify", is_flag=True, help="Run without notifications")
-def start(db_path: str, interval: int, no_ai: bool, no_notify: bool):
+@click.option("--notify/--no-notify", "notify", default=True, help="Send Telegram alerts")
+@click.option("--telegram-token", default=None, help="Telegram bot token (or TELEGRAM_BOT_TOKEN)")
+@click.option("--chat-id", default=None, help="Telegram chat id (or TELEGRAM_CHAT_ID)")
+def start(db_path: str, interval: int, no_ai: bool, notify: bool, telegram_token: str, chat_id: str):
     """Start continuous scanning with notifications."""
     console.print("[bold green]Starting Hirevia 2.0...[/bold green]")
 
@@ -49,73 +100,79 @@ def start(db_path: str, interval: int, no_ai: bool, no_notify: bool):
     config.scan_interval_minutes = interval
 
     # Get API keys at runtime
-    nvidia_key = get_nvidia_api_key()
-    if not nvidia_key:
-        console.print("[red]NVIDIA API key is required[/red]")
-        sys.exit(1)
+    nvidia_key = None if no_ai else _resolve_nvidia_key()
+    if not nvidia_key and not no_ai:
+        console.print("[yellow]No NVIDIA API key - continuing without AI matching[/yellow]")
 
     # Initialize components
     repo = JobRepository(Path(db_path))
-    ai_matcher = None if no_ai else AIMatcher(config, nvidia_key)
-    notifier = None
+    ai_matcher = None if (no_ai or not nvidia_key) else AIMatcher(config, nvidia_key)
+    notifier = _build_notifier(config, telegram_token, chat_id) if notify else None
 
-    if not no_notify:
-        telegram_token = get_telegram_token()
-        if telegram_token:
-            chat_id = click.prompt("Telegram chat ID")
-            notifier = TelegramNotifier(telegram_token, chat_id)
-
-    console.print(f"[green]Configuration loaded[/green]")
+    console.print("[green]Configuration loaded[/green]")
     console.print(f"Enabled sources: {', '.join(config.sources.get_enabled_sources())}")
     console.print(f"Database: {db_path}")
     console.print(f"Scan interval: {interval} minutes")
+    console.print(f"AI matching: {'on (' + config.nvidia_model + ')' if ai_matcher else 'off'}")
+    console.print(f"Notifications: {notifier.name if notifier else 'off'}")
 
     async def run_loop():
-        while True:
-            try:
-                console.print(f"\n[cyan]Starting scan...[/cyan]")
-                stats = await run_single_scan(config, repo, ai_matcher)
+        try:
+            while True:
+                try:
+                    console.print("\n[cyan]Starting scan...[/cyan]")
+                    # The pipeline owns notifications now: it alerts only for
+                    # jobs that passed dedup, filters, AI and link checks.
+                    stats = await run_single_scan(config, repo, ai_matcher, notifier)
+                    _print_stats(stats)
 
-                # Send notifications
-                if notifier and stats.jobs_notified > 0:
-                    # Would need to fetch newly notified jobs
-                    pass
+                    console.print(f"[yellow]Waiting {interval} minutes until next scan...[/yellow]")
+                    await asyncio.sleep(interval * 60)
 
-                _print_stats(stats)
+                except KeyboardInterrupt:
+                    console.print("\n[red]Stopping...[/red]")
+                    break
+                except Exception as e:
+                    logger.error(f"Scan loop error: {e}")
+                    console.print(f"[red]Error: {e}[/red]")
+                    await asyncio.sleep(60)
+        finally:
+            if notifier:
+                await notifier.close()
 
-                console.print(f"[yellow]Waiting {interval} minutes until next scan...[/yellow]")
-                await asyncio.sleep(interval * 60)
+    asyncio.run(run_loop())
 
-            except KeyboardInterrupt:
-                console.print("\n[red]Stopping...[/red]")
-                break
-            except Exception as e:
-                logger.error(f"Scan loop error: {e}")
-                console.print(f"[red]Error: {e}[/red]")
-                await asyncio.sleep(60)
-
-    try:
-        asyncio.run(run_loop())
-    finally:
-        if notifier:
-            asyncio.run(notifier.close())
 
 
 @cli.command()
 @click.option("--db-path", default="hirevia.db", help="SQLite database path")
 @click.option("--no-ai", is_flag=True, help="Run without AI matching")
-def scan(db_path: str, no_ai: bool):
+@click.option("--notify/--no-notify", "notify", default=False, help="Also send Telegram alerts")
+@click.option("--telegram-token", default=None, help="Telegram bot token (or TELEGRAM_BOT_TOKEN)")
+@click.option("--chat-id", default=None, help="Telegram chat id (or TELEGRAM_CHAT_ID)")
+def scan(db_path: str, no_ai: bool, notify: bool, telegram_token: str, chat_id: str):
     """Run a single scan cycle."""
     console.print("[bold]Running single scan...[/bold]")
 
     config = load_config()
-    nvidia_key = None if no_ai else get_nvidia_api_key()
+    nvidia_key = None if no_ai else _resolve_nvidia_key()
+    if not nvidia_key and not no_ai:
+        console.print("[yellow]No NVIDIA API key - running without AI matching[/yellow]")
 
     repo = JobRepository(Path(db_path))
-    ai_matcher = None if no_ai or not nvidia_key else AIMatcher(config, nvidia_key)
+    ai_matcher = None if (no_ai or not nvidia_key) else AIMatcher(config, nvidia_key)
+    notifier = _build_notifier(config, telegram_token, chat_id) if notify else None
 
-    stats = asyncio.run(run_single_scan(config, repo, ai_matcher))
+    async def _run():
+        try:
+            return await run_single_scan(config, repo, ai_matcher, notifier)
+        finally:
+            if notifier:
+                await notifier.close()
+
+    stats = asyncio.run(_run())
     _print_stats(stats)
+
 
 
 @cli.command()
@@ -179,6 +236,8 @@ def status(db_path: str, limit: int):
     table.add_column("Location", style="yellow", max_width=15)
     table.add_column("Source", style="blue", max_width=12)
     table.add_column("Status", style="magenta", max_width=10)
+    table.add_column("Fresh", style="white", max_width=12)
+    table.add_column("Link", style="white", max_width=11)
     table.add_column("AI Score", style="white", max_width=8)
 
     for job in jobs:
@@ -186,12 +245,23 @@ def status(db_path: str, limit: int):
         if job.ai_decision:
             ai_score = f"{job.ai_decision.get('match_score', 0)}%"
 
+        # Freshness + link verdict are computed during the scan and stored on
+        # the job; fall back to recomputing for rows written by older versions.
+        fresh = job.raw_data.get("freshness_label") or freshness_label(
+            job.posted_at or job.first_seen or job.detected_at
+        )
+        link = job.raw_data.get("application_url_quality") or classify_application_url(
+            str(job.application_url) if job.application_url else None
+        ).quality
+
         table.add_row(
             job.title[:30],
             job.company[:20],
             job.location[:15],
             job.source[:12],
             job.application_status.value,
+            fresh,
+            link,
             ai_score,
         )
 
@@ -264,6 +334,63 @@ def test():
     console.print("\n[bold green]All tests passed![/bold green]")
 
 
+@cli.command(name="telegram-login")
+def telegram_login():
+    """One-time Telegram login for the community collector (MTProto).
+
+    Asks for phone + OTP once and stores a local session file, so scans never
+    prompt again. The collector only READS the public channels listed in
+    telegram.yaml - job alerts still go out over the separate Bot API.
+    """
+    from hirevia.sources.telegram_config import load_telegram_credentials, load_telegram_settings
+
+    try:
+        from telethon import TelegramClient
+        from telethon.errors import SessionPasswordNeededError
+    except ImportError:
+        console.print("[red]Telethon is not installed - run: pip install telethon[/red]")
+        sys.exit(1)
+
+    credentials = load_telegram_credentials()
+    if credentials is None:
+        console.print("[red]Set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env first[/red]")
+        console.print("[dim]Free keys: my.telegram.org -> API development tools[/dim]")
+        sys.exit(1)
+
+    credentials.session_path.parent.mkdir(parents=True, exist_ok=True)
+    console.print(f"[dim]Session file: {credentials.session_path} (private - never commit it)[/dim]")
+
+    async def _login():
+        client = TelegramClient(
+            str(credentials.session_path), credentials.api_id, credentials.api_hash
+        )
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                console.print(f"[green]Already logged in[/green] as {me.first_name or me.username or 'user'}")
+            else:
+                phone = click.prompt("Phone number (international format, e.g. +91XXXXXXXXXX)")
+                await client.send_code_request(phone)
+                code = click.prompt("Login code (OTP from Telegram)", hide_input=True)
+                try:
+                    await client.sign_in(phone=phone, code=code.strip())
+                except SessionPasswordNeededError:
+                    password = click.prompt("2FA password", hide_input=True)
+                    await client.sign_in(password=password)
+                me = await client.get_me()
+                console.print(f"[green]Logged in[/green] as {me.first_name or me.username or 'user'}")
+
+            channels = load_telegram_settings().get_enabled_channels()
+            console.print(
+                f"Collector will monitor [bold]{len(channels)}[/bold] channel(s) from telegram.yaml"
+            )
+        finally:
+            await client.disconnect()
+
+    asyncio.run(_login())
+
+
 @cli.command()
 def version():
     """Show version."""
@@ -277,14 +404,26 @@ def _print_stats(stats: ScanStats):
     table.add_column("Count", style="green")
 
     table.add_row("Sources Scanned", str(stats.sources_scanned))
+    table.add_row("Messages Checked", str(stats.messages_checked))
+    table.add_row("Jobs Detected", str(stats.jobs_detected))
+    table.add_row("Jobs Normalized", str(stats.jobs_normalized))
     table.add_row("Jobs Found", str(stats.jobs_found))
     table.add_row("New Jobs", str(stats.jobs_new))
     table.add_row("Duplicates", str(stats.jobs_duplicate))
     table.add_row("Filtered", str(stats.jobs_filtered))
     table.add_row("AI Matched", str(stats.jobs_ai_matched))
+    table.add_row("AI Rejected", str(stats.jobs_ai_rejected))
+    if stats.ai_failures:
+        table.add_row("[yellow]AI Failures (degraded)[/yellow]", str(stats.ai_failures))
     table.add_row("Verified Open", str(stats.jobs_verified))
+    table.add_row("Link Unusable", str(stats.jobs_link_rejected))
+    table.add_row("Verification Unknown", str(stats.jobs_unverified))
+    table.add_row("Application Closed", str(stats.jobs_closed))
     table.add_row("Notified", str(stats.jobs_notified))
+    table.add_row("Alerts Suppressed", str(stats.jobs_skipped_notification))
     table.add_row("Expired", str(stats.jobs_expired))
+    if stats.jobs_failed:
+        table.add_row("[red]Failed Jobs[/red]", str(stats.jobs_failed))
     table.add_row("Duration", f"{stats.duration_seconds:.1f}s")
 
     console.print(table)

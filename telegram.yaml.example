@@ -1,0 +1,14 @@
+# Copy to telegram.yaml in the project root, then list the PUBLIC job
+# communities Hirevia should monitor. Credentials stay in .env.
+
+telegram:
+  enabled: true
+
+  channels:
+    - username: example_job_channel
+      enabled: true
+      lookback_hours: 24
+      max_messages: 100
+
+    - username: another_job_channel
+      enabled: true

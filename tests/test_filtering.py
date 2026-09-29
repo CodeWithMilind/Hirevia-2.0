@@ -146,5 +146,59 @@ def test_no_positive_signal_fails():
     assert not result.passed
 
 
+def test_empty_criteria_accepts_everything():
+    """No filters.yaml (all lists blank) must NOT swallow the whole pipeline."""
+    job = make_job(title="Java Architect", location="Delhi",
+                   description="Java Spring Hibernate, 5 years experience")
+    result = apply_filters(job, FilterConfig())
+    assert result.passed
+    assert "No filter criteria configured" in result.reason
+
+
+def test_partial_criteria_still_veto():
+    """An unset criterion is 'any', a configured one still has to match."""
+    job = make_job(title="Java Architect", location="Delhi",
+                   description="Java Spring Hibernate, 5 years experience")
+    result = apply_filters(job, FilterConfig(roles=["Python Developer"]))
+    assert not result.passed
+    assert "No matching role, location or skill" in result.reason
+def test_employment_type_unknown_is_not_a_veto():
+    """Telegram posts rarely say \"Full time\" - silence must not drop the job."""
+    job = make_job(employment_type=None,
+                   description="Python FastAPI SQL, 1 year experience required")
+    result = apply_filters(job, make_config(employment=["full_time"]))
+    assert result.passed
+
+
+def test_employment_type_known_and_unwanted_still_vetoes():
+    job = make_job(title="Java Developer", location="Pune",
+                   description="Java Spring Hibernate, 1 year experience",
+                   employment_type="part_time")
+    result = apply_filters(job, make_config(employment=["full_time"]))
+    assert not result.passed
+
+
+def test_exclude_keywords_match_whole_words_only():
+    """\"lead\" vetoes the word \"lead\", not \"leading\"/\"leadership\"/\"blacklead\"."""
+    job = make_job(title="Backend Developer",
+                   description="Python FastAPI, you will be leading a small team and show "
+                               "leadership, 1 year experience")
+    result = apply_filters(job, make_config(exclude_keywords=["lead", "senior"]))
+    assert result.passed
+
+
+def test_exclude_keywords_still_catch_the_real_thing():
+    """A bare exclude keyword in the title still vetoes the job."""
+    job = make_job(title="Lead Backend Developer",
+                   description="Python FastAPI, 1 year experience")
+    result = apply_filters(job, make_config(exclude_keywords=["lead", "senior"]))
+    assert not result.passed
+    assert "lead" in result.matched["excluded"]
+
+
+
+
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -25,7 +25,13 @@ def extract_years_experience(text: str) -> Optional[int]:
 
 
 def check_roles(job: Job, roles: List[str]) -> tuple[bool, List[str]]:
-    """Check if job title matches any desired role."""
+    """Check if job title matches any desired role.
+
+    An empty list means "no role preference configured", which must pass:
+    otherwise a missing/blank filters.yaml silently drops every single job.
+    """
+    if not roles:
+        return True, []
     title_lower = job.title.lower()
     matched = []
     for role in roles:
@@ -35,7 +41,9 @@ def check_roles(job: Job, roles: List[str]) -> tuple[bool, List[str]]:
 
 
 def check_locations(job: Job, locations: List[str]) -> tuple[bool, List[str]]:
-    """Check if job location matches any desired location."""
+    """Check if job location matches any desired location (empty = any)."""
+    if not locations:
+        return True, []
     location_lower = job.location.lower()
     matched = []
     for loc in locations:
@@ -77,7 +85,9 @@ def check_experience(job: Job, exp_config: Dict) -> tuple[bool, Dict]:
 
 
 def check_skills(job: Job, skills: List[str]) -> tuple[bool, List[str]]:
-    """Check if job description contains desired skills."""
+    """Check if job description contains desired skills (empty = any)."""
+    if not skills:
+        return True, []
     text = (job.title + " " + job.description + " " + " ".join(job.skills)).lower()
     matched = []
     for skill in skills:
@@ -107,15 +117,38 @@ def check_employment(job: Job, employment_types: List[str]) -> tuple[bool, List[
         if emp_lower in job_type or emp_lower in text:
             matched.append(emp)
 
-    return len(matched) > 0, matched
+    if matched:
+        return True, matched
+    if not job_type:
+        # The post never stated a contract type (typical for a Telegram alert).
+        # Silence is not a mismatch - vetoing here would drop real jobs simply
+        # because the collector could not read "Full time" out of the message.
+        return True, []
+    return False, []
+
+
+_EXCLUDE_CACHE: Dict[str, "re.Pattern"] = {}
+
+
+def _exclude_pattern(keyword: str) -> "re.Pattern":
+    """Whole-word matcher so 'lead' cannot veto 'leading' or 'leadership'.
+
+    A trailing 's' is allowed, so 'senior' still matches 'seniors'. Matching is
+    deliberately whole-word: substring matching made filters like 'lead' veto
+    every posting that merely mentioned leading or blacklead.
+    """
+    key = keyword.lower().strip()
+    if key not in _EXCLUDE_CACHE:
+        _EXCLUDE_CACHE[key] = re.compile(r"\b" + re.escape(key) + r"s?\b")
+    return _EXCLUDE_CACHE[key]
 
 
 def check_excludes(job: Job, exclude_keywords: List[str]) -> tuple[bool, List[str]]:
-    """Check if job contains excluded keywords."""
+    """Check if job contains excluded keywords (whole-word, case-insensitive)."""
     text = (job.title + " " + job.description).lower()
     matched = []
     for kw in exclude_keywords:
-        if kw.lower() in text:
+        if _exclude_pattern(kw).search(text):
             matched.append(kw)
     return len(matched) == 0, matched
 
@@ -123,7 +156,6 @@ def check_excludes(job: Job, exclude_keywords: List[str]) -> tuple[bool, List[st
 def apply_filters(job: Job, config: FilterConfig) -> FilterResult:
     """Apply all deterministic filters."""
     all_matched = {}
-    reasons = []
 
     # Check excludes first (fast fail)
     exclude_passed, exclude_matched = check_excludes(job, config.exclude_keywords)
@@ -134,44 +166,68 @@ def apply_filters(job: Job, config: FilterConfig) -> FilterResult:
             reason=f"Excluded keywords found: {', '.join(exclude_matched)}",
         )
 
+    # Positive signals: what makes this job one the candidate cares about.
+    signals = []
+
     # Check roles
     roles_passed, roles_matched = check_roles(job, config.roles)
     if roles_matched:
         all_matched["roles"] = roles_matched
-        reasons.append(f"Role match: {', '.join(roles_matched)}")
+        signals.append(f"Role match: {', '.join(roles_matched)}")
 
     # Check locations
     loc_passed, loc_matched = check_locations(job, config.locations)
     if loc_matched:
         all_matched["locations"] = loc_matched
-        reasons.append(f"Location match: {', '.join(loc_matched)}")
-
-    # Check experience
-    exp_passed, exp_info = check_experience(job, config.experience)
-    all_matched["experience"] = exp_info
-    if exp_passed and exp_info.get("detected_years") is not None:
-        reasons.append(f"Experience: {exp_info['detected_years']} years (max {exp_info['max_allowed']})")
-    elif exp_passed and exp_info.get("fresher_ok"):
-        reasons.append("Fresher/entry-level eligible")
+        signals.append(f"Location match: {', '.join(loc_matched)}")
 
     # Check skills
     skills_passed, skills_matched = check_skills(job, config.skills)
     if skills_matched:
         all_matched["skills"] = skills_matched
-        reasons.append(f"Skills match: {', '.join(skills_matched[:5])}{'...' if len(skills_matched) > 5 else ''}")
+        signals.append(
+            f"Skills match: {', '.join(skills_matched[:5])}{'...' if len(skills_matched) > 5 else ''}"
+        )
+
+    # Qualification checks: these can only veto, they never signal interest.
+    details = []
+
+    # Check experience
+    exp_passed, exp_info = check_experience(job, config.experience)
+    all_matched["experience"] = exp_info
+    if exp_passed and exp_info.get("detected_years") is not None:
+        details.append(f"Experience: {exp_info['detected_years']} years (max {exp_info['max_allowed']})")
+    elif exp_passed and exp_info.get("fresher_ok"):
+        details.append("Fresher/entry-level eligible")
 
     # Check employment
     emp_passed, emp_matched = check_employment(job, config.employment)
     if emp_matched:
         all_matched["employment"] = emp_matched
-        reasons.append(f"Employment type: {', '.join(emp_matched)}")
+        details.append(f"Employment type: {', '.join(emp_matched)}")
 
-    # Overall pass: must pass roles OR locations OR skills (at least one positive signal)
-    # AND must pass experience AND employment
-    positive_signal = roles_passed or loc_passed or skills_passed
+    # At least one *configured* positive criterion must fire (OR between roles,
+    # locations and skills, as before). A criterion with no entries is "any":
+    # it neither signals interest nor vetoes, so a blank filters.yaml accepts
+    # everything instead of silently dropping every job.
+    configured = [
+        ok for ok, wanted in (
+            (roles_passed, config.roles),
+            (loc_passed, config.locations),
+            (skills_passed, config.skills),
+        ) if wanted
+    ]
+    positive_signal = any(configured) if configured else True
     passed = positive_signal and exp_passed and emp_passed
 
-    reason = "; ".join(reasons) if reasons else "No matching criteria"
+    if signals:
+        reason = "; ".join(signals + details)
+    elif not configured:
+        reason = "No filter criteria configured - accepting everything" + (
+            f" ({'; '.join(details)})" if details else ""
+        )
+    else:
+        reason = "No matching role, location or skill"
 
     return FilterResult(
         passed=passed,

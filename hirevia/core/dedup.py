@@ -27,6 +27,23 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+_LEGAL_SUFFIXES = {
+    "pvt", "pvt.", "private", "ltd", "ltd.", "limited", "llp", "inc", "inc.",
+    "corp", "corp.", "corporation", "co", "co.", "company", "the",
+}
+
+
+def normalize_company(text: str) -> str:
+    """Normalize a company name for identity: lowercase, strip punctuation and
+    trailing legal suffixes, so 'Acme Pvt Ltd' and 'Acme Private Limited'
+    collapse to the same identity across reposts/channels."""
+    text = normalize_text(text)
+    words = text.split()
+    while len(words) > 1 and words[-1] in _LEGAL_SUFFIXES:
+        words.pop()
+    return " ".join(words)
+
+
 def compute_fingerprint(job: Job) -> str:
     """Compute deterministic fingerprint for deduplication."""
     parts = []
@@ -40,7 +57,7 @@ def compute_fingerprint(job: Job) -> str:
         parts.append(f"app:{normalize_url(str(job.application_url))}")
 
     # 3. Company + normalized title + normalized location
-    company_norm = normalize_text(job.company)
+    company_norm = normalize_company(job.company)
     title_norm = normalize_text(job.title)
     location_norm = normalize_text(job.location)
     parts.append(f"ctl:{company_norm}|{title_norm}|{location_norm}")

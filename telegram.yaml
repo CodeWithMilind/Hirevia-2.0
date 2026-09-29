@@ -1,0 +1,67 @@
+# # Hirevia - Telegram job-community monitoring
+# # Separation of concerns:
+# #   * Channel list lives HERE (no Python edits needed to add a community).
+# #   * Credentials live in .env (TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_SESSION_NAME)
+# #     and are NEVER stored in this file.
+# #
+# # Only PUBLIC channels/groups you are permitted to read.
+# # After editing this file, restart the scanner (or wait for the next scan -
+# # telegram.yaml is re-read on every scan).
+
+# telegram:
+#   enabled: true
+
+#   channels: []
+#     # - username: iimjobs              # accepts "name", "@name" or "https://t.me/name"
+#     #   enabled: true
+#     #   lookback_hours: 24             # first-run window; later scans read only new messages
+#     #   max_messages: 100              # per-scan safety cap
+
+
+# ------------------------------------------------------------------
+
+telegram:
+  enabled: true
+
+  defaults:
+    enabled: true
+    lookback_hours: 24
+    max_messages: 100
+
+  channels:
+    - username: AiIndiaJobs
+    - username: codinghelpdesk
+    - username: datasciencefree
+    - username: datasciencefun
+    - username: dot_aware
+    - username: engineerjobsindia
+    - username: fresher_offcampus_drives
+    - username: freshercareersdotin
+    - username: Fresherjobsadda
+    - username: fresheroffcampus
+    - username: freshershunt
+    - username: getjobss
+    - username: gocareers
+    - username: HireMeFresh
+    - username: hiringdaily
+    - username: internseeker
+    - username: Internshipsworld
+    - username: internshiptojobs
+    - username: job4fresherss
+    - username: jobbytesdaily
+    - username: jobs4fresherdotcom
+    - username: jobseekeras
+    - username: jobsvacancynew
+    - username: machinelearning_deeplearning
+    - username: notificaJobs_AI_MachineLearning
+    - username: off_campus_jobs_and_internships
+    - username: offcampus_phodenge
+    - username: offcampusjobsindia_IT
+    - username: placementdriveofficial
+    - username: placementkit
+    - username: PLACEMENTLELO
+    - username: Remote_Software_Developer_Jobs
+    - username: seekeras
+    - username: UrExamBuddy
+    - username: walkindrive
+    - username: way2freshers

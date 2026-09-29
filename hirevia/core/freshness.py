@@ -5,10 +5,48 @@ from typing import Optional
 
 from hirevia.core.models import Job, ApplicationStatus
 
+# Canonical freshness ladder - single source of truth for every stage
+# (collector stamps it into raw_data["freshness_label"], notification shows it).
+FRESHNESS_LABELS = ("very_fresh", "fresh", "recent", "older", "low_freshness")
+
+# Upper bound of each bucket in hours (low_freshness is the overflow bucket).
+FRESHNESS_BUCKETS_HOURS = (1, 6, 24, 72)
+
 
 def calculate_expiry(first_seen: datetime, hours: int = 24) -> datetime:
     """Calculate expiry time from first_seen."""
     return first_seen + timedelta(hours=hours)
+
+
+def freshness_label(posted_at: Optional[datetime], now: Optional[datetime] = None) -> str:
+    """Label a post's age: very_fresh / fresh / recent / older / low_freshness.
+
+    Accepts naive-UTC or aware datetimes (aware inputs are normalised to naive
+    UTC first, matching how Job.posted_at is stored).
+    """
+    if posted_at is None:
+        return "low_freshness"
+    if now is None:
+        now = datetime.utcnow()
+    if posted_at.tzinfo is not None:
+        from datetime import timezone
+
+        posted_at = posted_at.astimezone(timezone.utc).replace(tzinfo=None)
+    if now.tzinfo is not None:
+        from datetime import timezone
+
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+
+    age_hours = (now - posted_at).total_seconds() / 3600
+    if age_hours < 0:  # clock skew / future-dated message
+        return "very_fresh"
+    for label, bound in zip(FRESHNESS_LABELS, FRESHNESS_BUCKETS_HOURS):
+        if age_hours < bound:
+            return label
+    if age_hours <= FRESHNESS_BUCKETS_HOURS[-1]:
+        return "older"
+    return FRESHNESS_LABELS[-1]
+
 
 
 def is_expired(job: Job, now: Optional[datetime] = None) -> bool:
