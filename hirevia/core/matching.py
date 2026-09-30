@@ -353,7 +353,8 @@ class MatchEvidence:
 
     @property
     def score(self) -> int:
-        return int(round(sum(signal["score"] for signal in self.signals.values())))
+        total = int(round(sum(signal["score"] for signal in self.signals.values())))
+        return max(0, min(100, total))
 
     @property
     def strongest_note(self) -> str:

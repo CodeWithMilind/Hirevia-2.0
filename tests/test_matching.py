@@ -13,6 +13,7 @@ The tests here pin the scoring CONTRACT, not incidental numbers:
 """
 
 import pytest
+from pydantic import ValidationError
 
 from hirevia.core.matching import WEIGHTS, analyze, combine, match_job, parse_experience
 from hirevia.core.models import (
@@ -262,6 +263,91 @@ def test_ai_contributes_only_a_bounded_share():
     assert result.deterministic_score < result.match_score <= 100
     expected = round(evidence.score * 0.6 + 100 * 0.4)
     assert result.match_score == expected
+
+
+def test_strong_deterministic_match_is_reduced_by_a_weak_ai_verdict():
+    evidence = analyze(make_job(), make_profile())
+    ai = AIResponse(relevant=False, priority=Priority.P3, match_score=20, reason="weak fit")
+
+    result = combine(evidence, None, ai)
+
+    expected = round(evidence.score * 0.6 + 20 * 0.4) - 12
+    assert evidence.score >= 80
+    assert result.match_score == expected
+    assert result.match is False
+    assert result.priority is Priority.P3
+
+
+def test_weak_deterministic_match_is_not_rescued_by_a_strong_ai_verdict():
+    evidence = analyze(
+        make_job(title="Sales Executive", location="Mumbai", description="Sales role."),
+        make_profile(),
+    )
+    ai = AIResponse(relevant=True, priority=Priority.P1, match_score=100, reason="strong fit")
+
+    result = combine(evidence, None, ai)
+
+    assert evidence.score < 30
+    assert result.match_score == round(evidence.score * 0.6 + 100 * 0.4)
+    assert result.match is False
+    assert result.priority is Priority.P3
+
+
+@pytest.mark.parametrize(
+    "job_overrides",
+    [
+        {"description": "Python FastAPI. Requires 7+ years of experience."},
+        {"title": "Senior Python Developer"},
+    ],
+    ids=["experience", "seniority"],
+)
+def test_hard_veto_overrides_a_perfect_ai_verdict(job_overrides):
+    evidence = analyze(make_job(**job_overrides), make_profile())
+    ai = AIResponse(relevant=True, priority=Priority.P1, match_score=100, reason="perfect fit")
+
+    result = combine(evidence, None, ai)
+
+    assert result.hard_reject is True
+    assert result.reject_reasons == evidence.reject_reasons
+    assert result.match is False
+    assert result.match_score <= 40
+    assert result.priority is Priority.P3
+
+
+def test_deterministic_and_hybrid_scores_are_bounded():
+    evidence = analyze(make_job(), make_profile())
+    evidence.signals["external"] = {"score": 150, "note": "synthetic oversized signal"}
+    ai = AIResponse(relevant=True, priority=Priority.P1, match_score=100, reason="strong fit")
+
+    result = combine(evidence, None, ai)
+
+    assert evidence.score == 100
+    assert result.deterministic_score == 100
+    assert result.ai_score == 100
+    assert 0 <= result.match_score <= 100
+
+
+@pytest.mark.parametrize(
+    "score_fields",
+    [{"ai_score": 101}, {"ai_score": -1}, {"deterministic_score": 101},
+     {"deterministic_score": -1}],
+)
+def test_match_result_rejects_out_of_range_source_scores(score_fields):
+    with pytest.raises(ValidationError):
+        MatchResult(**score_fields)
+
+
+def test_missing_skills_remain_visible_without_becoming_a_hard_veto():
+    profile = make_profile(skills=["Python", "FastAPI", "SQL"])
+    evidence = analyze(make_job(description="Python role. 0-1 years."), profile)
+
+    result = combine(evidence, None, AIResponse(
+        relevant=True, priority=Priority.P2, match_score=70, reason="partial fit"
+    ))
+
+    assert "FastAPI" in result.missing_skills
+    assert "SQL" in result.missing_skills
+    assert result.hard_reject is False
 
 
 def test_over_confident_model_cannot_manufacture_relevance():

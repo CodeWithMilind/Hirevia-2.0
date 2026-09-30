@@ -35,6 +35,10 @@ class AITimeoutError(AIError):
     """Request timed out / connection dropped - worth one retry."""
 
 
+class AIServerError(AIError):
+    """The server failed temporarily - worth one retry."""
+
+
 class AIInvalidResponseError(AIError):
     """The model answered, but not with usable JSON."""
 
@@ -64,6 +68,8 @@ def classify_api_error(error: Exception) -> AIError:
         return AIAuthError(f"AI authentication failed - check NVIDIA_API_KEY: {message[:150]}")
     if "timeout" in lowered or "timed out" in lowered:
         return AITimeoutError(f"AI request timed out: {message[:180]}")
+    if isinstance(status, int) and 500 <= status < 600:
+        return AIServerError(f"AI server error: {message[:180]}")
     if status == 404 or any(hint in lowered for hint in _MODEL_UNAVAILABLE_HINTS):
         return AIModelUnavailableError(
             f"configured AI model is unavailable - set NVIDIA_MODEL in .env ({message[:180]})"
@@ -204,7 +210,7 @@ class NVIDIAClient:
                     await asyncio.sleep(max(e.retry_after, 2.0 * (attempt + 1)))
                     continue
                 raise
-            except AITimeoutError as e:
+            except (AITimeoutError, AIServerError) as e:
                 last_error = e
                 if attempt < attempts - 1:
                     await asyncio.sleep(1.5 * (attempt + 1))

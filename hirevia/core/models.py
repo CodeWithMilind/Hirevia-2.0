@@ -403,10 +403,10 @@ class MatchResult(BaseModel):
     # Traceability: which model answered, and what it answered with.
     ai_status: str = "skipped"            # ok | failed | skipped
     ai_model: Optional[str] = None
-    ai_score: Optional[int] = None
+    ai_score: Optional[int] = Field(default=None, ge=0, le=100)
     ai_priority: Optional[Priority] = None
     ai_error: Optional[str] = None
-    deterministic_score: int = 0
+    deterministic_score: int = Field(default=0, ge=0, le=100)
     # Per-signal breakdown (0-1 scores + notes) for explainability/dashboard.
     signals: Dict[str, Any] = Field(default_factory=dict)
 

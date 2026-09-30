@@ -37,6 +37,7 @@ from hirevia.ai.client import (
     AIInvalidResponseError,
     AIModelUnavailableError,
     AIRateLimitError,
+    AIServerError,
     AITimeoutError,
     NVIDIAClient,
     classify_api_error,
@@ -371,17 +372,39 @@ def test_timeout_that_recovers_on_the_second_try_yields_a_real_verdict(sleep_log
 
 
 @pytest.mark.parametrize("status", [500, 502, 503])
-def test_server_error_surfaces_as_a_typed_error_without_retrying(status):
+def test_server_error_is_typed_as_transient(status):
     error = classify_api_error(http_error(status, "Internal server error"))
 
-    assert isinstance(error, AIError)
-    assert not isinstance(error, (AIModelUnavailableError, AIRateLimitError,
-                                  AIAuthError, AITimeoutError))
-    assert "AI request failed" in str(error)
+    assert isinstance(error, AIServerError)
+    assert "AI server error" in str(error)
 
-    matcher, fake = make_matcher(http_error(status, "Internal server error"))
+
+@pytest.mark.parametrize("message", ["Service Unavailable", "gateway unavailable"])
+def test_http_503_unavailable_wording_remains_a_server_error(message):
+    error = classify_api_error(http_error(503, message))
+
+    assert isinstance(error, AIServerError)
+    assert not isinstance(error, AIModelUnavailableError)
+
+
+def test_transient_server_error_retries_with_timeout_backoff_then_recovers(sleep_log):
+    matcher, fake = make_matcher(
+        http_error(503, "Service Unavailable"), completion(VALID_JSON)
+    )
+
     response = ask(matcher)
-    assert response.degraded is True and len(fake.calls) == 1
+
+    assert response.degraded is False and response.match_score == 82
+    assert len(fake.calls) == 2
+    assert sleep_log == [1.5]
+
+
+def test_server_error_retries_once_when_the_outage_persists(sleep_log):
+    matcher, fake = make_matcher(http_error(503, "Service Unavailable"))
+    response = ask(matcher)
+
+    assert response.degraded is True and len(fake.calls) == 2
+    assert sleep_log == [1.5]
 
 
 def test_unclassified_transport_exception_still_degrades_the_verdict():
