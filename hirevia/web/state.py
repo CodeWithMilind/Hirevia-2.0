@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,7 @@ from hirevia.core.models import Job, ScanStats, ApplicationStatus
 from hirevia.core.pipeline import Pipeline, run_single_scan
 from hirevia.storage.state import JobRepository
 from hirevia.ai.matcher import AIMatcher
+from hirevia.ai.providers import provider_status
 from hirevia.notifications.telegram import TelegramNotifier
 # NOTE: hirevia.web.api.models is imported inside the methods that need it.
 # hirevia.web.api's __init__ imports routes, which imports this module - a
@@ -124,9 +126,9 @@ class WebUIState:
             self.add_activity("Scanner already running", "warning")
             return False
         
-        # Initialize AI matcher if key provided
-        if nvidia_key:
-            self.ai_matcher = AIMatcher(self.config, nvidia_key)
+        # Provider credentials are read from environment variables only.
+        if any(provider["configured"] for provider in provider_status(self.config)):
+            self.ai_matcher = AIMatcher(self.config, os.getenv("NVIDIA_API_KEY"))
         
         # Initialize Telegram notifier if credentials provided
         if telegram_token and telegram_chat_id:

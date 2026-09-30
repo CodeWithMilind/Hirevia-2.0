@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field
@@ -48,9 +48,50 @@ class FilterConfig(BaseModel):
     exclude_keywords: list[str] = Field(default_factory=list)
 
 
+class AIProviderConfig(BaseModel):
+    type: Literal["openai_compatible"] = "openai_compatible"
+    base_url: str = ""
+    model: str = ""
+    api_key_env: str = ""
+
+
+def _default_ai_providers() -> Dict[str, AIProviderConfig]:
+    return {
+        "nvidia": AIProviderConfig(
+            base_url="https://integrate.api.nvidia.com/v1",
+            model="meta/llama-3.1-70b-instruct",
+            api_key_env="NVIDIA_API_KEY",
+        ),
+        "groq": AIProviderConfig(
+            base_url="https://api.groq.com/openai/v1",
+            model="llama-3.3-70b-versatile",
+            api_key_env="GROQ_API_KEY",
+        ),
+        "ollama": AIProviderConfig(
+            base_url="http://localhost:11434/v1",
+            api_key_env="OLLAMA_API_KEY",
+        ),
+        "llamacpp": AIProviderConfig(
+            base_url="http://localhost:8080/v1",
+            api_key_env="LLAMACPP_API_KEY",
+        ),
+    }
+
+
+class AIConfig(BaseModel):
+    enabled: bool = True
+    primary: str = "nvidia"
+    fallback: List[str] = Field(default_factory=lambda: ["groq", "ollama", "llamacpp"])
+    timeout_seconds: int = Field(default=20, ge=1, le=300)
+    max_retries: int = Field(default=1, ge=0, le=3)
+    cooldown_seconds: int = Field(default=120, ge=1, le=300)
+    providers: Dict[str, AIProviderConfig] = Field(default_factory=_default_ai_providers)
+
+
 class Config(BaseModel):
     sources: SourcesConfig = Field(default_factory=SourcesConfig)
     filters: FilterConfig = Field(default_factory=FilterConfig)
+    ai: AIConfig = Field(default_factory=AIConfig)
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
     nvidia_model: str = "meta/llama-3.1-70b-instruct"
     scan_interval_minutes: int = 30
@@ -132,6 +173,7 @@ def load_config(
     base_dir: Optional[Path] = None,
     sources_path: Optional[Path] = None,
     filters_path: Optional[Path] = None,
+    ai_path: Optional[Path] = None,
 ) -> Config:
     _ensure_dotenv()  # NVIDIA_MODEL / NVIDIA_API_KEY live in .env for local runs
     if base_dir is None:
@@ -141,9 +183,28 @@ def load_config(
         sources_path = base_dir / "sources.yaml"
     if filters_path is None:
         filters_path = base_dir / "filters.yaml"
+    if ai_path is None:
+        ai_path = base_dir / "ai.yaml"
 
     sources_data = load_yaml(sources_path)
     filters_data = load_yaml(filters_path)
+    ai_data = load_yaml(ai_path)
+    ai_data = ai_data.get("ai", ai_data) or {}
+
+    provider_data = {
+        name: provider.model_dump()
+        for name, provider in _default_ai_providers().items()
+    }
+    for name, values in (ai_data.get("providers") or {}).items():
+        provider_data.setdefault(name, {})
+        provider_data[name].update(values or {})
+    nvidia = provider_data["nvidia"]
+    nvidia["base_url"] = os.getenv("NVIDIA_BASE_URL", nvidia["base_url"])
+    nvidia["model"] = os.getenv("NVIDIA_MODEL", nvidia["model"])
+    ai_data["providers"] = provider_data
+    if os.getenv("AI_TIMEOUT_SECONDS"):
+        ai_data["timeout_seconds"] = _env_int("AI_TIMEOUT_SECONDS", 20)
+    ai_settings = AIConfig(**ai_data)
 
     sources_config = SourcesConfig(**sources_data)
     filters_config = FilterConfig(**filters_data)
@@ -151,10 +212,11 @@ def load_config(
     return Config(
         sources=sources_config,
         filters=filters_config,
-        nvidia_base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
-        nvidia_model=os.getenv("NVIDIA_MODEL", "meta/llama-3.1-70b-instruct"),
+        ai=ai_settings,
+        nvidia_base_url=nvidia["base_url"],
+        nvidia_model=nvidia["model"],
         scan_interval_minutes=int(os.getenv("SCAN_INTERVAL_MINUTES", "30")),
-        ai_timeout_seconds=int(os.getenv("AI_TIMEOUT_SECONDS", "45")),
+        ai_timeout_seconds=ai_settings.timeout_seconds,
         verify_application_urls=_env_bool("VERIFY_APPLICATION_URLS", True),
         verify_timeout_seconds=float(os.getenv("VERIFY_TIMEOUT_SECONDS", "8")),
         notify_min_match_score=int(os.getenv("NOTIFY_MIN_MATCH_SCORE", "80")),

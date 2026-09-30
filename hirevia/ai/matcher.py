@@ -14,7 +14,8 @@ model cannot outrank a thin posting.
 import logging
 from typing import Optional
 
-from hirevia.ai.client import NVIDIAClient
+from hirevia.ai.client import AIError, NVIDIAClient
+from hirevia.ai.providers import AIProvider, AIProviderRouter, build_ai_provider_router
 from hirevia.config import Config
 from hirevia.core.matching import MatchEvidence, evidence_prompt_block
 from hirevia.core.models import AIResponse, CandidateProfile, Job
@@ -118,10 +119,24 @@ def build_user_prompt(
 class AIMatcher:
     """One job in, one structured verdict out. Never raises."""
 
-    def __init__(self, config: Config, api_key: str):
-        self.client = NVIDIAClient(config, api_key)
+    def __init__(
+        self,
+        config: Config,
+        api_key: Optional[str] = None,
+        provider: Optional[AIProvider] = None,
+    ):
+        primary = NVIDIAClient(config, api_key) if api_key else None
+        self.client = provider or build_ai_provider_router(
+            config, primary_api_key=api_key, primary_provider=primary
+        )
         self.model = self.client.model
         self.config = config
+
+    @property
+    def provider_name(self) -> str:
+        return getattr(self.client, "last_provider", None) or getattr(
+            self.client, "provider_name", "unknown"
+        )
 
     async def match(
         self,
@@ -146,14 +161,25 @@ class AIMatcher:
                 schema=MATCH_RESPONSE_SCHEMA,
                 temperature=0.1,
                 max_tokens=600,
-                retries=1,
+                retries=self.config.ai.max_retries,
             )
             response = AIResponse.from_json(result)
+            self.model = getattr(self.client, "last_model", None) or self.client.model
             response.raw_data = {"model": self.model, "payload": result if isinstance(result, dict) else {}}
+            if self.provider_name != "nvidia":
+                response.raw_data["provider"] = self.provider_name
             return response
         except Exception as e:  # noqa: BLE001 - AI must never break the pipeline
-            logger.warning("[AI] match failed for %r (%s): %s", job.title, self.model, e)
-            response = AIResponse.failure(e)
-            response.raw_data = {"model": self.model, "payload": {}}
+            safe_error = e if isinstance(e, AIError) else AIError(
+                f"AI provider failed ({type(e).__name__})"
+            )
+            logger.debug("[AI] match degraded for %r (%s)", job.title, type(e).__name__)
+            response = AIResponse.failure(safe_error)
+            response.raw_data = {
+                "model": getattr(self.client, "last_model", None) or self.model,
+                "payload": {},
+            }
+            if self.provider_name != "nvidia":
+                response.raw_data["provider"] = self.provider_name
             return response
 

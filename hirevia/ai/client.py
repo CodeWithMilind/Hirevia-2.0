@@ -43,6 +43,10 @@ class AIInvalidResponseError(AIError):
     """The model answered, but not with usable JSON."""
 
 
+class AIResponseFormatError(AIError):
+    """The provider does not support the requested structured response format."""
+
+
 # Phrases an OpenAI-compatible gateway uses when the model name is dead.
 _MODEL_UNAVAILABLE_HINTS = (
     "is not a valid model", "model not found", "model does not exist",
@@ -52,8 +56,13 @@ _MODEL_UNAVAILABLE_HINTS = (
 )
 
 
-def classify_api_error(error: Exception) -> AIError:
-    """Map any SDK/transport error onto one of our typed AIErrors."""
+def classify_api_error(
+    error: Exception,
+    provider_name: str = "nvidia",
+    api_key_env: str = "NVIDIA_API_KEY",
+    model_env: str = "NVIDIA_MODEL",
+) -> AIError:
+    """Map SDK/transport errors to safe typed errors without echoing payloads."""
     from openai import APITimeoutError, APIConnectionError, RateLimitError
 
     status = getattr(error, "status_code", None)
@@ -61,20 +70,26 @@ def classify_api_error(error: Exception) -> AIError:
     lowered = message.lower()
 
     if isinstance(error, (APITimeoutError, APIConnectionError)):
-        return AITimeoutError(f"AI request did not complete: {message[:180]}")
+        return AITimeoutError(f"AI request did not complete (timed out; provider={provider_name})")
     if isinstance(error, RateLimitError) or status == 429 or "rate limit" in lowered:
-        return AIRateLimitError(f"AI rate limit reached: {message[:180]}", _retry_after(error))
+        return AIRateLimitError(f"AI rate limit reached (provider={provider_name})", _retry_after(error))
     if status in (401, 403):
-        return AIAuthError(f"AI authentication failed - check NVIDIA_API_KEY: {message[:150]}")
+        return AIAuthError(
+            f"AI authentication failed (HTTP {status}, provider={provider_name}); check {api_key_env}"
+        )
     if "timeout" in lowered or "timed out" in lowered:
-        return AITimeoutError(f"AI request timed out: {message[:180]}")
+        return AITimeoutError(f"AI request did not complete (timed out; provider={provider_name})")
     if isinstance(status, int) and 500 <= status < 600:
-        return AIServerError(f"AI server error: {message[:180]}")
+        return AIServerError(f"AI server error (HTTP {status}, provider={provider_name})")
+    if status == 400 and ("response_format" in lowered or "json_schema" in lowered):
+        return AIResponseFormatError(
+            f"provider={provider_name} does not support the configured structured response format"
+        )
     if status == 404 or any(hint in lowered for hint in _MODEL_UNAVAILABLE_HINTS):
         return AIModelUnavailableError(
-            f"configured AI model is unavailable - set NVIDIA_MODEL in .env ({message[:180]})"
+            f"configured AI model is unavailable (provider={provider_name}); set {model_env}"
         )
-    return AIError(f"AI request failed: {message[:200]}")
+    return AIError(f"AI request failed (provider={provider_name}; error={type(error).__name__})")
 
 
 def _retry_after(error: Exception) -> float:
@@ -112,7 +127,7 @@ def extract_json_object(content: str) -> dict:
         raise
 
 
-class NVIDIAClient:
+class OpenAICompatibleClient:
     # Models differ: some reject response_format=json_schema. On that failure
     # we transparently retry with prompt-instructed JSON so the pipeline keeps
     # working when NVIDIA_MODEL is swapped in .env.
@@ -121,15 +136,26 @@ class NVIDIAClient:
         "No markdown, no commentary."
     )
 
-    def __init__(self, config: Config, api_key: str):
-        self.config = config
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: str,
+        timeout: float = 45,
+        provider_name: str = "openai-compatible",
+        api_key_env: str = "API_KEY",
+        model_env: str = "MODEL",
+    ):
+        self.provider_name = provider_name
+        self.api_key_env = api_key_env
+        self.model_env = model_env
         self.client = AsyncOpenAI(
             api_key=api_key,
-            base_url=config.nvidia_base_url,
-            timeout=getattr(config, "ai_timeout_seconds", 45),
+            base_url=base_url,
+            timeout=timeout,
             max_retries=0,  # retries are handled here so backoff stays predictable
         )
-        self.model = config.nvidia_model  # configurable via NVIDIA_MODEL env
+        self.model = model
 
     async def chat_completion(
         self,
@@ -155,12 +181,16 @@ class NVIDIAClient:
         try:
             response = await self.client.chat.completions.create(**kwargs)
         except Exception as e:
-            error = classify_api_error(e)
-            logger.error("[AI] %s (model=%s)", error, self.model)
+            error = classify_api_error(e, self.provider_name, self.api_key_env, self.model_env)
+            logger.debug(
+                "[AI] request failed (provider=%s, error=%s, status=%s)",
+                self.provider_name, type(e).__name__, getattr(e, "status_code", None),
+            )
             raise error from e
 
-        content = response.choices[0].message.content if response.choices else None
-        if not content:
+        message = response.choices[0].message if response.choices else None
+        content = getattr(message, "content", None)
+        if not isinstance(content, str) or not content.strip():
             raise AIInvalidResponseError(f"empty completion from model={self.model}")
         return content
 
@@ -195,7 +225,7 @@ class NVIDIAClient:
                 return extract_json_object(content)
             except json.JSONDecodeError as e:
                 last_error = AIInvalidResponseError(f"model returned unusable JSON: {e}")
-                logger.warning("[AI] invalid JSON (attempt %d/%d): %s", attempt + 1, attempts, e)
+                logger.debug("[AI] invalid JSON (attempt %d/%d)", attempt + 1, attempts)
                 if attempt < attempts - 1:
                     messages = messages + [
                         {"role": "assistant", "content": content},
@@ -216,14 +246,9 @@ class NVIDIAClient:
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 raise
+            except AIResponseFormatError:
+                return await self._prompt_json_completion(messages, schema, temperature, max_tokens)
             except AIError as e:
-                message = str(e).lower()
-                if "response_format" in message or ("json_schema" in message and "400" in message):
-                    logger.warning(
-                        "[AI] model %s rejected structured output - using prompt-instructed JSON",
-                        self.model,
-                    )
-                    return await self._prompt_json_completion(messages, schema, temperature, max_tokens)
                 raise
 
         raise last_error or AIInvalidResponseError("AI completion failed")
@@ -247,3 +272,18 @@ class NVIDIAClient:
             messages=prompt, temperature=temperature, max_tokens=max_tokens, response_format=None
         )
         return extract_json_object(content)
+
+
+class NVIDIAClient(OpenAICompatibleClient):
+    """Backward-compatible NVIDIA endpoint client."""
+
+    def __init__(self, config: Config, api_key: str):
+        super().__init__(
+            base_url=config.nvidia_base_url,
+            model=config.nvidia_model,
+            api_key=api_key,
+            timeout=getattr(config, "ai_timeout_seconds", 45),
+            provider_name="nvidia",
+            api_key_env="NVIDIA_API_KEY",
+            model_env="NVIDIA_MODEL",
+        )

@@ -86,7 +86,7 @@ def load_profile(
     profile = _build_profile(data, filters)
     for warning in validate_profile(profile):
         logger.warning("[Profile] %s: %s", path.name, warning)
-    logger.info(
+    logger.debug(
         "[Profile] loaded %s (%d skills, %d roles, %d locations, type=%s)",
         path, len(profile.skills), len(profile.preferred_roles),
         len(profile.preferred_locations), profile.candidate_type,

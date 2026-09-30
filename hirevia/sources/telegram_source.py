@@ -79,7 +79,7 @@ def _cursor_for(channel: str) -> int:
             value = 0
         if value > 0:
             _last_seen_ids[channel] = value
-            logger.info("%s Resumed %s from message %s", PREFIX, channel, value)
+            logger.debug("%s Resumed %s from message %s", PREFIX, channel, value)
             return value
     return 0
 
@@ -178,7 +178,7 @@ async def ensure_client():
     except ImportError as e:
         raise TelegramAuthError("Telethon is not installed - run: pip install telethon") from e
 
-    logger.info("%s Connecting...", PREFIX)
+    logger.debug("%s Connecting...", PREFIX)
     credentials.session_path.parent.mkdir(parents=True, exist_ok=True)
     client = TelegramClient(
         str(credentials.session_path),
@@ -199,7 +199,7 @@ async def ensure_client():
         raise TelegramAuthError(f"Telegram connection failed: {_safe_err(e)}") from e
 
     _shared_client = client
-    logger.info("%s Authentication successful", PREFIX)
+    logger.debug("%s Authentication successful", PREFIX)
     return client
 
 
@@ -223,7 +223,15 @@ class TelegramSource(JobSource):
         # Per-scan counters read by the pipeline to fill ScanStats
         # (Messages Checked / Jobs Detected / Jobs Normalized).
         self.last_stats = {"messages_checked": 0, "jobs_detected": 0, "jobs_normalized": 0}
-        self._intent_counts = {}
+        self._intent_counts = {
+            "promotional_rejected": 0,
+            "educational_rejected": 0,
+            "informational_rejected": 0,
+            "spam_rejected": 0,
+            "selection_rejected": 0,
+            "aggregator_rejected": 0,
+            "intent_ambiguous": 0,
+        }
 
     def bind_state(self, repo) -> None:
         """Called by the Pipeline: store per-channel cursors in the jobs DB."""
@@ -258,6 +266,8 @@ class TelegramSource(JobSource):
             "educational_rejected": 0,
             "informational_rejected": 0,
             "spam_rejected": 0,
+            "selection_rejected": 0,
+            "aggregator_rejected": 0,
             "intent_ambiguous": 0,
         }
         messages_checked = 0
@@ -299,6 +309,7 @@ class TelegramSource(JobSource):
                     unique[job.source_job_id] = job
 
         self.last_stats = {
+            "channels_scanned": len(channels),
             "messages_checked": messages_checked,
             "jobs_detected": jobs_detected,
             "jobs_normalized": len(unique),
@@ -352,28 +363,32 @@ class TelegramSource(JobSource):
                     IntentCategory.EDUCATIONAL: "educational_rejected",
                     IntentCategory.INFORMATIONAL: "informational_rejected",
                     IntentCategory.SPAM: "spam_rejected",
+                    IntentCategory.SELECTION_ANNOUNCEMENT: "selection_rejected",
+                    IntentCategory.AGGREGATOR_LIST: "aggregator_rejected",
                 }.get(decision.category)
                 if counter:
                     self._intent_counts[counter] += 1
-                logger.info(
+                logger.debug(
                     "%s [Filter] REJECTED %s: %s",
                     PREFIX, decision.category.value, decision.reason,
                 )
                 continue
             if decision.category is IntentCategory.UNKNOWN:
                 self._intent_counts["intent_ambiguous"] += 1
+            elif decision.category is IntentCategory.AMBIGUOUS:
+                self._intent_counts["intent_ambiguous"] += 1
             else:
-                logger.info(
+                logger.debug(
                     "%s [Filter] ACCEPTED %s: %s",
                     PREFIX, decision.category.value, decision.reason,
                 )
-            logger.info(
+            logger.debug(
                 "%s New message detected in %s #%s", PREFIX, channel.username, msg.message_id
             )
             job = message_to_job(msg, decision)
             if job is None:
                 continue
-            logger.info(
+            logger.debug(
                 "%s Job detected/normalized: %s @ %s | %s | freshness: %s",
                 PREFIX, job.title, job.company, channel.username,
                 job.raw_data.get("freshness_label", "?"),

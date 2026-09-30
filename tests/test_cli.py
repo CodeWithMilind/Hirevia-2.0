@@ -6,6 +6,7 @@ every ScanStats field the pipeline reports.
 """
 
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -17,11 +18,14 @@ from hirevia.cli import _build_notifier, _print_stats, _resolve_nvidia_key, cli
 from hirevia.config import Config
 from hirevia.core.models import ApplicationStatus, Job, ScanStats
 from hirevia.notifications.telegram import TelegramNotifier
+from hirevia.sources.telegram_config import TelegramChannel
+from hirevia.sources.telegram_extract import TgMessage
+from hirevia.sources.telegram_source import TelegramSource
 
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch, tmp_path):
-    for var in ("NVIDIA_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+    for var in ("NVIDIA_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "HIREVIA_LOG_LEVEL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.chdir(tmp_path)
     yield
@@ -45,17 +49,28 @@ def test_nvidia_key_prefers_the_environment(monkeypatch):
     assert _resolve_nvidia_key() == "nv-abc"
 
 
-def test_nvidia_key_falls_back_to_prompt(monkeypatch):
-    monkeypatch.setattr(cli_module, "get_nvidia_api_key", lambda: "nv-prompted")
-    assert _resolve_nvidia_key() == "nv-prompted"
-
-
-def test_nvidia_key_is_optional_when_prompting_is_impossible(monkeypatch):
-    def boom():
-        raise EOFError
-
-    monkeypatch.setattr(cli_module, "get_nvidia_api_key", boom)
+def test_nvidia_key_is_never_prompted_for(monkeypatch):
+    monkeypatch.setattr(cli_module, "get_nvidia_api_key", lambda: pytest.fail("must not prompt"), raising=False)
     assert _resolve_nvidia_key() is None
+
+
+def test_provider_configuration_can_enable_groq_without_nvidia(monkeypatch):
+    seen = {}
+
+    class FakeMatcher:
+        def __init__(self, config, api_key):
+            seen["api_key"] = api_key
+
+    monkeypatch.setattr(cli_module, "provider_status", lambda config: [
+        {"name": "nvidia", "configured": False},
+        {"name": "groq", "configured": True},
+    ])
+    monkeypatch.setattr(cli_module, "AIMatcher", FakeMatcher)
+
+    matcher = cli_module._build_ai_matcher(Config())
+
+    assert isinstance(matcher, FakeMatcher)
+    assert seen["api_key"] is None
 
 
 def test_notifier_is_built_from_environment_with_retry_settings(monkeypatch):
@@ -87,7 +102,7 @@ def test_explicit_flags_win_over_environment(monkeypatch):
 
 # --- commands ------------------------------------------------------------------
 
-def test_scan_reports_every_pipeline_metric(monkeypatch, tmp_path):
+def test_scan_reports_compact_summary_and_real_counts(monkeypatch, tmp_path):
     seen = {}
 
     async def fake_scan(config, repo, ai_matcher=None, notifier=None):
@@ -104,10 +119,12 @@ def test_scan_reports_every_pipeline_metric(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert seen["notifier"] is None and seen["ai"] is None
-    for label in ("Messages Checked", "Jobs Detected", "AI Failures (degraded)",
-                  "Link Unusable", "Application Closed", "Alerts Suppressed",
-                  "Failed Jobs", "Errors:"):
+    for label in ("Hirevia Scan", "Messages scanned", "Opportunities", "Noise filtered",
+                  "Profile matched", "High-quality", "AI provider", "AI degraded",
+                  "Scan completed", "Errors requiring attention"):
         assert label in result.output
+    for diagnostic in ("AI Matched", "Jobs Reaching Matching", "Stage 5", "Excluded keywords"):
+        assert diagnostic not in result.output
 
 
 def test_scan_closes_the_notifier_it_created(monkeypatch, tmp_path):
@@ -156,10 +173,98 @@ def test_status_shows_freshness_and_link_verdict(monkeypatch, tmp_path):
 
 
 def test_print_stats_stays_quiet_on_a_healthy_scan(capsys):
-    _print_stats(ScanStats(jobs_found=1, jobs_new=1))
+    _print_stats(ScanStats(
+        jobs_found=1, jobs_new=1,
+        top_opportunities=[{
+            "title": "Python Developer", "company": "Example", "match_score": 88,
+            "priority": "P1", "location": "Pune", "application_url": "https://example.com/apply",
+        }],
+    ))
     out = capsys.readouterr().out
     assert "AI Failures" not in out  # only shown when something degraded
-    assert "Duration" in out
+    assert "Scan completed" in out
+    assert "Python Developer" in out
+
+
+def test_telegram_message_details_are_debug_not_normal_info(caplog):
+    caplog.set_level(logging.INFO)
+    source = TelegramSource()
+    source._normalize_messages(
+        TelegramChannel(username="jobs_alpha"),
+        [TgMessage("jobs_alpha", 1, datetime.utcnow(), "Hiring Python Developer. Apply: https://jobs.lever.co/acme/1")],
+    )
+
+    assert "New message detected" not in caplog.text
+    assert "[Filter] ACCEPTED" not in caplog.text
+
+    caplog.clear()
+    caplog.set_level(logging.DEBUG)
+    source._normalize_messages(
+        TelegramChannel(username="jobs_alpha"),
+        [TgMessage("jobs_alpha", 2, datetime.utcnow(), "Hiring Python Developer. Apply: https://jobs.lever.co/acme/2")],
+    )
+    assert "New message detected" in caplog.text
+    assert "[Filter] ACCEPTED" in caplog.text
+
+
+def test_logging_configuration_is_idempotent_and_verbose_is_debug(monkeypatch):
+    root = logging.getLogger()
+    telethon_logger = logging.getLogger("telethon")
+    original_handlers = root.handlers
+    original_level = root.level
+    original_telethon_level = telethon_logger.level
+    root.handlers = []
+    try:
+        monkeypatch.delenv("HIREVIA_LOG_LEVEL", raising=False)
+        cli_module.configure_logging()
+        assert telethon_logger.level == logging.WARNING
+        first_count = len(root.handlers)
+        cli_module.configure_logging()
+        assert first_count == len(root.handlers) == 1
+        cli_module.configure_logging(verbose=True)
+        assert root.level == logging.DEBUG
+        assert root.handlers[0].level == logging.DEBUG
+        assert telethon_logger.level == logging.DEBUG
+        monkeypatch.setenv("HIREVIA_LOG_LEVEL", "DEBUG")
+        cli_module.configure_logging()
+        assert root.level == logging.DEBUG
+    finally:
+        for handler in root.handlers:
+            if handler not in original_handlers:
+                handler.close()
+        root.handlers = original_handlers
+        root.setLevel(original_level)
+        telethon_logger.setLevel(original_telethon_level)
+
+
+def test_scan_verbose_option_enables_debug_logs(monkeypatch, tmp_path):
+    seen = {}
+
+    async def fake_scan(config, repo, ai_matcher=None, notifier=None):
+        seen["level"] = logging.getLogger().level
+        return ScanStats()
+
+    monkeypatch.setattr(cli_module, "run_single_scan", fake_scan)
+    monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
+    result = CliRunner().invoke(
+        cli, ["scan", "--verbose", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "verbose.db")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["level"] == logging.DEBUG
+
+
+def test_ai_status_reports_configuration_without_secrets(monkeypatch):
+    monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
+    monkeypatch.setenv("GROQ_API_KEY", "groq-CANARY-do-not-print")
+
+    result = CliRunner().invoke(cli, ["ai", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Hirevia AI Providers" in result.output
+    assert "NVIDIA (primary)" in result.output
+    assert "GROQ" in result.output and "configured" in result.output
+    assert "groq-CANARY-do-not-print" not in result.output
 
 
 def test_start_loop_survives_errors_and_closes_the_notifier(monkeypatch, tmp_path):

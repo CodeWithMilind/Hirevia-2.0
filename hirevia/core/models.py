@@ -461,11 +461,14 @@ class MatchResult(BaseModel):
 
 class ScanStats(BaseModel):
     sources_scanned: int = 0
+    telegram_channels_scanned: int = 0
     messages_checked: int = 0
     promotional_rejected: int = 0
     educational_rejected: int = 0
     informational_rejected: int = 0
     spam_rejected: int = 0
+    selection_rejected: int = 0
+    aggregator_rejected: int = 0
     intent_ambiguous: int = 0
     jobs_detected: int = 0
     jobs_normalized: int = 0
@@ -489,6 +492,8 @@ class ScanStats(BaseModel):
     jobs_link_rejected: int = 0
     jobs_notified: int = 0
     jobs_notification_eligible: int = 0
+    ai_provider: str = "disabled"
+    top_opportunities: List[Dict[str, Any]] = Field(default_factory=list)
     jobs_skipped_notification: int = 0
     jobs_expired: int = 0
     jobs_failed: int = 0

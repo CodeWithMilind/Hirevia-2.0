@@ -51,7 +51,7 @@ class SourceRegistry:
                             if isinstance(attr, type) and issubclass(attr, JobSource) and attr != JobSource:
                                 self._sources[source_name] = attr()
                                 break
-                    logger.info(f"Loaded source: {source_name}")
+                    logger.debug("Loaded source: %s", source_name)
                 except Exception as e:
                     logger.warning(f"Failed to load source {source_name}: {e}")
             else:

@@ -9,36 +9,57 @@ from typing import Optional
 
 import click
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
-from hirevia.config import Config, load_config, get_nvidia_api_key, get_telegram_token
-from hirevia.core.models import ScanStats
-from hirevia.core.freshness import freshness_label
-from hirevia.core.verification import classify_application_url
-from hirevia.core.pipeline import run_single_scan
-from hirevia.storage.state import JobRepository
 from hirevia.ai.matcher import AIMatcher
+from hirevia.ai.providers import provider_status
+from hirevia.config import Config, load_config, get_telegram_token
+from hirevia.core.models import ScanStats
+from hirevia.core.pipeline import run_single_scan
+from hirevia.core.verification import classify_application_url
+from hirevia.core.freshness import freshness_label
 from hirevia.notifications.telegram import TelegramNotifier
+from hirevia.storage.state import JobRepository
 
 console = Console()
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
+def configure_logging(verbose: bool = False) -> None:
+    """Configure the application logger without stacking console handlers."""
+    configured_level = os.getenv("HIREVIA_LOG_LEVEL", "").strip().upper()
+    level = getattr(logging, configured_level, None) if configured_level else None
+    if not isinstance(level, int):
+        level = logging.DEBUG if verbose else logging.INFO
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    logging.getLogger("telethon").setLevel(
+        logging.DEBUG if level <= logging.DEBUG else logging.WARNING
+    )
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        ))
+        root.addHandler(handler)
+    for handler in root.handlers:
+        handler.setLevel(level)
+
+
 def _resolve_nvidia_key() -> Optional[str]:
-    """Env first (automation friendly), then an interactive prompt."""
+    """Read NVIDIA credentials from the environment without prompting."""
     key = (os.getenv("NVIDIA_API_KEY") or "").strip()
-    if key:
-        return key
-    try:
-        return (get_nvidia_api_key() or "").strip() or None
-    except (EOFError, KeyboardInterrupt):
+    return key or None
+
+
+def _build_ai_matcher(config: Config, disabled: bool = False) -> Optional[AIMatcher]:
+    if disabled or not config.ai.enabled:
         return None
+    if not any(provider["configured"] for provider in provider_status(config)):
+        return None
+    return AIMatcher(config, _resolve_nvidia_key())
 
 
 def _build_notifier(config: Config, token: Optional[str], chat_id: Optional[str]):
@@ -91,8 +112,10 @@ def cli():
 @click.option("--notify/--no-notify", "notify", default=True, help="Send Telegram alerts")
 @click.option("--telegram-token", default=None, help="Telegram bot token (or TELEGRAM_BOT_TOKEN)")
 @click.option("--chat-id", default=None, help="Telegram chat id (or TELEGRAM_CHAT_ID)")
-def start(db_path: str, interval: int, no_ai: bool, notify: bool, telegram_token: str, chat_id: str):
+@click.option("--verbose", is_flag=True, help="Show per-job and provider diagnostics")
+def start(db_path: str, interval: int, no_ai: bool, notify: bool, telegram_token: str, chat_id: str, verbose: bool):
     """Start continuous scanning with notifications."""
+    configure_logging(verbose)
     console.print("[bold green]Starting Hirevia 2.0...[/bold green]")
 
     # Load config
@@ -100,13 +123,11 @@ def start(db_path: str, interval: int, no_ai: bool, notify: bool, telegram_token
     config.scan_interval_minutes = interval
 
     # Get API keys at runtime
-    nvidia_key = None if no_ai else _resolve_nvidia_key()
-    if not nvidia_key and not no_ai:
-        console.print("[yellow]No NVIDIA API key - continuing without AI matching[/yellow]")
-
     # Initialize components
     repo = JobRepository(Path(db_path))
-    ai_matcher = None if (no_ai or not nvidia_key) else AIMatcher(config, nvidia_key)
+    ai_matcher = _build_ai_matcher(config, no_ai)
+    if not ai_matcher and not no_ai:
+        console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
     notifier = _build_notifier(config, telegram_token, chat_id) if notify else None
 
     console.print("[green]Configuration loaded[/green]")
@@ -150,17 +171,16 @@ def start(db_path: str, interval: int, no_ai: bool, notify: bool, telegram_token
 @click.option("--notify/--no-notify", "notify", default=False, help="Also send Telegram alerts")
 @click.option("--telegram-token", default=None, help="Telegram bot token (or TELEGRAM_BOT_TOKEN)")
 @click.option("--chat-id", default=None, help="Telegram chat id (or TELEGRAM_CHAT_ID)")
-def scan(db_path: str, no_ai: bool, notify: bool, telegram_token: str, chat_id: str):
+@click.option("--verbose", is_flag=True, help="Show per-job and provider diagnostics")
+def scan(db_path: str, no_ai: bool, notify: bool, telegram_token: str, chat_id: str, verbose: bool):
     """Run a single scan cycle."""
-    console.print("[bold]Running single scan...[/bold]")
+    configure_logging(verbose)
 
     config = load_config()
-    nvidia_key = None if no_ai else _resolve_nvidia_key()
-    if not nvidia_key and not no_ai:
-        console.print("[yellow]No NVIDIA API key - running without AI matching[/yellow]")
-
     repo = JobRepository(Path(db_path))
-    ai_matcher = None if (no_ai or not nvidia_key) else AIMatcher(config, nvidia_key)
+    ai_matcher = _build_ai_matcher(config, no_ai)
+    if not ai_matcher and not no_ai:
+        console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
     notifier = _build_notifier(config, telegram_token, chat_id) if notify else None
 
     async def _run():
@@ -398,48 +418,70 @@ def version():
     console.print("Hirevia 2.0.0")
 
 
+@cli.group()
+def ai():
+    """Inspect configured AI providers."""
+    pass
+
+
+@ai.command(name="status")
+def ai_status():
+    """Show provider configuration without contacting external services."""
+    config = load_config()
+    console.print("\n[bold]Hirevia AI Providers[/bold]")
+    if not config.ai.enabled:
+        console.print("AI matching: disabled")
+        return
+    for provider in provider_status(config):
+        role = " (primary)" if provider["primary"] else ""
+        state = "configured" if provider["configured"] else "not configured"
+        console.print(f"\n{provider['name'].upper()}{role}")
+        console.print(f"  Model: {provider['model'] or 'not set'}")
+        console.print(f"  Status: {state}")
+
+
 def _print_stats(stats: ScanStats):
-    console.print("\n[bold]Scan Results[/bold]")
-    table = Table()
-    table.add_column("Metric", style="cyan")
-    table.add_column("Count", style="green")
+    noise_filtered = sum((
+        stats.promotional_rejected,
+        stats.educational_rejected,
+        stats.informational_rejected,
+        stats.spam_rejected,
+        stats.selection_rejected,
+        stats.aggregator_rejected,
+    ))
+    summary = Table.grid(padding=(0, 2))
+    summary.add_column(style="cyan", justify="right")
+    summary.add_column(style="white")
+    summary.add_row("Telegram channels", str(stats.telegram_channels_scanned or stats.sources_scanned))
+    summary.add_row("Messages scanned", str(stats.messages_checked))
+    summary.add_row("Opportunities", str(stats.jobs_found))
+    summary.add_row("Noise filtered", str(noise_filtered))
+    summary.add_row("Profile matched", str(stats.jobs_matched))
+    summary.add_row("High-quality", str(stats.jobs_notification_eligible))
+    summary.add_row("AI provider", stats.ai_provider or "disabled")
+    console.print(Panel(summary, title="Hirevia Scan", border_style="cyan"))
 
-    table.add_row("Sources Scanned", str(stats.sources_scanned))
-    table.add_row("Messages Checked", str(stats.messages_checked))
-    table.add_row("Promotional Rejected", str(stats.promotional_rejected))
-    table.add_row("Educational Rejected", str(stats.educational_rejected))
-    table.add_row("Informational Rejected", str(stats.informational_rejected))
-    table.add_row("Spam/Noise Rejected", str(stats.spam_rejected))
-    table.add_row("Ambiguous Intent", str(stats.intent_ambiguous))
-    table.add_row("Jobs Detected", str(stats.jobs_detected))
-    table.add_row("Jobs Normalized", str(stats.jobs_normalized))
-    table.add_row("Jobs Found", str(stats.jobs_found))
-    table.add_row("New Jobs", str(stats.jobs_new))
-    table.add_row("Duplicates", str(stats.jobs_duplicate))
-    table.add_row("Filtered", str(stats.jobs_filtered))
-    table.add_row("Jobs Reaching Matching", str(stats.jobs_matching_attempted))
-    table.add_row("AI Matched", str(stats.jobs_ai_matched))
-    table.add_row("AI Rejected", str(stats.jobs_ai_rejected))
+    if stats.top_opportunities:
+        console.print("\n[bold]TOP OPPORTUNITIES[/bold]")
+        for index, item in enumerate(stats.top_opportunities, start=1):
+            console.print(
+                f"\n{index}. [bold]{item['title']}[/bold]\n"
+                f"   Company : {item['company']}\n"
+                f"   Match   : {item['match_score']}%\n"
+                f"   Priority: {item['priority']}\n"
+                f"   Location: {item['location']}\n"
+                f"   Apply   : {item['application_url']}"
+            )
+
+    console.print(f"\n[green]Scan completed in {stats.duration_seconds:.1f}s[/green]")
     if stats.ai_failures:
-        table.add_row("[yellow]AI Failures (degraded)[/yellow]", str(stats.ai_failures))
-    table.add_row("Verified Open", str(stats.jobs_verified))
-    table.add_row("Jobs Reaching Verification", str(stats.jobs_verification_attempted))
-    table.add_row("Link Unusable", str(stats.jobs_link_rejected))
-    table.add_row("Verification Unknown", str(stats.jobs_unverified))
-    table.add_row("Application Closed", str(stats.jobs_closed))
-    table.add_row("Notified", str(stats.jobs_notified))
-    table.add_row("Would Qualify for Notification", str(stats.jobs_notification_eligible))
-    table.add_row("Alerts Suppressed", str(stats.jobs_skipped_notification))
-    table.add_row("Expired", str(stats.jobs_expired))
+        console.print(f"[yellow]AI degraded for {stats.ai_failures} job(s); deterministic fallback used[/yellow]")
     if stats.jobs_failed:
-        table.add_row("[red]Failed Jobs[/red]", str(stats.jobs_failed))
-    table.add_row("Duration", f"{stats.duration_seconds:.1f}s")
-
-    console.print(table)
+        console.print(f"[red]Jobs failed: {stats.jobs_failed}[/red]")
 
     if stats.errors:
-        console.print("\n[red]Errors:[/red]")
-        for err in stats.errors:
+        console.print("\n[red]Errors requiring attention:[/red]")
+        for err in stats.errors[:5]:
             console.print(f"  - {err}")
 
 

@@ -60,6 +60,9 @@ class IntentCategory(str, Enum):
     EDUCATIONAL = "educational"
     INFORMATIONAL = "informational"
     SPAM = "spam"
+    SELECTION_ANNOUNCEMENT = "selection_announcement"
+    AGGREGATOR_LIST = "aggregator_list"
+    AMBIGUOUS = "ambiguous"
     UNKNOWN = "unknown"
 
 
@@ -69,6 +72,7 @@ class IntentDecision:
     accepted: bool
     reason: str
     signals: Tuple[str, ...] = ()
+    manual_application_action: bool = False
 
 
 _HIRING_INTENT_RE = re.compile(
@@ -83,7 +87,7 @@ _DRIVE_INTENT_RE = re.compile(
 )
 _ROLE_INTENT_RE = re.compile(
     r"\b(?:developers?|engineers?|scientists?|analysts?|programmers?|intern(?:ship)?s?|"
-    r"apprenticeships?|trainees?|designers?|consultants?|associates?|"
+    r"apprentice(?:ship)?s?|trainees?|designers?|consultants?|associates?|"
     r"software\s+roles?|data\s+roles?)\b",
     re.IGNORECASE,
 )
@@ -91,6 +95,11 @@ _APPLICATION_ACTION_RE = re.compile(
     r"\b(?:apply(?:\s+now|\s+here)?|application\s+link|registrations?(?:\s+open)?|register(?:\s+now|\s+here|\s+using)?|"
     r"submit\s+(?:your\s+)?resume|send\s+(?:your\s+)?(?:resume|cv)|"
     r"walk[\s-]*in|interview\s+schedule)\b",
+    re.IGNORECASE,
+)
+_DIRECT_APPLICATION_ACTION_RE = re.compile(
+    r"\b(?:apply(?:\s+now|\s+here)?|application\s+link|submit\s+(?:your\s+)?resume|"
+    r"send\s+(?:your\s+)?(?:resume|cv)|walk[\s-]*in|interview\s+schedule)\b",
     re.IGNORECASE,
 )
 _PROMOTION_RE = re.compile(
@@ -101,7 +110,9 @@ _PROMOTION_RE = re.compile(
 )
 _EDUCATIONAL_RE = re.compile(
     r"\b(?:certifi(?:ed|cations?)|webinars?|workshops?|master\s*classes?|"
-    r"learn\s+\w+(?:\s+\w+)?|get\s+job[ -]ready)\b",
+    r"learn\s+\w+(?:\s+\w+)?|learning\s+paths?|get\s+job[ -]ready|learning\s+playlists?|"
+    r"from\s+beginner\s+to\s+job[ -]ready|master\s+.{1,60}(?:playlist|learning|coding)|"
+    r"beginner\s+to\s+(?:ai[ -]powered|job[ -]ready))\b",
     re.IGNORECASE,
 )
 _INFORMATIONAL_RE = re.compile(
@@ -120,6 +131,25 @@ _SPAM_RE = re.compile(
 )
 _AMBIGUOUS_OPPORTUNITY_RE = re.compile(
     r"\b(?:interview\s+opportunity|training\s+\+\s*interview)\b",
+    re.IGNORECASE,
+)
+_SELECTION_ANNOUNCEMENT_RE = re.compile(
+    r"\b(?:selected\s*(?:!|\.|,|$)|congratulations?\b.{0,100}\bselected\b|"
+    r"\bselected\b.{0,70}\bcongratulations?\b|offer\s+(?:letter\s+)?released|"
+    r"\b\d+\s+(?:students?|candidates?)\s+selected|"
+    r"congratulations?\b.{0,80}\b(?:placement|placed|offer)\b)",
+    re.IGNORECASE,
+)
+_AGGREGATOR_LIST_RE = re.compile(
+    r"\b(?:\d+\+?\s+job\s+portals?|top\s+\d*\s*job\s+(?:portals?|websites?)|"
+    r"(?:one\s+)?curated\s+list\s+of\s+jobs?|100\s+companies\s+hiring|"
+    r"fresh\s+jobs\s+every\s+day|job\s+portals?\s*\.\s*one\s+curated\s+list)\b",
+    re.IGNORECASE,
+)
+_COMMENT_GATE_RE = re.compile(
+    r"\bcomment\b.{0,100}\b(?:get|receive|dm|link|yes)\b|"
+    r"\bdm\s+(?:me|us)\b.{0,70}\blink\b|\blike\s+and\s+share\b|"
+    r"\bjoin\s+(?:this|our)\s+group\b.{0,60}\blink\b",
     re.IGNORECASE,
 )
 
@@ -149,16 +179,13 @@ def classify_job_intent(text: str, links: Optional[List[str]] = None) -> IntentD
     has_drive = bool(_DRIVE_INTENT_RE.search(text))
     has_role = bool(_ROLE_INTENT_RE.search(text))
     has_action = bool(_APPLICATION_ACTION_RE.search(text))
+    has_direct_action = bool(_DIRECT_APPLICATION_ACTION_RE.search(text))
     has_fresher = bool(re.search(r"\b(?:fresher|freshers|graduate hiring)\b", text, re.I))
-    has_employer_evidence = bool(re.search(r"\b(?:company|at\s+[A-Z][\w&.-]+|with\s+[A-Z][\w&.-]+)\b", text))
-    has_external_link = any(
-        link and urlparse(link).netloc.lower().replace("www.", "") not in {"t.me", "telegram.me"}
-        for link in (links or [])
-    )
+    has_application_link = any(_is_application_link(link) for link in (links or []))
     has_concrete_opening = (
         (has_hiring and (has_role or has_fresher or has_action))
         or (has_drive and (has_role or has_action or has_fresher))
-        or (has_role and (has_action or has_external_link))
+        or (has_role and (has_direct_action or has_application_link))
         or (has_role and has_hiring)
     )
 
@@ -169,10 +196,14 @@ def classify_job_intent(text: str, links: Optional[List[str]] = None) -> IntentD
         signals.append("job role")
     if has_action:
         signals.append("application action")
-    if has_external_link:
-        signals.append("external link")
+    if has_application_link:
+        signals.append("application link")
 
     if has_concrete_opening:
+        manual_action = bool(
+            re.search(r"\bwalk[\s-]*in\b", text, re.I)
+            and re.search(r"\b(?:venue|address|location|date|time|bring\s+(?:your\s+)?resume)\b", text, re.I)
+        )
         if has_drive:
             category = IntentCategory.HIRING_DRIVE
         elif re.search(r"\b(?:apprentice|apprenticeship)\b", text, re.I):
@@ -183,16 +214,26 @@ def classify_job_intent(text: str, links: Optional[List[str]] = None) -> IntentD
             category = IntentCategory.JOB
         return IntentDecision(
             category, True, "explicit hiring/role evidence with an application path",
-            tuple(sorted(set(signals))),
+            tuple(sorted(set(signals))), manual_action,
         )
 
     if _AMBIGUOUS_OPPORTUNITY_RE.search(text):
         return IntentDecision(
-            IntentCategory.UNKNOWN, True,
+            IntentCategory.AMBIGUOUS, True,
             "possible interview opportunity, but no specific opening is stated",
             tuple(sorted(set(signals + ["ambiguous opportunity"]))),
         )
 
+    if _SELECTION_ANNOUNCEMENT_RE.search(text):
+        return IntentDecision(
+            IntentCategory.SELECTION_ANNOUNCEMENT, False,
+            "selection or offer announcement; no separate open opportunity",
+        )
+    if _AGGREGATOR_LIST_RE.search(text):
+        return IntentDecision(
+            IntentCategory.AGGREGATOR_LIST, False,
+            "curated job portal/list content; no individual actionable opening",
+        )
     if _SPAM_RE.search(text):
         return IntentDecision(IntentCategory.SPAM, False, "channel/community or service promotion")
     if _PROMOTION_RE.search(text):
@@ -201,10 +242,16 @@ def classify_job_intent(text: str, links: Optional[List[str]] = None) -> IntentD
         return IntentDecision(IntentCategory.EDUCATIONAL, False, "educational content; no actionable opening")
     if _INFORMATIONAL_RE.search(text):
         return IntentDecision(IntentCategory.INFORMATIONAL, False, "informational content; no actionable opening")
+    if _COMMENT_GATE_RE.search(text):
+        return IntentDecision(
+            IntentCategory.AMBIGUOUS, True,
+            "application link is gated behind comments, DMs, or group joining",
+            tuple(sorted(set(signals + ["gated application link"]))),
+        )
 
     if has_hiring or has_drive or has_role or any(word in lower for word in ("job", "career", "intern")):
         return IntentDecision(
-            IntentCategory.UNKNOWN, True,
+            IntentCategory.AMBIGUOUS, True,
             "job-related wording without enough evidence to confirm an opening",
             tuple(sorted(set(signals + ["ambiguous job intent"]))),
         )
@@ -297,6 +344,24 @@ def extract_fresher_signals(text: str) -> List[str]:
 def extract_links(text: str) -> List[str]:
     """Regex fallback link extraction (collector prefers Telegram entities)."""
     return [m.group(0).rstrip(".,;:!'\"") for m in URL_RE.finditer(text or "")]
+
+
+def _is_application_link(url: Optional[str]) -> bool:
+    """Accept recognized job platforms or URLs whose path signals application intent."""
+    if not url:
+        return False
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if not host or host in _TELEGRAM_HOSTS:
+        return False
+    if any(pattern.search(url) for pattern in _ATS_RES):
+        return True
+    if host.startswith(("jobs.", "careers.", "apply.")):
+        return True
+    return any(
+        token in parsed.path.lower()
+        for token in ("/job", "/career", "/apply", "/opening", "/vacanc", "/posting", "/position")
+    )
 
 
 def _is_telegram_link(url: str) -> bool:
@@ -706,11 +771,13 @@ def message_to_job(msg: TgMessage, intent: Optional[IntentDecision] = None) -> O
                 "source_channels": [msg.channel],
                 "source_message_id": msg.message_id,
                 "source_message_url": message_url,
+                "source_url": message_url,
                 "message_date": posted_at.isoformat(),
                 "freshness_label": freshness_label(posted_at),
                 "detection_signals": list(decision.signals),
                 "intent_category": decision.category.value,
                 "intent_reason": decision.reason,
+                "manual_application_action": decision.manual_application_action,
                 "content_risk": content_risk_signals(text),
                 "fresher_signals": extract_fresher_signals(text),
                 "salary": extract_salary(text),

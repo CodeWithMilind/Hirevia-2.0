@@ -192,9 +192,10 @@ def test_missing_application_url_is_stored_but_never_matched_or_alerted(repo):
     assert stored.raw_data["application_url_usable"] is False
 
 
-def test_ambiguous_telegram_intent_is_never_notification_eligible(repo):
+@pytest.mark.parametrize("intent_category", ["unknown", "ambiguous"])
+def test_ambiguous_telegram_intent_is_never_notification_eligible(repo, intent_category):
     job = make_job(apply="https://jobs.lever.co/acme/backend")
-    job.raw_data["intent_category"] = "unknown"
+    job.raw_data["intent_category"] = intent_category
     matcher = FakeMatcher()
     notifier = FakeNotifier()
 
@@ -206,6 +207,25 @@ def test_ambiguous_telegram_intent_is_never_notification_eligible(repo):
     assert stats.jobs_notification_eligible == 0
     assert stats.jobs_skipped_notification == 1
     assert notifier.sent == []
+
+
+def test_scheduled_walk_in_without_external_url_remains_actionable(repo):
+    job = make_job(apply=None)
+    job.raw_data.update({
+        "intent_category": "hiring_drive",
+        "manual_application_action": True,
+    })
+    matcher = FakeMatcher()
+    notifier = FakeNotifier()
+
+    stats = run(build_pipeline([FakeSource([job])], repo, matcher, notifier))
+
+    assert stats.jobs_link_rejected == 0
+    assert stats.jobs_verification_attempted == 1
+    assert stats.jobs_unverified == 1
+    assert stats.jobs_notification_eligible == 1
+    assert notifier.sent == [job.title]
+    assert str(job.url) == "https://t.me/jobs_alpha/1"
 
 
 @pytest.mark.parametrize(

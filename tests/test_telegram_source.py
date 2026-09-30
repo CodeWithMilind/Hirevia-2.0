@@ -90,6 +90,28 @@ def test_collect_normalizes_new_messages():
     assert {j.raw_data["source_channel"] for j in jobs} == {"jobs_alpha", "jobs_beta"}
 
 
+def test_collect_counts_intent_noise_before_job_normalization():
+    two_channel_yaml()
+    messages = [
+        tg_msg("jobs_alpha", 1, "Join our Python course"),
+        tg_msg("jobs_alpha", 2, "20+ Job Portals. One Curated List. Fresh Jobs Every Day."),
+        tg_msg("jobs_alpha", 3, "Selected, Congratulations..."),
+        tg_msg("jobs_alpha", 4, "Career tips for data analysts"),
+        tg_msg("jobs_alpha", 5, JOB_TEXT),
+    ]
+    source = make_source({"jobs_alpha": messages, "jobs_beta": []})
+
+    jobs = asyncio.run(source.collect())
+
+    assert len(jobs) == 1
+    assert source.last_stats["messages_checked"] == 5
+    assert source.last_stats["promotional_rejected"] == 1
+    assert source.last_stats["aggregator_rejected"] == 1
+    assert source.last_stats["selection_rejected"] == 1
+    assert source.last_stats["informational_rejected"] == 1
+    assert source.last_stats["jobs_normalized"] == 1
+
+
 def test_in_scan_reposts_collapse():
     two_channel_yaml()
     src = make_source({

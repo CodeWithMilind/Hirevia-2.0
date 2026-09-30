@@ -29,7 +29,7 @@ from hirevia.core.filtering import apply_filters
 from hirevia.core.freshness import freshness_label, sort_by_freshness
 from hirevia.core.matching import analyze, combine
 from hirevia.core.models import AIResponse, ApplicationStatus, Job, MatchResult, Priority, ScanStats
-from hirevia.core.verification import classify_application_url, verify_application
+from hirevia.core.verification import UrlQuality, classify_application_url, verify_application
 from hirevia.notifications.base import Notifier
 from hirevia.profile.profile import load_profile, validate_profile
 from hirevia.sources.registry import SourceRegistry
@@ -80,10 +80,11 @@ class Pipeline:
         self.registry = SourceRegistry(config)
         self.profile = load_profile()
         self.stats = ScanStats()
+        self.stats.ai_provider = getattr(ai_matcher, "provider_name", "disabled") if ai_matcher else "disabled"
         self._matcher_takes_evidence = _accepts_evidence(ai_matcher)
         for warning in validate_profile(self.profile):
             logger.warning("%s profile: %s", PREFIX, warning)
-        logger.info(
+        logger.debug(
             "%s profile '%s': %d skill(s), %d role(s), %d yr experience, remote=%s%s",
             PREFIX, self.profile.name, len(self.profile.skills), len(self.profile.preferred_roles),
             self.profile.experience_years, self.profile.remote_preference,
@@ -95,15 +96,18 @@ class Pipeline:
     async def run_scan(self) -> ScanStats:
         """Run one complete scan cycle. Never raises: returns stats + errors."""
         start_time = datetime.utcnow()
-        self.stats = ScanStats()
+        self.stats = ScanStats(
+            ai_provider=getattr(self.ai_matcher, "provider_name", "disabled")
+            if self.ai_matcher else "disabled"
+        )
 
         try:
             self.stats.jobs_expired = self.repo.expire_jobs()
-            logger.info("%s Stage 1: expired %d stale job(s)", PREFIX, self.stats.jobs_expired)
+            logger.debug("%s Stage 1: expired %d stale job(s)", PREFIX, self.stats.jobs_expired)
 
             sources = self.registry.get_enabled_sources()
             self.stats.sources_scanned = len(sources)
-            logger.info(
+            logger.debug(
                 "%s Stage 2: scanning %d enabled source(s): %s",
                 PREFIX, len(sources), ", ".join(s.name for s in sources) or "none",
             )
@@ -144,6 +148,7 @@ class Pipeline:
             f"found={s.jobs_found} new={s.jobs_new} dup={s.jobs_duplicate} "
             f"promo_rejected={s.promotional_rejected} education_rejected={s.educational_rejected} "
             f"info_rejected={s.informational_rejected} spam_rejected={s.spam_rejected} "
+            f"selection_rejected={s.selection_rejected} aggregator_rejected={s.aggregator_rejected} "
             f"ambiguous={s.intent_ambiguous} "
             f"filtered={s.jobs_filtered} matched={s.jobs_matched} below_match={s.jobs_below_match} "
             f"matching_attempted={s.jobs_matching_attempted} "
@@ -182,12 +187,13 @@ class Pipeline:
         self.stats.messages_checked += int(counters.get("messages_checked", 0) or 0)
         for counter in (
             "promotional_rejected", "educational_rejected", "informational_rejected",
-            "spam_rejected", "intent_ambiguous",
+            "spam_rejected", "selection_rejected", "aggregator_rejected", "intent_ambiguous",
         ):
             setattr(self.stats, counter, getattr(self.stats, counter) + int(counters.get(counter, 0) or 0))
         self.stats.jobs_detected += int(counters.get("jobs_detected", 0) or 0)
         self.stats.jobs_normalized += int(counters.get("jobs_normalized", 0) or 0)
-        logger.info("%s Source %s collected %d job(s)", PREFIX, source.name, len(jobs))
+        self.stats.telegram_channels_scanned += int(counters.get("channels_scanned", 0) or 0)
+        logger.debug("%s Source %s collected %d job(s)", PREFIX, source.name, len(jobs))
         return jobs
 
     # -- one job, stage by stage -------------------------------------------
@@ -219,12 +225,12 @@ class Pipeline:
         filters = apply_filters(job, self.config.filters)
         if not filters.passed:
             self.stats.jobs_filtered += 1
-            logger.info("%s %s Stage 4: filtered %r (%s)", PREFIX, tag, job.title, filters.reason)
+            logger.debug("%s %s Stage 4: filtered %r (%s)", PREFIX, tag, job.title, filters.reason)
             return
 
         # Stage 5a: cheap link gate BEFORE paying for an AI call. A post whose
         # only link is a channel/shortener/aggregator can never be applied to.
-        quality = classify_application_url(str(job.application_url) if job.application_url else None)
+        quality = self._application_quality(job)
         self._stamp(job, quality)
         if not quality.usable:
             self.stats.jobs_link_rejected += 1
@@ -234,7 +240,7 @@ class Pipeline:
                 job.application_url = None
             if self.repo.upsert_job(job):
                 self.stats.jobs_new += 1
-            logger.info(
+            logger.debug(
                 "%s Stage 5: %r has no usable apply link (%s) - stored, never alerted",
                 PREFIX, job.title, quality.reason,
             )
@@ -247,7 +253,7 @@ class Pipeline:
         verdict = await self._match(job, tag)
         if not verdict.match:
             self.stats.jobs_below_match += 1
-            logger.info(
+            logger.debug(
                 "%s %s Stage 5: no match for %r (%d%%, deterministic %d%%) - %s",
                 PREFIX, tag, job.title, verdict.match_score, verdict.deterministic_score,
                 verdict.reason[:160] or "below the match threshold",
@@ -277,12 +283,36 @@ class Pipeline:
             if self.notifier is None and blocked == "notifications disabled":
                 if self._alert_block(job, verdict, quality, is_new, ignore_notification_disabled=True) is None:
                     self.stats.jobs_notification_eligible += 1
+                    self._record_top_opportunity(job, verdict)
             self.stats.jobs_skipped_notification += 1
-            logger.info("%s %s Stage 7: no alert for %r - %s", PREFIX, tag, job.title, blocked)
+            logger.debug("%s %s Stage 7: no alert for %r - %s", PREFIX, tag, job.title, blocked)
             return
 
         self.stats.jobs_notification_eligible += 1
+        self._record_top_opportunity(job, verdict)
         await self._notify(job, verdict)
+
+    def _application_quality(self, job: Job):
+        quality = classify_application_url(str(job.application_url) if job.application_url else None)
+        if not quality.usable and job.raw_data.get("manual_application_action"):
+            return UrlQuality(
+                "generic", True, 65,
+                "explicit walk-in schedule/location provides an application action",
+            )
+        return quality
+
+    def _record_top_opportunity(self, job: Job, verdict: MatchResult) -> None:
+        item = {
+            "title": job.title,
+            "company": job.company,
+            "match_score": verdict.match_score,
+            "priority": verdict.priority.value,
+            "location": job.location,
+            "application_url": str(job.application_url) if job.application_url else str(job.url),
+        }
+        self.stats.top_opportunities.append(item)
+        self.stats.top_opportunities.sort(key=lambda opportunity: opportunity["match_score"], reverse=True)
+        del self.stats.top_opportunities[5:]
 
     def _stamp(self, job: Job, quality) -> None:
         """Persist the freshness + link-quality verdicts on the job itself."""
@@ -321,13 +351,11 @@ class Pipeline:
         verdict = existing.verdict_model()
         if verdict is None:
             return
-        quality = classify_application_url(
-            str(existing.application_url) if existing.application_url else None
-        )
+        quality = self._application_quality(existing)
         blocked = self._alert_block(existing, verdict, quality, is_new=False, allow_known=True)
         if blocked:
             return
-        logger.info("%s Stage 3: retrying the alert that never landed for %r", PREFIX, existing.title)
+        logger.debug("%s Stage 3: retrying the alert that never landed for %r", PREFIX, existing.title)
         await self._notify(existing, verdict)
 
 
@@ -351,11 +379,12 @@ class Pipeline:
         else:
             args = (job, self.profile, evidence) if self._matcher_takes_evidence else (job, self.profile)
             decision = await self.ai_matcher.match(*args)  # never raises
+            self.stats.ai_provider = getattr(self.ai_matcher, "provider_name", self.stats.ai_provider)
             job.ai_decision = decision.model_dump()
             if decision.degraded:
                 self.stats.ai_failures += 1
                 self._record_error(f"AI degraded ({job.source}/{job.source_job_id}): {decision.error}")
-                logger.warning(
+                logger.debug(
                     "%s Stage 5: AI unavailable for %r (%s) - scored on evidence alone",
                     PREFIX, job.title, decision.error,
                 )
@@ -369,7 +398,7 @@ class Pipeline:
         # Mirrors for the dashboard's existing flat readers.
         job.raw_data["deterministic_score"] = verdict.deterministic_score
         job.raw_data["ai_status"] = verdict.ai_status
-        logger.info(
+        logger.debug(
             "%s Stage 5: %r -> %d%% (%s) = deterministic %d%% + ai %s | %s",
             PREFIX, job.title, verdict.match_score, verdict.priority.value,
             verdict.deterministic_score,
@@ -380,6 +409,8 @@ class Pipeline:
 
     async def _verify(self, job: Job, tag: str):
         """Stage 6: reachability of the application page (best effort)."""
+        if job.raw_data.get("manual_application_action"):
+            return ApplicationStatus.UNKNOWN, self._application_quality(job)
         try:
             return await verify_application(
                 job,
@@ -391,9 +422,7 @@ class Pipeline:
                 "%s Stage 6: link check failed for %r (%s) - status stays unknown",
                 PREFIX, job.title, e,
             )
-            return ApplicationStatus.UNKNOWN, classify_application_url(
-                str(job.application_url) if job.application_url else None
-            )
+            return ApplicationStatus.UNKNOWN, self._application_quality(job)
 
     def _alert_block(
         self,
@@ -409,7 +438,7 @@ class Pipeline:
         `allow_known` is used by the alert-retry path: the job is already in the
         database, we are re-sending something that never got delivered.
         """
-        if job.raw_data.get("intent_category") == "unknown":
+        if job.raw_data.get("intent_category") in {"unknown", "ambiguous"}:
             return "job intent is ambiguous; no actionable opening confirmed"
         if self.notifier is None and not ignore_notification_disabled:
             return "notifications disabled"
