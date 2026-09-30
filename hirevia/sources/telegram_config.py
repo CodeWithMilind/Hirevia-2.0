@@ -139,6 +139,13 @@ def load_telegram_settings(path: Optional[Path] = None) -> TelegramSettings:
 
     section = data.get("telegram", data) or {}
     raw_channels = section.get("channels") or []
+    raw_defaults = section.get("defaults") or {}
+    supported_defaults = ("enabled", "lookback_hours", "max_messages")
+    defaults = (
+        {key: raw_defaults[key] for key in supported_defaults if key in raw_defaults}
+        if isinstance(raw_defaults, dict)
+        else {}
+    )
 
     channels: List[TelegramChannel] = []
     for item in raw_channels:
@@ -146,7 +153,7 @@ def load_telegram_settings(path: Optional[Path] = None) -> TelegramSettings:
             logger.warning("[Telegram] Skipping malformed channel entry: %r", item)
             continue
         try:
-            channels.append(TelegramChannel(**item))
+            channels.append(TelegramChannel(**{**defaults, **item}))
         except Exception as e:
             logger.warning("[Telegram] Skipping invalid channel %r: %s", item, e)
 

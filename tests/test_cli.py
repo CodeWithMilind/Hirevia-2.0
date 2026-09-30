@@ -108,20 +108,32 @@ def test_explicit_flags_win_over_environment(monkeypatch):
 def test_scan_reports_compact_summary_and_real_counts(monkeypatch, tmp_path):
     seen = {}
 
-    async def fake_scan(config, repo, ai_matcher=None, notifier=None):
+    async def fake_scan(
+        config, repo, ai_matcher=None, notifier=None, diagnostic_output=False,
+        ai_progress_callback=None,
+    ):
         seen["notifier"] = notifier
         seen["ai"] = ai_matcher
+        seen["diagnostic_output"] = diagnostic_output
+        seen["ai_progress_callback"] = ai_progress_callback
         return make_stats()
 
     monkeypatch.setattr(cli_module, "run_single_scan", fake_scan)
     monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
+    monkeypatch.setattr(
+        cli_module,
+        "_build_notifier",
+        lambda *a, **k: pytest.fail("diagnostic mode must not create a notifier"),
+    )
 
     result = CliRunner().invoke(
-        cli, ["scan", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "cli.db")]
+        cli, ["scan", "--no-ai", "--notify", "--diagnostic", "--db-path", str(tmp_path / "cli.db")]
     )
 
     assert result.exit_code == 0, result.output
     assert seen["notifier"] is None and seen["ai"] is None
+    assert seen["diagnostic_output"] is True
+    assert seen["ai_progress_callback"] is None
     for label in ("Hirevia Scan", "Messages scanned", "Opportunities", "Noise filtered",
                   "Profile matched", "High-quality", "AI provider", "AI degraded",
                   "Scan completed", "Errors requiring attention"):
@@ -138,7 +150,10 @@ def test_scan_closes_the_notifier_it_created(monkeypatch, tmp_path):
             closed.append(True)
             await self.client.aclose()
 
-    async def fake_scan(config, repo, ai_matcher=None, notifier=None):
+    async def fake_scan(
+        config, repo, ai_matcher=None, notifier=None, diagnostic_output=False,
+        ai_progress_callback=None,
+    ):
         assert isinstance(notifier, SpyNotifier), "pipeline must receive the notifier"
         return ScanStats(jobs_notified=1)
 
@@ -153,6 +168,122 @@ def test_scan_closes_the_notifier_it_created(monkeypatch, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert closed == [True]
+
+
+def test_scan_prints_live_ai_matching_progress(monkeypatch, tmp_path):
+    async def fake_scan(
+        config, repo, ai_matcher=None, notifier=None, diagnostic_output=False,
+        ai_progress_callback=None,
+    ):
+        assert diagnostic_output is False
+        assert ai_progress_callback is not None
+        ai_progress_callback("start", total=3)
+
+        outcomes = [
+            ("Software Engineer", "Amazon", "ok", True, 87, "P1", None),
+            ("Customer Support Executive", "ABC", "ok", False, 31, "P3", None),
+            ("Data Scientist", "XYZ", "failed", True, 62, "P2", "secret APITimeoutError: timeout"),
+        ]
+        for index, (title, company, status, match, score, priority, error) in enumerate(outcomes, 1):
+            ai_progress_callback(
+                "job",
+                index=index,
+                total=3,
+                job=SimpleNamespace(title=title, company=company),
+                verdict=SimpleNamespace(
+                    ai_status=status,
+                    ai_error=error,
+                    match=match,
+                    match_score=score,
+                    priority=SimpleNamespace(value=priority),
+                ),
+                provider="nvidia",
+                model="nvidia/test-model",
+            )
+        ai_progress_callback("complete")
+        return ScanStats()
+
+    monkeypatch.setattr(cli_module, "run_single_scan", fake_scan)
+    monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
+
+    result = CliRunner().invoke(
+        cli, ["scan", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "progress.db")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "AI MATCHING" in result.output
+    assert "[1/3] Software Engineer — Amazon" in result.output
+    assert "→ NVIDIA | nvidia/test-model" in result.output
+    assert "→ MATCHED | Score: 87 | P1" in result.output
+    assert "[2/3] Customer Support Executive — ABC" in result.output
+    assert "→ NOT MATCHED | Score: 31" in result.output
+    assert "[3/3] Data Scientist — XYZ" in result.output
+    assert "→ AI ERROR | timeout" in result.output
+    assert "secret" not in result.output
+    assert "APITimeoutError" not in result.output
+    assert "AI MATCHING COMPLETE" in result.output
+    assert "Processed: 3" in result.output
+    assert "Matched: 1" in result.output
+    assert "Not matched: 1" in result.output
+    assert "AI errors: 1" in result.output
+
+
+def test_scan_prints_final_eligible_results_without_notifications(monkeypatch, tmp_path):
+    seen = {}
+
+    async def fake_scan(
+        config, repo, ai_matcher=None, notifier=None, diagnostic_output=False,
+        ai_progress_callback=None,
+    ):
+        seen["notifier"] = notifier
+        seen["diagnostic_output"] = diagnostic_output
+        return ScanStats(
+            jobs_notification_eligible=1,
+            top_opportunities=[{
+                "title": "Software Engineer",
+                "company": "Amazon",
+                "match_score": 87,
+                "priority": "P1",
+                "location": "Pune",
+                "application_url": "https://jobs.example.com/amazon/123",
+            }],
+        )
+
+    monkeypatch.setattr(cli_module, "run_single_scan", fake_scan)
+    monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
+
+    result = CliRunner().invoke(
+        cli, ["scan", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "final.db")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == {"notifier": None, "diagnostic_output": False}
+    assert "FINAL HIREVIA RESULTS" in result.output
+    assert "Final eligible jobs: 1" in result.output
+    assert "Software Engineer — Amazon" in result.output
+    assert "Match Score: 87" in result.output
+    assert "Priority: P1" in result.output
+    assert "Application: https://jobs.example.com/amazon/123" in result.output
+    assert "Telegram notifications: DISABLED (--no-notify)" in result.output
+
+
+def test_scan_prints_empty_final_results(monkeypatch, tmp_path):
+    async def fake_scan(
+        config, repo, ai_matcher=None, notifier=None, diagnostic_output=False,
+        ai_progress_callback=None,
+    ):
+        return ScanStats()
+
+    monkeypatch.setattr(cli_module, "run_single_scan", fake_scan)
+    monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
+
+    result = CliRunner().invoke(
+        cli, ["scan", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "empty.db")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Final eligible jobs: 0" in result.output
+    assert "No eligible jobs found." in result.output
 
 
 def test_status_shows_freshness_and_link_verdict(monkeypatch, tmp_path):
@@ -248,7 +379,10 @@ def test_logging_configuration_is_idempotent_and_verbose_is_debug(monkeypatch):
 def test_scan_verbose_option_enables_debug_logs(monkeypatch, tmp_path):
     seen = {}
 
-    async def fake_scan(config, repo, ai_matcher=None, notifier=None):
+    async def fake_scan(
+        config, repo, ai_matcher=None, notifier=None, diagnostic_output=False,
+        ai_progress_callback=None,
+    ):
         seen["level"] = logging.getLogger().level
         return ScanStats()
 
@@ -378,7 +512,7 @@ def test_ai_test_calls_only_selected_primary_provider(monkeypatch):
     assert len(called) == 1
     assert called[0]["schema"] == MATCH_RESPONSE_SCHEMA
     assert called[0]["temperature"] == 0.1
-    assert called[0]["max_tokens"] == 600
+    assert called[0]["max_tokens"] == 1200
     assert called[0]["messages"][0]["role"] == "system"
     assert called[0]["messages"][1]["role"] == "user"
     assert "Junior Python Backend Developer" in called[0]["messages"][1]["content"]

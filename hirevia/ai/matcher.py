@@ -160,7 +160,7 @@ class AIMatcher:
                 messages=messages,
                 schema=MATCH_RESPONSE_SCHEMA,
                 temperature=0.1,
-                max_tokens=600,
+                max_tokens=1200,
                 retries=self.config.ai.max_retries,
             )
             response = AIResponse.from_json(result)

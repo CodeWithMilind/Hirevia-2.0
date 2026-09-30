@@ -219,9 +219,10 @@ class TelegramSource(JobSource):
 
     name = "telegram"
 
-    def __init__(self):
+    def __init__(self, diagnostic_output: bool = False):
         # Per-scan counters read by the pipeline to fill ScanStats
         # (Messages Checked / Jobs Detected / Jobs Normalized).
+        self.diagnostic_output = diagnostic_output
         self.last_stats = {"messages_checked": 0, "jobs_detected": 0, "jobs_normalized": 0}
         self._intent_counts = {
             "promotional_rejected": 0,
@@ -272,7 +273,10 @@ class TelegramSource(JobSource):
         }
         messages_checked = 0
         jobs_detected = 0
+        jobs_printed = 0
         for channel in channels:
+            if self.diagnostic_output:
+                self._print_channel_header(channel.username)
             try:
                 messages = await self._fetch_channel_messages(client, channel)
             except FloodWaitError as e:
@@ -293,7 +297,12 @@ class TelegramSource(JobSource):
             messages_checked += len(messages)
             channel_jobs = self._normalize_messages(channel, messages)
             jobs_detected += len(channel_jobs)
+            printed_ids = set()
             for job in channel_jobs:
+                if self.diagnostic_output and job.source_job_id not in printed_ids:
+                    self._print_diagnostic_job(job)
+                    printed_ids.add(job.source_job_id)
+                    jobs_printed += 1
                 jobs.append(job)
                 existing = unique.get(job.source_job_id)
                 if existing is not None:
@@ -315,10 +324,69 @@ class TelegramSource(JobSource):
             "jobs_normalized": len(unique),
             **self._intent_counts,
         }
+        if self.diagnostic_output:
+            self._print_diagnostic_summary(
+                channels_scanned=len(channels),
+                messages_checked=messages_checked,
+                jobs_detected=jobs_detected,
+                jobs_normalized=len(unique),
+                jobs_printed=jobs_printed,
+                duplicates_removed=jobs_detected - len(unique),
+                intent_counts=self._intent_counts,
+            )
 
         # Collapse reposts of the same opening inside one scan; cross-scan
         # reposts are absorbed later by repository dedup (source+source_job_id).
         return list(unique.values())
+
+    @staticmethod
+    def _print_channel_header(channel_name: str) -> None:
+        print("=" * 60)
+        print(f"📢 CHANNEL: {channel_name}")
+        print("=" * 60)
+
+    @staticmethod
+    def _print_diagnostic_job(job: Job) -> None:
+        def display(value, unavailable="Not specified"):
+            text = str(value).strip() if value is not None else ""
+            if not text or text.lower() in {"unknown", "n/a", "na", "none", "nil", "-"}:
+                return unavailable
+            return text
+
+        print(f"Job Role: {display(job.title)}")
+        print(f"Company Name: {display(job.company)}")
+        print(f"Location: {display(job.location)}")
+        print(f"Apply Link: {display(job.application_url, 'Not available')}")
+        print(f"Experience Level: {display(job.experience)}")
+        print("-" * 26)
+        print()
+
+    @staticmethod
+    def _print_diagnostic_summary(
+        *,
+        channels_scanned: int,
+        messages_checked: int,
+        jobs_detected: int,
+        jobs_normalized: int,
+        jobs_printed: int,
+        duplicates_removed: int,
+        intent_counts: Optional[Dict[str, int]] = None,
+    ) -> None:
+        intent_counts = intent_counts or {}
+        print("=" * 60)
+        print("SCAN SUMMARY")
+        print("=" * 60)
+        print(f"Channels scanned: {channels_scanned}")
+        print(f"Messages checked: {messages_checked}")
+        print(f"Jobs detected: {jobs_detected}")
+        print(f"Jobs normalized: {jobs_normalized}")
+        print(f"Jobs printed: {jobs_printed}")
+        print(f"Duplicates removed: {duplicates_removed}")
+        print(f"Promotional rejected: {intent_counts.get('promotional_rejected', 0)}")
+        print(f"Educational rejected: {intent_counts.get('educational_rejected', 0)}")
+        print(f"Informational rejected: {intent_counts.get('informational_rejected', 0)}")
+        print(f"Spam rejected: {intent_counts.get('spam_rejected', 0)}")
+        print("=" * 60)
 
     # -- internals (monkeypatched in tests) ---------------------------------
 

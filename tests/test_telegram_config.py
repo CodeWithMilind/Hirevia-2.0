@@ -66,6 +66,46 @@ def test_channel_defaults(tmp_path):
     assert channel.enabled is True
 
 
+def test_defaults_apply_to_channels_and_explicit_values_override(tmp_path):
+    write_yaml(
+        tmp_path,
+        "telegram:\n"
+        "  defaults:\n"
+        "    enabled: false\n"
+        "    lookback_hours: 48\n"
+        "    max_messages: 25\n"
+        "  channels:\n"
+        "    - username: jobs_alpha\n"
+        "      enabled: true\n"
+        "    - username: jobs_beta\n"
+        "      max_messages: 10\n",
+    )
+
+    settings = load_telegram_settings()
+
+    assert [(c.username, c.enabled, c.lookback_hours, c.max_messages) for c in settings.channels] == [
+        ("jobs_alpha", True, 48, 25),
+        ("jobs_beta", False, 48, 10),
+    ]
+    assert [c.username for c in settings.get_enabled_channels()] == ["jobs_alpha"]
+
+
+def test_configured_max_messages_default_reaches_channel_objects(tmp_path):
+    write_yaml(
+        tmp_path,
+        "telegram:\n"
+        "  defaults:\n"
+        "    max_messages: 25\n"
+        "  channels:\n"
+        "    - username: jobs_alpha\n",
+    )
+
+    channel = load_telegram_settings().channels[0]
+
+    assert isinstance(channel, TelegramChannel)
+    assert channel.max_messages == 25
+
+
 def test_invalid_channel_skipped_not_fatal(tmp_path):
     write_yaml(tmp_path, "enabled: true\nchannels:\n  - username: 'has spaces!'\n  - username: jobs_good\n")
     settings = load_telegram_settings()

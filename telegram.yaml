@@ -26,11 +26,11 @@ telegram:
   defaults:
     enabled: true
     lookback_hours: 24
-    max_messages: 100
+    max_messages: 25
 
   channels:
     - username: AiIndiaJobs
-    - username: codinghelpdesk
+    # - username: codinghelpdesk
     - username: datasciencefree
     - username: datasciencefun
     - username: dot_aware
@@ -40,28 +40,28 @@ telegram:
     - username: Fresherjobsadda
     - username: fresheroffcampus
     - username: freshershunt
-    - username: getjobss
-    - username: gocareers
-    - username: HireMeFresh
-    - username: hiringdaily
-    - username: internseeker
-    - username: Internshipsworld
-    - username: internshiptojobs
-    - username: job4fresherss
-    - username: jobbytesdaily
-    - username: jobs4fresherdotcom
-    - username: jobseekeras
-    - username: jobsvacancynew
-    - username: machinelearning_deeplearning
-    - username: notificaJobs_AI_MachineLearning
-    - username: off_campus_jobs_and_internships
-    - username: offcampus_phodenge
-    - username: offcampusjobsindia_IT
-    - username: placementdriveofficial
-    - username: placementkit
-    - username: PLACEMENTLELO
-    - username: Remote_Software_Developer_Jobs
-    - username: seekeras
-    - username: UrExamBuddy
-    - username: walkindrive
-    - username: way2freshers
+    # - username: getjobss
+    # - username: gocareers
+    # - username: HireMeFresh
+    # - username: hiringdaily
+    # - username: internseeker
+    # - username: Internshipsworld
+    # - username: internshiptojobs
+    # - username: job4fresherss
+    # - username: jobbytesdaily
+    # - username: jobs4fresherdotcom
+    # - username: jobseekeras
+    # - username: jobsvacancynew
+    # - username: machinelearning_deeplearning
+    # - username: notificaJobs_AI_MachineLearning
+    # - username: off_campus_jobs_and_internships
+    # - username: offcampus_phodenge
+    # - username: offcampusjobsindia_IT
+    # - username: placementdriveofficial
+    # - username: placementkit
+    # - username: PLACEMENTLELO
+    # - username: Remote_Software_Developer_Jobs
+    # - username: seekeras
+    # - username: UrExamBuddy
+    # - username: walkindrive
+    # - username: way2freshers

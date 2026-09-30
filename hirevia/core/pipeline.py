@@ -20,7 +20,7 @@ deterministic half still scores every job (see hirevia.core.matching).
 import inspect
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from hirevia.ai.matcher import AIMatcher
 from hirevia.config import Config
@@ -72,11 +72,15 @@ class Pipeline:
         repo: JobRepository,
         ai_matcher: Optional[AIMatcher] = None,
         notifier: Optional[Notifier] = None,
+        diagnostic_output: bool = False,
+        ai_progress_callback: Optional[Callable[..., None]] = None,
     ):
         self.config = config
         self.repo = repo
         self.ai_matcher = ai_matcher
         self.notifier = notifier
+        self.diagnostic_output = diagnostic_output
+        self.ai_progress_callback = ai_progress_callback
         self.registry = SourceRegistry(config)
         self.profile = load_profile(self.config.profile_path, self.config.filters)
         self.stats = ScanStats()
@@ -106,6 +110,10 @@ class Pipeline:
             logger.debug("%s Stage 1: expired %d stale job(s)", PREFIX, self.stats.jobs_expired)
 
             sources = self.registry.get_enabled_sources()
+            if self.diagnostic_output:
+                for source in sources:
+                    if source.name == "telegram":
+                        source.diagnostic_output = True
             self.stats.sources_scanned = len(sources)
             logger.debug(
                 "%s Stage 2: scanning %d enabled source(s): %s",
@@ -124,6 +132,9 @@ class Pipeline:
             )
 
             total = len(all_jobs)
+            self._ai_progress_processed = 0
+            if self.ai_matcher is not None and self.ai_progress_callback:
+                self._emit_ai_progress("start", total=total)
             for index, job in enumerate(all_jobs, start=1):
                 try:
                     await self._process_job(job, index, total)
@@ -134,6 +145,8 @@ class Pipeline:
                         "%s [%d/%d] job %r (%s) failed: %s",
                         PREFIX, index, total, job.title, job.source, e, exc_info=True,
                     )
+            if self.ai_matcher is not None and self.ai_progress_callback:
+                self._emit_ai_progress("complete")
         except Exception as e:  # noqa: BLE001
             logger.error("%s scan failed: %s", PREFIX, e, exc_info=True)
             self._record_error(f"Pipeline: {type(e).__name__}: {e}")
@@ -285,6 +298,17 @@ class Pipeline:
         else:
             self.stats.jobs_matching_attempted += 1
             verdict = await self._match(job, tag, evidence)
+            if self.ai_matcher is not None and self.ai_progress_callback:
+                self._ai_progress_processed += 1
+                self._emit_ai_progress(
+                    "job",
+                    index=self._ai_progress_processed,
+                    total=total,
+                    job=job,
+                    verdict=verdict,
+                    provider=getattr(self.ai_matcher, "provider_name", "unknown"),
+                    model=self._active_ai_model(verdict),
+                )
         if not verdict.match:
             self.stats.jobs_below_match += 1
             logger.debug(
@@ -334,6 +358,21 @@ class Pipeline:
                 "explicit walk-in schedule/location provides an application action",
             )
         return quality
+
+    def _active_ai_model(self, verdict: MatchResult) -> str:
+        client = getattr(self.ai_matcher, "client", None)
+        return (
+            getattr(client, "last_model", None)
+            or verdict.ai_model
+            or getattr(self.ai_matcher, "model", None)
+            or "unknown"
+        )
+
+    def _emit_ai_progress(self, event: str, **payload) -> None:
+        try:
+            self.ai_progress_callback(event, **payload)
+        except Exception:
+            logger.debug("%s AI progress callback failed", PREFIX, exc_info=True)
 
     def _record_top_opportunity(self, job: Job, verdict: MatchResult) -> None:
         item = {
@@ -551,9 +590,13 @@ async def run_single_scan(
     repo: JobRepository,
     ai_matcher: Optional[AIMatcher] = None,
     notifier: Optional[Notifier] = None,
+    diagnostic_output: bool = False,
+    ai_progress_callback: Optional[Callable[..., None]] = None,
 ) -> ScanStats:
     """Run a single scan - convenience function."""
-    pipeline = Pipeline(config, repo, ai_matcher, notifier)
+    pipeline = Pipeline(
+        config, repo, ai_matcher, notifier, diagnostic_output, ai_progress_callback
+    )
     return await pipeline.run_scan()
 
 

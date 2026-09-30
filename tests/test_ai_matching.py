@@ -222,7 +222,7 @@ def test_request_sends_the_configured_model_and_json_schema():
     sent = fake.calls[0]
     assert sent["model"] == "nvidia/test-model"      # NVIDIA_MODEL, not hardcoded
     assert sent["temperature"] == 0.1
-    assert sent["max_tokens"] == 600
+    assert sent["max_tokens"] == 1200
     assert [m["role"] for m in sent["messages"]] == ["system", "user"]
     assert sent["messages"][0]["content"] == SYSTEM_PROMPT
     schema = sent["response_format"]["json_schema"]["schema"]
@@ -681,7 +681,7 @@ def test_nvidia_nemotron_uses_prompted_json_without_response_format():
         "Respond with ONLY a valid JSON object matching the provided schema. "
         "No markdown, no commentary."
     )
-    assert sent["temperature"] == 0.1 and sent["max_tokens"] == 600
+    assert sent["temperature"] == 0.1 and sent["max_tokens"] == 1200
 
 
 def test_nvidia_nemotron_malformed_prompted_json_becomes_invalid_response():

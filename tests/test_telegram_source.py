@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from hirevia.core.models import Job
 from hirevia.sources import telegram_source
 from hirevia.sources.telegram_config import TelegramAuthError, TelegramChannel
 from hirevia.sources.telegram_extract import TgMessage
@@ -61,8 +62,8 @@ def two_channel_yaml(enabled=True):
     )
 
 
-def make_source(per_channel):
-    src = TelegramSource()
+def make_source(per_channel, diagnostic_output=False):
+    src = TelegramSource(diagnostic_output=diagnostic_output)
 
     async def fake_ensure():
         return object()
@@ -88,6 +89,63 @@ def test_collect_normalizes_new_messages():
     assert len(jobs) == 2
     assert {j.source for j in jobs} == {"telegram"}
     assert {j.raw_data["source_channel"] for j in jobs} == {"jobs_alpha", "jobs_beta"}
+
+
+def test_diagnostic_output_groups_normalized_jobs_and_summary(capsys):
+    two_channel_yaml()
+    source = make_source(
+        {
+            "jobs_alpha": [
+                tg_msg("jobs_alpha", 1),
+                tg_msg("jobs_alpha", 2),
+                tg_msg("jobs_alpha", 3, text="Join our Python course"),
+            ],
+            "jobs_beta": [tg_msg("jobs_beta", 7, text=JOB_TEXT_B)],
+        },
+        diagnostic_output=True,
+    )
+
+    asyncio.run(source.collect())
+    output = capsys.readouterr().out
+
+    alpha = output.index("📢 CHANNEL: jobs_alpha")
+    first_job = output.index("Job Role: Backend Developer")
+    beta = output.index("📢 CHANNEL: jobs_beta")
+    second_job = output.index("Job Role: We are hiring: Data Analyst")
+    summary = output.index("SCAN SUMMARY")
+    assert alpha < first_job < beta < second_job < summary
+    assert output.count("Job Role: Backend Developer") == 1
+    assert "Join our Python course" not in output
+    assert "Company Name: Acme Corp" in output
+    assert "Location: Remote" in output
+    assert "Apply Link: https://jobs.lever.co/beta-labs/analyst-99" in output
+    assert "Channels scanned: 2" in output
+    assert "Messages checked: 4" in output
+    assert "Jobs detected: 3" in output
+    assert "Jobs normalized: 2" in output
+    assert "Jobs printed: 2" in output
+    assert "Duplicates removed: 1" in output
+    assert "Promotional rejected: 1" in output
+
+
+def test_diagnostic_output_uses_placeholders_for_missing_fields(capsys):
+    job = Job(
+        source="telegram",
+        source_job_id="missing-fields",
+        title="Backend Developer",
+        company="Unknown",
+        location="Not specified",
+        description="Hiring Backend Developer",
+        url="https://t.me/jobs_alpha/1",
+    )
+
+    TelegramSource._print_diagnostic_job(job)
+    output = capsys.readouterr().out
+
+    assert "Company Name: Not specified" in output
+    assert "Location: Not specified" in output
+    assert "Apply Link: Not available" in output
+    assert "Experience Level: Not specified" in output
 
 
 def test_collect_counts_intent_noise_before_job_normalization():

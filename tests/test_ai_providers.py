@@ -106,7 +106,7 @@ def test_llamacpp_matching_request_shape_returns_parsed_verdict():
     assert calls[0]["messages"][0]["content"] == SYSTEM_PROMPT
     assert "Junior Python Developer" in calls[0]["messages"][1]["content"]
     assert calls[0]["response_format"]["json_schema"]["schema"] == MATCH_RESPONSE_SCHEMA
-    assert calls[0]["temperature"] == 0.1 and calls[0]["max_tokens"] == 600
+    assert calls[0]["temperature"] == 0.1 and calls[0]["max_tokens"] == 1200
 
 
 @pytest.mark.parametrize("content", [None, "not JSON"])

@@ -178,7 +178,20 @@ def start(db_path: str, interval: int, no_ai: bool, notify: bool, telegram_token
 @click.option("--telegram-token", default=None, help="Telegram bot token (or TELEGRAM_BOT_TOKEN)")
 @click.option("--chat-id", default=None, help="Telegram chat id (or TELEGRAM_CHAT_ID)")
 @click.option("--verbose", is_flag=True, help="Show per-job and provider diagnostics")
-def scan(db_path: str, no_ai: bool, notify: bool, telegram_token: str, chat_id: str, verbose: bool):
+@click.option(
+    "--diagnostic",
+    is_flag=True,
+    help="Print normalized Telegram jobs grouped by channel; suppress notifications",
+)
+def scan(
+    db_path: str,
+    no_ai: bool,
+    notify: bool,
+    telegram_token: str,
+    chat_id: str,
+    verbose: bool,
+    diagnostic: bool,
+):
     """Run a single scan cycle."""
     configure_logging(verbose)
 
@@ -187,17 +200,26 @@ def scan(db_path: str, no_ai: bool, notify: bool, telegram_token: str, chat_id: 
     ai_matcher = _build_ai_matcher(config, no_ai)
     if not ai_matcher and not no_ai:
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
-    notifier = _build_notifier(config, telegram_token, chat_id) if notify else None
+    notifier = _build_notifier(config, telegram_token, chat_id) if notify and not diagnostic else None
 
     async def _run():
         try:
-            return await run_single_scan(config, repo, ai_matcher, notifier)
+            return await run_single_scan(
+                config,
+                repo,
+                ai_matcher,
+                notifier,
+                diagnostic_output=diagnostic,
+                ai_progress_callback=None if diagnostic else _make_ai_progress_reporter(),
+            )
         finally:
             if notifier:
                 await notifier.close()
 
     stats = asyncio.run(_run())
     _print_stats(stats)
+    if not diagnostic:
+        _print_final_results(stats, notifications_enabled=bool(notify and notifier))
 
 
 
@@ -590,6 +612,82 @@ def _print_stats(stats: ScanStats):
         console.print("\n[red]Errors requiring attention:[/red]")
         for err in stats.errors[:5]:
             console.print(f"  - {err}")
+
+
+def _print_final_results(stats: ScanStats, notifications_enabled: bool) -> None:
+    console.print("\n" + "=" * 60)
+    console.print("FINAL HIREVIA RESULTS")
+    console.print("=" * 60)
+    console.print(f"\nFinal eligible jobs: {stats.jobs_notification_eligible}")
+
+    if not stats.jobs_notification_eligible:
+        console.print("No eligible jobs found.")
+    else:
+        for index, item in enumerate(stats.top_opportunities, start=1):
+            console.print(
+                f"\n{index}. [bold]{item['title']}[/bold] — {item['company']}\n"
+                f"   Company: {item['company']}\n"
+                f"   Location: {item['location'] or 'Not specified'}\n"
+                f"   Match Score: {item['match_score']}\n"
+                f"   Priority: {item['priority']}\n"
+                f"   Application: {item['application_url'] or 'Not available'}"
+            )
+
+    if notifications_enabled:
+        console.print("\nTelegram notifications: ENABLED")
+    else:
+        console.print("\nTelegram notifications: DISABLED (--no-notify)")
+    console.print("=" * 60)
+
+
+def _make_ai_progress_reporter():
+    counts = {"processed": 0, "matched": 0, "not_matched": 0, "errors": 0}
+
+    def report(event, **details):
+        if event == "start":
+            console.print("\n" + "=" * 60)
+            console.print("AI MATCHING")
+            console.print("=" * 60)
+            return
+
+        if event == "job":
+            counts["processed"] += 1
+            job = details["job"]
+            verdict = details["verdict"]
+            provider = str(details.get("provider") or "unknown").upper()
+            model = str(details.get("model") or "unknown")
+            console.print(
+                f"\n[{details['index']}/{details['total']}] "
+                f"[bold]{job.title}[/bold] — {job.company}"
+            )
+            console.print(f"        → {provider} | {model}")
+
+            if verdict.ai_status == "failed":
+                counts["errors"] += 1
+                error_text = str(verdict.ai_error or "").lower()
+                error_label = "timeout" if "timeout" in error_text or "timed out" in error_text else "request failed"
+                console.print(f"        → AI ERROR | {error_label}")
+            elif verdict.match:
+                counts["matched"] += 1
+                console.print(
+                    f"        → MATCHED | Score: {verdict.match_score} | {verdict.priority.value}"
+                )
+            else:
+                counts["not_matched"] += 1
+                console.print(f"        → NOT MATCHED | Score: {verdict.match_score}")
+            return
+
+        if event == "complete":
+            console.print("\n" + "=" * 60)
+            console.print("AI MATCHING COMPLETE")
+            console.print("=" * 60)
+            console.print(f"Processed: {counts['processed']}")
+            console.print(f"Matched: {counts['matched']}")
+            console.print(f"Not matched: {counts['not_matched']}")
+            console.print(f"AI errors: {counts['errors']}")
+            console.print("=" * 60)
+
+    return report
 
 
 if __name__ == "__main__":
