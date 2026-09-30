@@ -192,6 +192,22 @@ def test_missing_application_url_is_stored_but_never_matched_or_alerted(repo):
     assert stored.raw_data["application_url_usable"] is False
 
 
+def test_ambiguous_telegram_intent_is_never_notification_eligible(repo):
+    job = make_job(apply="https://jobs.lever.co/acme/backend")
+    job.raw_data["intent_category"] = "unknown"
+    matcher = FakeMatcher()
+    notifier = FakeNotifier()
+
+    stats = run(build_pipeline([FakeSource([job])], repo, matcher, notifier))
+
+    assert matcher.calls == [job.title]
+    assert stats.jobs_matching_attempted == 1
+    assert stats.jobs_verification_attempted == 1
+    assert stats.jobs_notification_eligible == 0
+    assert stats.jobs_skipped_notification == 1
+    assert notifier.sent == []
+
+
 @pytest.mark.parametrize(
     "application_url, expected_quality",
     [

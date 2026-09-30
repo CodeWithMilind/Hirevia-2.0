@@ -9,8 +9,10 @@ the actual relevance/scoring decisions downstream.
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -47,6 +49,166 @@ JOB_SIGNALS = [
     "backend", "frontend", "full stack", "python", "java developer",
     "job alert", "job update", "placement",
 ]
+
+
+class IntentCategory(str, Enum):
+    JOB = "job"
+    INTERNSHIP = "internship"
+    HIRING_DRIVE = "hiring_drive"
+    APPRENTICESHIP = "apprenticeship"
+    PROMOTIONAL = "promotional"
+    EDUCATIONAL = "educational"
+    INFORMATIONAL = "informational"
+    SPAM = "spam"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class IntentDecision:
+    category: IntentCategory
+    accepted: bool
+    reason: str
+    signals: Tuple[str, ...] = ()
+
+
+_HIRING_INTENT_RE = re.compile(
+    r"\b(?:hiring|recruiting|recruitment|vacanc(?:y|ies)|job\s+openings?|"
+    r"open\s+positions?|looking\s+for\s+(?:candidates|applicants|engineers|developers))\b",
+    re.IGNORECASE,
+)
+_DRIVE_INTENT_RE = re.compile(
+    r"\b(?:(?:off[\s-]*campus|campus|hiring|recruitment)\s+drive|"
+    r"walk[\s-]*in(?:\s+interview)?)\b",
+    re.IGNORECASE,
+)
+_ROLE_INTENT_RE = re.compile(
+    r"\b(?:developers?|engineers?|scientists?|analysts?|programmers?|intern(?:ship)?s?|"
+    r"apprenticeships?|trainees?|designers?|consultants?|associates?|"
+    r"software\s+roles?|data\s+roles?)\b",
+    re.IGNORECASE,
+)
+_APPLICATION_ACTION_RE = re.compile(
+    r"\b(?:apply(?:\s+now|\s+here)?|application\s+link|registrations?(?:\s+open)?|register(?:\s+now|\s+here|\s+using)?|"
+    r"submit\s+(?:your\s+)?resume|send\s+(?:your\s+)?(?:resume|cv)|"
+    r"walk[\s-]*in|interview\s+schedule)\b",
+    re.IGNORECASE,
+)
+_PROMOTION_RE = re.compile(
+    r"\b(?:courses?|training\s+programs?|bootcamps?|coaching|career\s+counsel(?:ling|ing)|"
+    r"mentorship|placement\s+assistance|enroll|admission|limited\s+seats?|"
+    r"fees?|coupon|discount|subscription|buy\s+now|paid\s+programs?)\b",
+    re.IGNORECASE,
+)
+_EDUCATIONAL_RE = re.compile(
+    r"\b(?:certifi(?:ed|cations?)|webinars?|workshops?|master\s*classes?|"
+    r"learn\s+\w+(?:\s+\w+)?|get\s+job[ -]ready)\b",
+    re.IGNORECASE,
+)
+_INFORMATIONAL_RE = re.compile(
+    r"\b(?:career\s+tips?|career\s+advice|job\s+news|hiring\s+news|"
+    r"interview\s+(?:tips?|questions?|preparation)|soft\s+skills\s+questions?|how\s+to\s+prepare|"
+    r"roadmaps?|tutorials?|real[\s-]*world\s+.*\bexamples?|"
+    r"(?:news|article|explained|definition|statistics|dataset))\b",
+    re.IGNORECASE,
+)
+_SPAM_RE = re.compile(
+    r"\b(?:subscribe\s+to\s+(?:our|my)\s+(?:(?:telegram|whatsapp)\s+)?(?:channel|group)|follow\s+our\s+channel|"
+    r"join\s+(?:our\s+)?(?:telegram\s+)?(?:channel|community|group)|"
+    r"boost\s+your\s+resume|resume[ -]writing\s+(?:service|services)|"
+    r"professional\s+resume\s+service)\b",
+    re.IGNORECASE,
+)
+_AMBIGUOUS_OPPORTUNITY_RE = re.compile(
+    r"\b(?:interview\s+opportunity|training\s+\+\s*interview)\b",
+    re.IGNORECASE,
+)
+
+
+def _canonicalize_text(text: str) -> str:
+    """Normalize styled Unicode and invisible separators used in channel posts."""
+    normalized = unicodedata.normalize("NFKC", text or "")
+    return re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", normalized)
+
+
+def classify_job_intent(text: str, links: Optional[List[str]] = None) -> IntentDecision:
+    """Classify a Telegram post by primary intent and evidence of an opening.
+
+    Promotional words are contextual signals, never standalone vetoes. A
+    concrete hiring/role/application combination takes precedence over them.
+    """
+    text = _canonicalize_text(text).strip()
+    if not text:
+        return IntentDecision(IntentCategory.INFORMATIONAL, False, "empty message")
+
+    lower = text.lower()
+    job_signals = tuple(sorted({
+        signal for signal, rx in zip(JOB_SIGNALS, _JOB_SIGNAL_RES)
+        if rx.search(" " + lower + " ")
+    }))
+    has_hiring = bool(_HIRING_INTENT_RE.search(text))
+    has_drive = bool(_DRIVE_INTENT_RE.search(text))
+    has_role = bool(_ROLE_INTENT_RE.search(text))
+    has_action = bool(_APPLICATION_ACTION_RE.search(text))
+    has_fresher = bool(re.search(r"\b(?:fresher|freshers|graduate hiring)\b", text, re.I))
+    has_employer_evidence = bool(re.search(r"\b(?:company|at\s+[A-Z][\w&.-]+|with\s+[A-Z][\w&.-]+)\b", text))
+    has_external_link = any(
+        link and urlparse(link).netloc.lower().replace("www.", "") not in {"t.me", "telegram.me"}
+        for link in (links or [])
+    )
+    has_concrete_opening = (
+        (has_hiring and (has_role or has_fresher or has_action))
+        or (has_drive and (has_role or has_action or has_fresher))
+        or (has_role and (has_action or has_external_link))
+        or (has_role and has_hiring)
+    )
+
+    signals = list(job_signals)
+    if has_hiring:
+        signals.append("explicit hiring")
+    if has_role:
+        signals.append("job role")
+    if has_action:
+        signals.append("application action")
+    if has_external_link:
+        signals.append("external link")
+
+    if has_concrete_opening:
+        if has_drive:
+            category = IntentCategory.HIRING_DRIVE
+        elif re.search(r"\b(?:apprentice|apprenticeship)\b", text, re.I):
+            category = IntentCategory.APPRENTICESHIP
+        elif re.search(r"\b(?:intern|internship)\b", text, re.I):
+            category = IntentCategory.INTERNSHIP
+        else:
+            category = IntentCategory.JOB
+        return IntentDecision(
+            category, True, "explicit hiring/role evidence with an application path",
+            tuple(sorted(set(signals))),
+        )
+
+    if _AMBIGUOUS_OPPORTUNITY_RE.search(text):
+        return IntentDecision(
+            IntentCategory.UNKNOWN, True,
+            "possible interview opportunity, but no specific opening is stated",
+            tuple(sorted(set(signals + ["ambiguous opportunity"]))),
+        )
+
+    if _SPAM_RE.search(text):
+        return IntentDecision(IntentCategory.SPAM, False, "channel/community or service promotion")
+    if _PROMOTION_RE.search(text):
+        return IntentDecision(IntentCategory.PROMOTIONAL, False, "course/training or paid-program promotion")
+    if _EDUCATIONAL_RE.search(text):
+        return IntentDecision(IntentCategory.EDUCATIONAL, False, "educational content; no actionable opening")
+    if _INFORMATIONAL_RE.search(text):
+        return IntentDecision(IntentCategory.INFORMATIONAL, False, "informational content; no actionable opening")
+
+    if has_hiring or has_drive or has_role or any(word in lower for word in ("job", "career", "intern")):
+        return IntentDecision(
+            IntentCategory.UNKNOWN, True,
+            "job-related wording without enough evidence to confirm an opening",
+            tuple(sorted(set(signals + ["ambiguous job intent"]))),
+        )
+    return IntentDecision(IntentCategory.INFORMATIONAL, False, "no actionable job opportunity")
 
 # Signals that almost always accompany a real opening (an actual call to act).
 STRONG_JOB_SIGNALS = {
@@ -112,34 +274,9 @@ def content_risk_signals(text: str) -> List[str]:
 
 
 def looks_like_job(text: str) -> Tuple[bool, List[str]]:
-    """Multi-signal gate over word boundaries. Returns (is_candidate, signals).
-
-    Decision rules (a single weak negative never kills a legitimate job):
-      * any STRONG job signal (hiring/vacancy/apply/walk-in/...)  -> accept
-      * else any FATAL negative (course/roadmap/webinar/tutorial/.) -> reject
-      * else >=2 negatives (e.g. "certification" + "learning")      -> reject
-      * else any weak positive signal                               -> accept
-    """
-    if not text or not text.strip():
-        return False, []
-    lower = " " + text.lower() + " "
-    signals: List[str] = []
-    has_strong = False
-    for signal, rx in zip(JOB_SIGNALS, _JOB_SIGNAL_RES):
-        if rx.search(lower):
-            signals.append(signal)
-            if signal in STRONG_JOB_SIGNALS:
-                has_strong = True
-
-    if has_strong:
-        return True, sorted(set(signals))
-
-    risks = content_risk_signals(text)
-    if any(r in FATAL_NEGATIVE_SIGNALS for r in risks):
-        return False, []
-    if len(risks) >= 2:
-        return False, []
-    return len(signals) > 0, sorted(set(signals))
+    """Compatibility wrapper for the context-based intent classifier."""
+    decision = classify_job_intent(text)
+    return decision.accepted, list(decision.signals)
 
 
 def extract_fresher_signals(text: str) -> List[str]:
@@ -523,20 +660,21 @@ def _to_naive_utc(dt: datetime) -> datetime:
     return dt
 
 
-def message_to_job(msg: TgMessage) -> Optional[Job]:
+def message_to_job(msg: TgMessage, intent: Optional[IntentDecision] = None) -> Optional[Job]:
     """Convert one Telegram message into a normalized Job, or None if the
     message is not a job candidate / cannot be normalized."""
     text = (msg.text or "").strip()
     if not text:
         return None
 
-    is_candidate, signals = looks_like_job(text)
-    if not is_candidate:
-        return None
-
     links = list(msg.links) if msg.links else []
     if not links:
         links = extract_links(text)
+    decision = intent or classify_job_intent(text, links)
+    if not decision.accepted:
+        return None
+
+    text = _canonicalize_text(text)
     application_url = rank_application_url(links)
     message_url = f"https://t.me/{msg.channel}/{msg.message_id}"
 
@@ -570,7 +708,9 @@ def message_to_job(msg: TgMessage) -> Optional[Job]:
                 "source_message_url": message_url,
                 "message_date": posted_at.isoformat(),
                 "freshness_label": freshness_label(posted_at),
-                "detection_signals": signals,
+                "detection_signals": list(decision.signals),
+                "intent_category": decision.category.value,
+                "intent_reason": decision.reason,
                 "content_risk": content_risk_signals(text),
                 "fresher_signals": extract_fresher_signals(text),
                 "salary": extract_salary(text),

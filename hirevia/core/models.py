@@ -462,6 +462,11 @@ class MatchResult(BaseModel):
 class ScanStats(BaseModel):
     sources_scanned: int = 0
     messages_checked: int = 0
+    promotional_rejected: int = 0
+    educational_rejected: int = 0
+    informational_rejected: int = 0
+    spam_rejected: int = 0
+    intent_ambiguous: int = 0
     jobs_detected: int = 0
     jobs_normalized: int = 0
     jobs_found: int = 0
@@ -470,17 +475,20 @@ class ScanStats(BaseModel):
     jobs_filtered: int = 0
     jobs_ai_matched: int = 0
     jobs_ai_rejected: int = 0
+    jobs_matching_attempted: int = 0
     # Jobs where the AI call failed and the pipeline used the degraded fallback.
     ai_failures: int = 0
     # Phase 7: hybrid profile-match outcomes (deterministic + AI together).
     jobs_matched: int = 0
     jobs_below_match: int = 0
     jobs_verified: int = 0
+    jobs_verification_attempted: int = 0
     jobs_unverified: int = 0
     jobs_closed: int = 0
     # Jobs dropped because the only link was social/aggregator/shortener noise.
     jobs_link_rejected: int = 0
     jobs_notified: int = 0
+    jobs_notification_eligible: int = 0
     jobs_skipped_notification: int = 0
     jobs_expired: int = 0
     jobs_failed: int = 0

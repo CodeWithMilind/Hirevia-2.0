@@ -142,11 +142,17 @@ class Pipeline:
         s = self.stats
         return (
             f"found={s.jobs_found} new={s.jobs_new} dup={s.jobs_duplicate} "
+            f"promo_rejected={s.promotional_rejected} education_rejected={s.educational_rejected} "
+            f"info_rejected={s.informational_rejected} spam_rejected={s.spam_rejected} "
+            f"ambiguous={s.intent_ambiguous} "
             f"filtered={s.jobs_filtered} matched={s.jobs_matched} below_match={s.jobs_below_match} "
+            f"matching_attempted={s.jobs_matching_attempted} "
             f"ai_ok={s.jobs_ai_matched} ai_no={s.jobs_ai_rejected} "
-            f"ai_errors={s.ai_failures} verified={s.jobs_verified} unknown={s.jobs_unverified} "
+            f"ai_errors={s.ai_failures} verified={s.jobs_verified} "
+            f"verification_attempted={s.jobs_verification_attempted} unknown={s.jobs_unverified} "
             f"closed={s.jobs_closed} no_apply_link={s.jobs_link_rejected} "
-            f"notified={s.jobs_notified} alerts_skipped={s.jobs_skipped_notification} "
+            f"notify_eligible={s.jobs_notification_eligible} notified={s.jobs_notified} "
+            f"alerts_skipped={s.jobs_skipped_notification} "
             f"failed={s.jobs_failed}"
         )
 
@@ -174,6 +180,11 @@ class Pipeline:
         self.stats.jobs_found += len(jobs)
         counters = getattr(source, "last_stats", None) or {}
         self.stats.messages_checked += int(counters.get("messages_checked", 0) or 0)
+        for counter in (
+            "promotional_rejected", "educational_rejected", "informational_rejected",
+            "spam_rejected", "intent_ambiguous",
+        ):
+            setattr(self.stats, counter, getattr(self.stats, counter) + int(counters.get(counter, 0) or 0))
         self.stats.jobs_detected += int(counters.get("jobs_detected", 0) or 0)
         self.stats.jobs_normalized += int(counters.get("jobs_normalized", 0) or 0)
         logger.info("%s Source %s collected %d job(s)", PREFIX, source.name, len(jobs))
@@ -232,6 +243,7 @@ class Pipeline:
         # Stage 5b: hybrid matching. Deterministic profile evidence first
         # (free, auditable), then the model's semantic judgement, then one
         # verdict that storage, notifications and the dashboard all read.
+        self.stats.jobs_matching_attempted += 1
         verdict = await self._match(job, tag)
         if not verdict.match:
             self.stats.jobs_below_match += 1
@@ -244,6 +256,7 @@ class Pipeline:
         self.stats.jobs_matched += 1
 
         # Stage 6: light-touch availability check on the application page
+        self.stats.jobs_verification_attempted += 1
         status, quality = await self._verify(job, tag)
         self._stamp(job, quality)
         job.application_status = status
@@ -261,10 +274,14 @@ class Pipeline:
 
         blocked = self._alert_block(job, verdict, quality, is_new)
         if blocked:
+            if self.notifier is None and blocked == "notifications disabled":
+                if self._alert_block(job, verdict, quality, is_new, ignore_notification_disabled=True) is None:
+                    self.stats.jobs_notification_eligible += 1
             self.stats.jobs_skipped_notification += 1
             logger.info("%s %s Stage 7: no alert for %r - %s", PREFIX, tag, job.title, blocked)
             return
 
+        self.stats.jobs_notification_eligible += 1
         await self._notify(job, verdict)
 
     def _stamp(self, job: Job, quality) -> None:
@@ -385,13 +402,16 @@ class Pipeline:
         quality,
         is_new: bool,
         allow_known: bool = False,
+        ignore_notification_disabled: bool = False,
     ) -> Optional[str]:
         """Return why this job must NOT interrupt the user (None = alert it).
 
         `allow_known` is used by the alert-retry path: the job is already in the
         database, we are re-sending something that never got delivered.
         """
-        if self.notifier is None:
+        if job.raw_data.get("intent_category") == "unknown":
+            return "job intent is ambiguous; no actionable opening confirmed"
+        if self.notifier is None and not ignore_notification_disabled:
             return "notifications disabled"
         if not is_new and not allow_known:
             return "already known before this scan"

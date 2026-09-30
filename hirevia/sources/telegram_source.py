@@ -27,7 +27,13 @@ from hirevia.sources.telegram_config import (
     load_telegram_credentials,
     load_telegram_settings,
 )
-from hirevia.sources.telegram_extract import TgMessage, looks_like_job, message_to_job
+from hirevia.sources.telegram_extract import (
+    IntentCategory,
+    TgMessage,
+    classify_job_intent,
+    extract_links,
+    message_to_job,
+)
 
 try:  # Telethon is imported lazily/optionally so the rest of Hirevia runs without it
     from telethon.errors import FloodWaitError, UsernameNotOccupiedError
@@ -217,6 +223,7 @@ class TelegramSource(JobSource):
         # Per-scan counters read by the pipeline to fill ScanStats
         # (Messages Checked / Jobs Detected / Jobs Normalized).
         self.last_stats = {"messages_checked": 0, "jobs_detected": 0, "jobs_normalized": 0}
+        self._intent_counts = {}
 
     def bind_state(self, repo) -> None:
         """Called by the Pipeline: store per-channel cursors in the jobs DB."""
@@ -246,6 +253,13 @@ class TelegramSource(JobSource):
 
         jobs: List[Job] = []
         unique: Dict[str, Job] = {}
+        self._intent_counts = {
+            "promotional_rejected": 0,
+            "educational_rejected": 0,
+            "informational_rejected": 0,
+            "spam_rejected": 0,
+            "intent_ambiguous": 0,
+        }
         messages_checked = 0
         jobs_detected = 0
         for channel in channels:
@@ -288,6 +302,7 @@ class TelegramSource(JobSource):
             "messages_checked": messages_checked,
             "jobs_detected": jobs_detected,
             "jobs_normalized": len(unique),
+            **self._intent_counts,
         }
 
         # Collapse reposts of the same opening inside one scan; cross-scan
@@ -329,13 +344,33 @@ class TelegramSource(JobSource):
     def _normalize_messages(self, channel: TelegramChannel, messages: List[TgMessage]) -> List[Job]:
         jobs: List[Job] = []
         for msg in messages:
-            is_candidate, _ = looks_like_job(msg.text)
-            if not is_candidate:
+            links = msg.links or extract_links(msg.text)
+            decision = classify_job_intent(msg.text, links)
+            if not decision.accepted:
+                counter = {
+                    IntentCategory.PROMOTIONAL: "promotional_rejected",
+                    IntentCategory.EDUCATIONAL: "educational_rejected",
+                    IntentCategory.INFORMATIONAL: "informational_rejected",
+                    IntentCategory.SPAM: "spam_rejected",
+                }.get(decision.category)
+                if counter:
+                    self._intent_counts[counter] += 1
+                logger.info(
+                    "%s [Filter] REJECTED %s: %s",
+                    PREFIX, decision.category.value, decision.reason,
+                )
                 continue
+            if decision.category is IntentCategory.UNKNOWN:
+                self._intent_counts["intent_ambiguous"] += 1
+            else:
+                logger.info(
+                    "%s [Filter] ACCEPTED %s: %s",
+                    PREFIX, decision.category.value, decision.reason,
+                )
             logger.info(
                 "%s New message detected in %s #%s", PREFIX, channel.username, msg.message_id
             )
-            job = message_to_job(msg)
+            job = message_to_job(msg, decision)
             if job is None:
                 continue
             logger.info(

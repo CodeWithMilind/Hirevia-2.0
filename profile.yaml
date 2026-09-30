@@ -1,0 +1,105 @@
+name: "Milind Chaudhari"
+
+summary: >-
+  Fresher interested in Python development, backend development, AI/ML,
+  data science, automation, and software engineering roles.
+
+candidate_type: "fresher"
+experience_years: 0
+target_max_experience_years: 2
+graduation_year: 2026
+accept_fresher: true
+internship_preference: true
+
+education: "MCA"
+degree: "MCA"
+
+skill_groups:
+  languages:
+    - Python
+    - Java
+    - JavaScript
+    - SQL
+  frameworks:
+    - FastAPI
+    - Flask
+    - Django
+    - React
+  ai_ml:
+    - Machine Learning
+    - Deep Learning
+    - Scikit-learn
+    - Natural Language Processing
+    - Generative AI
+  data_science:
+    - Data Science
+    - Data Analysis
+    - Pandas
+    - NumPy
+    - Matplotlib
+    - Jupyter
+  backend:
+    - REST API
+    - MySQL
+    - PostgreSQL
+    - MongoDB
+    - Testing
+  tools:
+    - Git
+    - Docker
+    - Linux
+    - Selenium
+
+tools: []
+
+projects:
+  - "Data4Viz: AI-powered data analysis and visualization platform using FastAPI and Next.js"
+  - "Vizion: Python library for automated EDA and visualization"
+  - "Hirevia: AI-powered job hunting and job monitoring agent"
+  - "Machine learning prediction and classification projects"
+  - "Python automation and web scraping projects"
+
+preferred_roles:
+  - Python Developer
+  - Python Backend Developer
+  - Backend Developer
+  - Software Developer
+  - Software Engineer
+  - AI Engineer
+  - AI/ML Engineer
+  - ML Engineer
+  - Data Scientist
+  - Data Analyst
+  - GenAI Engineer
+  - Automation Developer
+  - Python Automation Developer
+  - Full Stack Developer
+
+role_families:
+  - python_backend
+  - ai_ml
+  - data
+  - full_stack
+  - qa
+
+preferred_locations:
+  - Pune
+  - Maharashtra
+  - India
+  - Remote
+
+remote_preference: "preferred"
+
+employment_types:
+  - full_time
+  - internship
+  - contract
+
+preferred_companies: []
+avoid_companies: []
+avoid_roles: []
+
+salary_min: 0
+salary_max: 2000000
+
+notice_period_days: 30
