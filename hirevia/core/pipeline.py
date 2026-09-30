@@ -218,6 +218,9 @@ class Pipeline:
         if not quality.usable:
             self.stats.jobs_link_rejected += 1
             job.application_status = ApplicationStatus.UNKNOWN
+            if quality.quality == "none" and job.application_url:
+                job.raw_data["invalid_application_url"] = str(job.application_url)[:500]
+                job.application_url = None
             if self.repo.upsert_job(job):
                 self.stats.jobs_new += 1
             logger.info(
