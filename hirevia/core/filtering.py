@@ -1,10 +1,13 @@
 """YAML-based deterministic filtering"""
 
 import re
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from hirevia.core.models import Job, FilterResult
+from hirevia.core.matching import analyze, job_remote_mode, parse_experience, remote_mode
+from hirevia.core.models import CandidateProfile, Job, FilterResult
 from hirevia.config import FilterConfig
+from hirevia.core.freshness import is_expired
 
 
 def extract_years_experience(text: str) -> Optional[int]:
@@ -153,84 +156,249 @@ def check_excludes(job: Job, exclude_keywords: List[str]) -> tuple[bool, List[st
     return len(matched) == 0, matched
 
 
-def apply_filters(job: Job, config: FilterConfig) -> FilterResult:
-    """Apply all deterministic filters."""
-    all_matched = {}
+def apply_filters(
+    job: Job, config: FilterConfig, profile: Optional[CandidateProfile] = None
+) -> FilterResult:
+    """Apply local hard vetoes; missing evidence stays UNKNOWN and passes."""
+    from hirevia.core.matching import job_seniority
 
-    # Check excludes first (fast fail)
-    exclude_passed, exclude_matched = check_excludes(job, config.exclude_keywords)
-    if not exclude_passed:
-        return FilterResult(
-            passed=False,
-            matched={"excluded": exclude_matched},
-            reason=f"Excluded keywords found: {', '.join(exclude_matched)}",
-        )
+    intent = str((job.raw_data or {}).get("intent_category") or "").casefold()
+    rejected_intents = {
+        "promotional": "promotional_content",
+        "educational": "educational_content",
+        "informational": "non_job_content",
+        "spam": "spam_content",
+        "selection_announcement": "no_open_opportunity",
+        "aggregator_list": "non_job_content",
+    }
+    if intent in rejected_intents:
+        return _reject(rejected_intents[intent], "telegram.intent_category", {"category": intent})
 
-    # Positive signals: what makes this job one the candidate cares about.
-    signals = []
+    if not (job.title or "").strip():
+        return _reject("invalid_opportunity", "job.title")
+    if is_expired(job) or job.application_status.value in {"closed", "expired"}:
+        return _reject("expired_opportunity", "job.expiry")
+    if job.deadline:
+        deadline = job.deadline
+        if deadline.tzinfo is not None:
+            deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
+        if deadline < datetime.utcnow():
+            return _reject("expired_opportunity", "job.deadline")
 
-    # Check roles
+    supplied_profile = profile is not None
+    profile = profile or CandidateProfile()
+    unknown: List[str] = []
+    matched: Dict[str, object] = {}
+    text = " ".join((job.title or "", job.experience or "", job.description or ""))
+
     roles_passed, roles_matched = check_roles(job, config.roles)
     if roles_matched:
-        all_matched["roles"] = roles_matched
-        signals.append(f"Role match: {', '.join(roles_matched)}")
-
-    # Check locations
-    loc_passed, loc_matched = check_locations(job, config.locations)
-    if loc_matched:
-        all_matched["locations"] = loc_matched
-        signals.append(f"Location match: {', '.join(loc_matched)}")
-
-    # Check skills
-    skills_passed, skills_matched = check_skills(job, config.skills)
+        matched["roles"] = roles_matched
+    locations_passed, locations_matched = check_locations(job, config.locations)
+    if locations_matched:
+        matched["locations"] = locations_matched
+    _, skills_matched = check_skills(job, config.skills)
     if skills_matched:
-        all_matched["skills"] = skills_matched
-        signals.append(
-            f"Skills match: {', '.join(skills_matched[:5])}{'...' if len(skills_matched) > 5 else ''}"
-        )
+        matched["skills"] = skills_matched
 
-    # Qualification checks: these can only veto, they never signal interest.
-    details = []
+    experience = config.experience or {}
+    configured_max = _optional_number(experience.get("max_years"))
+    maximum = configured_max
+    maximum_rule = "experience.max_years"
+    if maximum is None and supplied_profile:
+        maximum = max(profile.target_max_experience_years, profile.experience_years)
+        maximum_rule = "profile.target_max_experience_years"
+    required = parse_experience(text)
+    if maximum is not None and required is None:
+        unknown.append("experience")
+    elif maximum is not None:
+        required_min, required_max = required
+        matched["experience"] = {
+            "detected_years": required_min,
+            "minimum": required_min,
+            "maximum": required_max,
+            "max_allowed": maximum,
+            "fresher_ok": required_min <= 1,
+        }
+        if required_min > maximum:
+            return _reject(
+                "experience_exceeds_maximum", maximum_rule, matched,
+            )
 
-    # Check experience
-    exp_passed, exp_info = check_experience(job, config.experience)
-    all_matched["experience"] = exp_info
-    if exp_passed and exp_info.get("detected_years") is not None:
-        details.append(f"Experience: {exp_info['detected_years']} years (max {exp_info['max_allowed']})")
-    elif exp_passed and exp_info.get("fresher_ok"):
-        details.append("Fresher/entry-level eligible")
+    allowed_employment = {_normalize_employment(item) for item in config.employment if str(item).strip()}
+    if allowed_employment:
+        job_employment = _job_employment(job, text)
+        if job_employment is None:
+            unknown.append("employment")
+        elif job_employment not in allowed_employment:
+            return _reject(
+                "incompatible_employment_type", "employment",
+                {"required": job_employment, "allowed": sorted(allowed_employment)},
+            )
 
-    # Check employment
-    emp_passed, emp_matched = check_employment(job, config.employment)
-    if emp_matched:
-        all_matched["employment"] = emp_matched
-        details.append(f"Employment type: {', '.join(emp_matched)}")
-
-    # At least one *configured* positive criterion must fire (OR between roles,
-    # locations and skills, as before). A criterion with no entries is "any":
-    # it neither signals interest nor vetoes, so a blank filters.yaml accepts
-    # everything instead of silently dropping every job.
-    configured = [
-        ok for ok, wanted in (
-            (roles_passed, config.roles),
-            (loc_passed, config.locations),
-            (skills_passed, config.skills),
-        ) if wanted
+    title = (job.title or "").casefold()
+    excluded = [
+        keyword for keyword in config.exclude_keywords
+        if keyword.strip() and _whole_word(keyword).search(title)
     ]
-    positive_signal = any(configured) if configured else True
-    passed = positive_signal and exp_passed and emp_passed
+    if excluded:
+        return _reject("excluded_role", "exclude_keywords", {"matched": excluded})
 
-    if signals:
-        reason = "; ".join(signals + details)
-    elif not configured:
-        reason = "No filter criteria configured - accepting everything" + (
-            f" ({'; '.join(details)})" if details else ""
-        )
-    else:
-        reason = "No matching role, location or skill"
+    seniority = job_seniority(job.title)
+    if seniority and _seniority_is_excluded(seniority, config.exclude_keywords):
+        return _reject("excluded_role", "exclude_keywords", {"seniority": seniority})
+    if seniority and profile.max_seniority and _seniority_rank(profile.max_seniority) < _seniority_rank(seniority):
+        return _reject("seniority_exceeds_maximum", "profile.candidate_type", {"seniority": seniority})
+    if supplied_profile and seniority:
+        from hirevia.core.matching import seniority_ceiling
 
-    return FilterResult(
-        passed=passed,
-        matched=all_matched,
-        reason=reason,
+        if seniority_ceiling(profile) < _seniority_rank(seniority):
+            return _reject("seniority_exceeds_maximum", "profile.candidate_type", {"seniority": seniority})
+
+    avoided_roles = [role for role in profile.avoid_roles if _phrase_in_text(role, title)]
+    if avoided_roles:
+        return _reject("excluded_role", "profile.avoid_roles", {"matched": avoided_roles})
+
+    excluded_company = next(
+        (company for company in profile.avoid_companies if _company_matches(job.company, company)),
+        None,
     )
+    if excluded_company:
+        return _reject("excluded_company", "profile.avoid_companies", {"matched": excluded_company})
+
+    if config.locations:
+        mode = remote_mode(job.location)
+        remote_allowed = any(_normalize_location(item) in {
+            "remote", "work from home", "wfh", "anywhere", "global", "worldwide", "any"
+        } for item in config.locations)
+        if mode == "remote" and not remote_allowed:
+            return _reject("incompatible_location", "locations", {"mode": "remote"})
+        city_preferences = [
+            item for item in config.locations
+            if _normalize_location(item) not in {
+                "remote", "work from home", "wfh", "anywhere", "global", "worldwide", "any"
+            }
+        ]
+        if not (job.location or "").strip() and mode is None:
+            unknown.append("location")
+        elif mode in {"onsite", "hybrid"} and remote_allowed and not city_preferences:
+            return _reject("incompatible_location", "locations", {"mode": mode})
+        elif mode == "remote":
+            pass
+        elif not city_preferences:
+            unknown.append("location")
+        else:
+            location_profile = CandidateProfile(
+                preferred_locations=city_preferences, remote_preference="any"
+            )
+            location_only_job = job.model_copy(update={
+                "title": "",
+                "company": "",
+                "description": "",
+                "experience": None,
+                "employment_type": None,
+                "skills": [],
+            })
+            location_evidence = analyze(location_only_job, location_profile)
+            if location_evidence.location_match is False:
+                return _reject(
+                    "incompatible_location", "locations", {"location": job.location or "unknown"}
+                )
+
+    if profile.remote_preference.strip().casefold() == "only":
+        mode = job_remote_mode(job)
+        if mode in {"onsite", "hybrid"}:
+            return _reject("incompatible_location", "profile.remote_preference", {"mode": mode})
+        if mode is None:
+            unknown.append("location")
+
+    if unknown:
+        return FilterResult(
+            passed=True,
+            status="UNKNOWN",
+            reason=f"insufficient_{unknown[0]}_information",
+            rule=None,
+            matched=matched,
+            details={"unknown": unknown},
+        )
+    return FilterResult(
+        passed=True,
+        status="PASS",
+        reason="passed_hard_filters",
+        rule=None,
+        matched=matched,
+        details={},
+    )
+
+
+def _reject(reason: str, rule: str, details: Optional[dict] = None) -> FilterResult:
+    return FilterResult(
+        passed=False, status="REJECT", reason=reason, rule=rule,
+        matched=details or {}, details=details or {},
+    )
+
+
+def _optional_number(value) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _whole_word(value: str):
+    return _exclude_pattern(value)
+
+
+def _phrase_in_text(phrase: str, text: str) -> bool:
+    return bool(phrase.strip() and re.search(
+        r"(?<!\w)" + re.escape(phrase.strip().casefold()) + r"(?!\w)", text
+    ))
+
+
+def _normalize_company(value: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", (value or "").casefold()).split())
+
+
+def _company_matches(actual: str, excluded: str) -> bool:
+    actual, excluded = _normalize_company(actual), _normalize_company(excluded)
+    return bool(actual and excluded and (actual == excluded or excluded in actual))
+
+
+def _normalize_location(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().casefold())
+
+
+def _normalize_employment(value: str) -> str:
+    text = re.sub(r"[\s-]+", "_", str(value or "").strip().casefold())
+    aliases = {
+        "fulltime": "full_time", "permanent": "full_time", "permanent_full_time": "full_time",
+        "parttime": "part_time", "intern": "internship", "apprentice": "apprenticeship",
+        "temp": "temporary",
+    }
+    return aliases.get(text, text)
+
+
+def _job_employment(job: Job, text: str) -> Optional[str]:
+    if job.employment_type:
+        return _normalize_employment(job.employment_type.value)
+    patterns = (
+        ("internship", r"\b(?:internships?|intern)\b"),
+        ("apprenticeship", r"\bapprenticeships?\b"),
+        ("trainee", r"\btrainees?\b"),
+        ("part_time", r"\bpart[\s-]?time\b"),
+        ("contract", r"\bcontract(?:ual)?\b"),
+        ("temporary", r"\btemporary\b"),
+        ("full_time", r"\bfull[\s-]?time\b"),
+    )
+    return next((kind for kind, pattern in patterns if re.search(pattern, text, re.I)), None)
+
+
+def _seniority_rank(value: str) -> int:
+    from hirevia.core.matching import SENIORITY_RANK
+
+    token = str(value or "").strip().casefold()
+    return next((rank for name, rank in SENIORITY_RANK.items() if token.startswith(name)), 0)
+
+
+def _seniority_is_excluded(value: str, keywords: List[str]) -> bool:
+    return any(keyword.strip().casefold() == value.casefold() for keyword in keywords)

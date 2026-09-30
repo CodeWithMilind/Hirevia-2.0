@@ -78,7 +78,7 @@ class Pipeline:
         self.ai_matcher = ai_matcher
         self.notifier = notifier
         self.registry = SourceRegistry(config)
-        self.profile = load_profile()
+        self.profile = load_profile(self.config.profile_path, self.config.filters)
         self.stats = ScanStats()
         self.stats.ai_provider = getattr(ai_matcher, "provider_name", "disabled") if ai_matcher else "disabled"
         self._matcher_takes_evidence = _accepts_evidence(ai_matcher)
@@ -150,7 +150,10 @@ class Pipeline:
             f"info_rejected={s.informational_rejected} spam_rejected={s.spam_rejected} "
             f"selection_rejected={s.selection_rejected} aggregator_rejected={s.aggregator_rejected} "
             f"ambiguous={s.intent_ambiguous} "
-            f"filtered={s.jobs_filtered} matched={s.jobs_matched} below_match={s.jobs_below_match} "
+            f"filtered={s.jobs_filtered} hard_passed={s.jobs_hard_filter_passed} "
+            f"hard_unknown={s.jobs_hard_filter_unknown} rule_scored={s.jobs_rule_scored} "
+            f"rule_strong={s.jobs_rule_strong} ai_skipped={s.jobs_ai_skipped} "
+            f"matched={s.jobs_matched} below_match={s.jobs_below_match} "
             f"matching_attempted={s.jobs_matching_attempted} "
             f"ai_ok={s.jobs_ai_matched} ai_no={s.jobs_ai_rejected} "
             f"ai_errors={s.ai_failures} verified={s.jobs_verified} "
@@ -222,10 +225,31 @@ class Pipeline:
             return
 
         # Stage 4: deterministic filters (filters.yaml)
-        filters = apply_filters(job, self.config.filters)
+        filters = apply_filters(job, self.config.filters, self.profile)
         if not filters.passed:
             self.stats.jobs_filtered += 1
-            logger.debug("%s %s Stage 4: filtered %r (%s)", PREFIX, tag, job.title, filters.reason)
+            logger.debug(
+                "%s [HARD FILTER] %s | %s | %s",
+                PREFIX, filters.status, job.title, filters.reason,
+            )
+            return
+        self.stats.jobs_hard_filter_passed += 1
+        if filters.status == "UNKNOWN":
+            self.stats.jobs_hard_filter_unknown += 1
+        logger.debug(
+            "%s [HARD FILTER] %s | %s | %s",
+            PREFIX, filters.status, job.title, filters.reason,
+        )
+
+        evidence = analyze(job, self.profile)
+        self.stats.jobs_rule_scored += 1
+        self.stats.jobs_rule_strong += int(evidence.score >= self.config.match_min_score)
+        if evidence.hard_reject:
+            self.stats.jobs_filtered += 1
+            logger.debug(
+                "%s [HARD FILTER] REJECT | %s | %s",
+                PREFIX, job.title, evidence.reject_reasons[0],
+            )
             return
 
         # Stage 5a: cheap link gate BEFORE paying for an AI call. A post whose
@@ -249,8 +273,18 @@ class Pipeline:
         # Stage 5b: hybrid matching. Deterministic profile evidence first
         # (free, auditable), then the model's semantic judgement, then one
         # verdict that storage, notifications and the dashboard all read.
-        self.stats.jobs_matching_attempted += 1
-        verdict = await self._match(job, tag)
+        if self.ai_matcher is not None and not _should_call_ai(evidence, self.config):
+            self.stats.jobs_ai_skipped += 1
+            verdict = combine(evidence, self.config)
+            job.match_result = verdict.model_dump(mode="json")
+            job.raw_data["deterministic_score"] = verdict.deterministic_score
+            job.raw_data["ai_status"] = verdict.ai_status
+            if not verdict.match:
+                self.stats.jobs_below_match += 1
+                return
+        else:
+            self.stats.jobs_matching_attempted += 1
+            verdict = await self._match(job, tag, evidence)
         if not verdict.match:
             self.stats.jobs_below_match += 1
             logger.debug(
@@ -362,7 +396,7 @@ class Pipeline:
 
     # -- stage helpers ------------------------------------------------------
 
-    async def _match(self, job: Job, tag: str) -> MatchResult:
+    async def _match(self, job: Job, tag: str, evidence=None) -> MatchResult:
         """Stage 5b: one hybrid verdict, always available.
 
         The deterministic half always runs: it is free, it is auditable, and it
@@ -371,7 +405,7 @@ class Pipeline:
         make (seniority, role intent, transferability), grounded on the evidence
         block so it cannot invent skills.
         """
-        evidence = analyze(job, self.profile)
+        evidence = evidence or analyze(job, self.profile)
 
         decision: Optional[AIResponse] = None
         if self.ai_matcher is None:
@@ -521,6 +555,19 @@ async def run_single_scan(
     """Run a single scan - convenience function."""
     pipeline = Pipeline(config, repo, ai_matcher, notifier)
     return await pipeline.run_scan()
+
+
+def _should_call_ai(evidence, config: Config) -> bool:
+    """Keep strong and uncertain candidates for semantic judgement; skip clear misses."""
+    if evidence.hard_reject:
+        return False
+    if evidence.role_match is True:
+        return True
+    if evidence.score >= config.match_min_score:
+        return True
+    if evidence.role_match is None:
+        return True
+    return False
 
 
 

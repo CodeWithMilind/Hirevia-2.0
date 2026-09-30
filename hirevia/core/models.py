@@ -367,6 +367,9 @@ class FilterResult(BaseModel):
     passed: bool
     matched: Dict[str, Any] = Field(default_factory=dict)
     reason: str = ""
+    status: str = "PASS"
+    rule: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------
@@ -476,6 +479,11 @@ class ScanStats(BaseModel):
     jobs_new: int = 0
     jobs_duplicate: int = 0
     jobs_filtered: int = 0
+    jobs_hard_filter_passed: int = 0
+    jobs_hard_filter_unknown: int = 0
+    jobs_rule_scored: int = 0
+    jobs_rule_strong: int = 0
+    jobs_ai_skipped: int = 0
     jobs_ai_matched: int = 0
     jobs_ai_rejected: int = 0
     jobs_matching_attempted: int = 0

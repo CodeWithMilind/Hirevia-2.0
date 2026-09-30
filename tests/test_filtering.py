@@ -1,8 +1,9 @@
 """Tests for YAML filtering"""
 
 import pytest
+import yaml
 from hirevia.core.filtering import apply_filters, extract_years_experience
-from hirevia.core.models import Job, FilterResult
+from hirevia.core.models import CandidateProfile, Job, FilterResult
 from hirevia.config import FilterConfig
 
 
@@ -109,7 +110,9 @@ def test_exclude_keywords():
     config = make_config(exclude_keywords=["senior"])
     result = apply_filters(job, config)
     assert not result.passed
-    assert "senior" in result.matched.get("excluded", [])
+    assert "senior" in result.matched.get("matched", [])
+    assert result.status == "REJECT"
+    assert result.reason == "excluded_role"
 
 
 def test_employment_match():
@@ -135,33 +138,34 @@ def test_all_filters_combined():
 
 
 def test_no_positive_signal_fails():
-    """Job with no matching role, location, or skill should fail."""
+    """A relevance miss is not a hard veto; the matcher can judge it later."""
     job = make_job(
         title="Java Architect",
-        location="Delhi",
-        description="Java Spring Hibernate, 5 years experience",
+        location="Pune",
+        description="Java Spring Hibernate, 0-2 years experience",
     )
     config = make_config()
     result = apply_filters(job, config)
-    assert not result.passed
+    assert result.passed
+    assert result.status == "PASS"
 
 
 def test_empty_criteria_accepts_everything():
     """No filters.yaml (all lists blank) must NOT swallow the whole pipeline."""
     job = make_job(title="Java Architect", location="Delhi",
-                   description="Java Spring Hibernate, 5 years experience")
+                   description="Java Spring Hibernate, 0-2 years experience")
     result = apply_filters(job, FilterConfig())
     assert result.passed
-    assert "No filter criteria configured" in result.reason
+    assert result.status == "PASS"
+    assert result.reason == "passed_hard_filters"
 
 
-def test_partial_criteria_still_veto():
-    """An unset criterion is 'any', a configured one still has to match."""
+def test_role_allowlist_is_relevance_not_a_hard_veto():
     job = make_job(title="Java Architect", location="Delhi",
-                   description="Java Spring Hibernate, 5 years experience")
+                   description="Java Spring Hibernate, 0-2 years experience")
     result = apply_filters(job, FilterConfig(roles=["Python Developer"]))
-    assert not result.passed
-    assert "No matching role, location or skill" in result.reason
+    assert result.passed
+    assert result.status == "PASS"
 def test_employment_type_unknown_is_not_a_veto():
     """Telegram posts rarely say \"Full time\" - silence must not drop the job."""
     job = make_job(employment_type=None,
@@ -193,7 +197,123 @@ def test_exclude_keywords_still_catch_the_real_thing():
                    description="Python FastAPI, 1 year experience")
     result = apply_filters(job, make_config(exclude_keywords=["lead", "senior"]))
     assert not result.passed
-    assert "lead" in result.matched["excluded"]
+    assert "lead" in result.matched["matched"]
+
+
+def test_experience_unknown_is_not_rejected():
+    job = make_job(description="Python backend opportunity; experience not specified.")
+    result = apply_filters(job, make_config())
+    assert result.passed
+    assert result.status == "UNKNOWN"
+    assert result.reason == "insufficient_experience_information"
+
+
+def test_range_experience_is_parsed_without_overrejecting_entry_paths():
+    config = make_config(experience={"max_years": 2, "fresher": True})
+    for description in (
+        "Fresher position, 0-2 years.",
+        "Entry level, 0-3 years.",
+        "Minimum 2 years experience.",
+    ):
+        assert apply_filters(make_job(description=description), config).passed
+    assert not apply_filters(make_job(description="3-5 years required."), config).passed
+    assert not apply_filters(make_job(description="5+ years required."), config).passed
+
+
+def test_unknown_employment_type_is_unknown_not_rejected():
+    job = make_job(employment_type=None, description="Python backend role.")
+    result = apply_filters(job, make_config(employment=["full_time"]))
+    assert result.passed
+    assert result.status == "UNKNOWN"
+
+
+def test_explicit_incompatible_employment_type_rejects():
+    job = make_job(employment_type="part_time")
+    result = apply_filters(job, make_config(employment=["full_time", "internship"]))
+    assert not result.passed
+    assert result.reason == "incompatible_employment_type"
+
+
+def test_explicit_company_exclusion_rejects():
+    job = make_job(company="Acme Technologies Private Limited")
+    profile = CandidateProfile(avoid_companies=["Acme"])
+    result = apply_filters(job, make_config(), profile)
+    assert not result.passed
+    assert result.reason == "excluded_company"
+
+
+def test_remote_job_passes_when_remote_is_configured():
+    job = make_job(location="Remote")
+    result = apply_filters(job, make_config(locations=["Remote", "Pune"]))
+    assert result.passed
+
+
+def test_explicit_incompatible_location_rejects_but_unknown_passes():
+    config = make_config(locations=["Pune", "Remote"])
+    assert not apply_filters(make_job(location="Mumbai"), config).passed
+    unknown = apply_filters(make_job(location=""), config)
+    assert unknown.passed and unknown.status == "UNKNOWN"
+
+
+def test_description_remote_word_does_not_override_explicit_city():
+    job = make_job(location="Mumbai", description="Join our remote-first engineering team.")
+    result = apply_filters(job, make_config(locations=["Pune", "Remote"]))
+    assert not result.passed
+    assert result.reason == "incompatible_location"
+
+
+def test_location_filter_keeps_pune_and_pcmc_distinct():
+    config = make_config(locations=["Pune"])
+    assert apply_filters(make_job(location="Pune, Maharashtra"), config).passed
+    assert not apply_filters(make_job(location="Pimpri-Chinchwad / PCMC"), config).passed
+
+
+@pytest.mark.parametrize("intent,reason", [
+    ("promotional", "promotional_content"),
+    ("educational", "educational_content"),
+])
+def test_non_opportunity_intent_rejects_before_matching(intent, reason):
+    job = make_job(raw_data={"intent_category": intent})
+    result = apply_filters(job, make_config())
+    assert not result.passed
+    assert result.reason == reason
+
+
+def test_skills_are_not_a_hard_requirement():
+    job = make_job(title="AI Engineer", description="Build AI services.")
+    result = apply_filters(job, make_config(skills=["Python"]))
+    assert result.passed
+
+
+def test_junior_python_backend_role_passes():
+    job = make_job(
+        title="Junior Python Backend Developer",
+        description="Python, FastAPI, entry level, 0-2 years.",
+    )
+    profile = CandidateProfile(
+        candidate_type="fresher", experience_years=0,
+        target_max_experience_years=2,
+    )
+    result = apply_filters(job, make_config(), profile)
+    assert result.passed
+    assert result.status == "PASS"
+
+
+def test_missing_optional_filter_fields_are_supported():
+    result = apply_filters(make_job(), FilterConfig())
+    assert result.passed
+    assert result.status == "PASS"
+
+
+def test_yaml_exclusion_changes_filter_decision_without_code_change():
+    job = make_job(title="Python Developer")
+    allow = FilterConfig(**yaml.safe_load("exclude_keywords: []"))
+    reject = FilterConfig(**yaml.safe_load("exclude_keywords:\n  - python developer\n"))
+
+    assert apply_filters(job, allow).passed
+    result = apply_filters(job, reject)
+    assert not result.passed
+    assert result.reason == "excluded_role"
 
 
 

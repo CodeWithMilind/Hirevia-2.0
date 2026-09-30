@@ -192,6 +192,55 @@ def test_missing_application_url_is_stored_but_never_matched_or_alerted(repo):
     assert stored.raw_data["application_url_usable"] is False
 
 
+def test_hard_reject_and_clear_role_miss_never_reach_ai_but_ambiguous_does(repo):
+    senior = make_job(
+        "Senior Java Architect", apply="https://jobs.lever.co/acme/senior",
+        message_id=21,
+    )
+    senior.description = "Java architecture role requiring 8+ years."
+    strong = make_job(
+        "Junior Python Backend Developer", apply="https://jobs.lever.co/acme/python",
+        message_id=22,
+    )
+    strong.description = "Python, FastAPI, 0-2 years, full-time."
+    ambiguous = make_job(
+        "Software Engineer - AI Platform", apply="https://jobs.lever.co/acme/ai",
+        message_id=23,
+    )
+    ambiguous.description = "Build an AI platform."
+    irrelevant = make_job(
+        "Sales Executive", apply="https://jobs.lever.co/acme/sales", message_id=24,
+    )
+    irrelevant.description = "Cold calling, sales quotas, and customer acquisition."
+    jobs = [senior, strong, ambiguous, irrelevant]
+    matcher = FakeMatcher()
+    pipeline = build_pipeline([FakeSource(jobs)], repo, matcher)
+    pipeline.profile = CandidateProfile(
+        candidate_type="fresher",
+        experience_years=0,
+        target_max_experience_years=2,
+        skills=["Python", "FastAPI"],
+        preferred_roles=["Python Backend Developer", "Software Engineer"],
+        role_families=["python_backend", "ai_ml"],
+        preferred_locations=["Pune", "Remote"],
+        remote_preference="preferred",
+        employment_types=["full_time", "internship"],
+    )
+
+    stats = run(pipeline)
+
+    assert set(matcher.calls) == {strong.title, ambiguous.title}
+    assert stats.jobs_filtered == 1
+    assert stats.jobs_hard_filter_passed == 3
+    assert stats.jobs_rule_scored == 3
+    assert stats.jobs_matching_attempted == 2
+    assert stats.jobs_ai_skipped == 1
+    assert stats.jobs_hard_filter_passed == 3
+    assert stats.jobs_rule_scored == 3
+    assert stats.jobs_ai_skipped == 1
+    assert len(jobs) == 4
+
+
 @pytest.mark.parametrize("intent_category", ["unknown", "ambiguous"])
 def test_ambiguous_telegram_intent_is_never_notification_eligible(repo, intent_category):
     job = make_job(apply="https://jobs.lever.co/acme/backend")
@@ -250,10 +299,12 @@ def test_company_and_job_board_links_remain_alertable(repo, application_url, exp
 def test_titleless_posting_is_not_alerted_even_with_a_valid_apply_link(repo):
     job = make_job(title="", apply="https://jobs.lever.co/acme/backend")
     notifier = FakeNotifier()
-    stats = run(build_pipeline([FakeSource([job])], repo, FakeMatcher(), notifier))
+    matcher = FakeMatcher()
+    stats = run(build_pipeline([FakeSource([job])], repo, matcher, notifier))
 
-    assert stats.jobs_matched == 1
-    assert stats.jobs_skipped_notification == 1
+    assert stats.jobs_filtered == 1
+    assert stats.jobs_matching_attempted == 0
+    assert matcher.calls == []
     assert notifier.sent == []
 
 
@@ -428,25 +479,12 @@ def test_high_ai_and_deterministic_scores_cannot_override_a_hard_veto(repo):
         preferred_locations=["Remote"],
         remote_preference="preferred",
     )
-    original_match = pipeline._match
-    observed_verdicts = []
-
-    async def capture_verdict(job, tag):
-        verdict = await original_match(job, tag)
-        observed_verdicts.append(verdict)
-        return verdict
-
-    pipeline._match = capture_verdict
-
     stats = run(pipeline)
 
-    assert stats.jobs_below_match == 1
+    assert stats.jobs_filtered == 1
+    assert stats.jobs_matching_attempted == 0
+    assert matcher.calls == []
     assert notifier.sent == []
-    verdict = observed_verdicts[0]
-    assert verdict.hard_reject is True
-    assert "8+ years" in " ".join(verdict.reject_reasons)
-    assert verdict.ai_score == 100
-    assert verdict.deterministic_score >= 75
 
 
 def test_future_timezone_aware_posting_does_not_crash_eligibility(repo):

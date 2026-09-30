@@ -333,7 +333,8 @@ def test_actionability_and_failure_cases_complete_without_false_alerts(
         assert stored.raw_data["invalid_application_url"] == "not a URL"
         assert stored.raw_data["application_url_usable"] is False
     elif case == "hard-veto":
-        assert fake_ai.calls
+        assert fake_ai.calls == []
+        assert stats.jobs_filtered == 1
         assert verifier.calls == []
     elif case == "ai-failure":
         stored = repo.get_by_source_id(job.source, job.source_job_id)
