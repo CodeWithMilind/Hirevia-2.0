@@ -78,6 +78,18 @@ CITY_ALIASES: Dict[str, List[str]] = {
     "chennai": ["madras"],
 }
 
+# Only encode containment for cities already named in CITY_ALIASES; nearby
+# places not listed there remain distinct rather than being guessed equivalent.
+CITY_REGIONS: Dict[str, set[str]] = {
+    "bengaluru": {"karnataka", "india"},
+    "mumbai": {"maharashtra", "india"},
+    "new delhi": {"india"},
+    "delhi ncr": {"india"},
+    "hyderabad": {"telangana", "india"},
+    "pune": {"maharashtra", "india"},
+    "chennai": {"tamil nadu", "india"},
+}
+
 # A preferred location that covers a whole country/region rather than a place.
 # Matching one of these is real but weaker evidence than matching a named city,
 # so it scores below an exact hit instead of tying with it.
@@ -88,6 +100,19 @@ BROAD_LOCATIONS = {
 }
 _ANYWHERE_PREFERENCES = {"remote", "anywhere", "worldwide", "global", "any",
                          "any location", "work from home", "wfh"}
+_UNKNOWN_LOCATIONS = {
+    "unknown", "n/a", "na", "not specified", "not provided", "not disclosed",
+    "location not specified", "location unavailable", "tbd", "to be determined",
+    "various", "multiple locations", "undisclosed",
+}
+
+
+def _normalize_location(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().casefold())
+
+
+def _contains_location(text: str, token: str) -> bool:
+    return bool(re.search(rf"(?<!\w){re.escape(token)}(?!\w)", text))
 
 
 def _is_broad_location(token: str) -> bool:
@@ -556,14 +581,31 @@ def _score_experience(profile: CandidateProfile, text: str, evidence: MatchEvide
 
 
 def _expand_location(token: str) -> List[str]:
-    token = token.strip().casefold()
-    return [token, *[a for a in CITY_ALIASES.get(token, []) if a != token]]
+    token = _normalize_location(token)
+    for city, aliases in CITY_ALIASES.items():
+        if token == city or token in aliases:
+            return [city, *[alias for alias in aliases if alias != city]]
+    return [token]
+
+
+def _has_named_city(location: str) -> bool:
+    return any(
+        _contains_location(location, token)
+        for city, aliases in CITY_ALIASES.items()
+        for token in (city, *aliases)
+    )
+
+
+def _city_regions(preference: str) -> set[str]:
+    expanded = _expand_location(preference)
+    city = next((name for name in CITY_REGIONS if name in expanded), None)
+    return CITY_REGIONS.get(city, set())
 
 
 def _score_location(job: Job, profile: CandidateProfile, evidence: MatchEvidence) -> None:
     evidence.remote_mode = job_remote_mode(job)
-    location = (job.location or "").casefold()
-    prefs = [str(p).strip().casefold() for p in profile.preferred_locations or [] if str(p).strip()]
+    location = _normalize_location(job.location)
+    prefs = [_normalize_location(p) for p in profile.preferred_locations or [] if _normalize_location(p)]
 
     if not prefs:
         evidence.location_match = None
@@ -580,7 +622,7 @@ def _score_location(job: Job, profile: CandidateProfile, evidence: MatchEvidence
     broad_hit: Optional[str] = None
     for pref in prefs:
         aliases = [a for a in _expand_location(pref) if a]
-        if not any(alias in location for alias in aliases):
+        if not any(_contains_location(location, alias) for alias in aliases):
             continue
         if _is_broad_location(pref):
             broad_hit = broad_hit or pref
@@ -595,10 +637,25 @@ def _score_location(job: Job, profile: CandidateProfile, evidence: MatchEvidence
                      f"remote role{'' if open_world else ' - not one of your cities'}")
         return
 
-    if not location.strip() or location in ("not specified", "unknown", "n/a"):
+    if evidence.remote_mode == "hybrid":
+        location = re.sub(r"\bhybrid\b", " ", location)
+        location = re.sub(r"\s+", " ", location).strip(" ,/-")
+
+    if not location or location in _UNKNOWN_LOCATIONS or not re.search(r"[a-z0-9]", location):
         evidence.location_match = None
         evidence.add("location", NEUTRAL, "posting does not state a location")
         return
+
+    if broad_hit is None and not _has_named_city(location):
+        for pref in prefs:
+            contained_regions = _city_regions(pref)
+            broad_hit = next(
+                (region for region in sorted(contained_regions)
+                 if _contains_location(location, region)),
+                None,
+            )
+            if broad_hit:
+                break
 
     if broad_hit:
         evidence.location_match = None
@@ -863,8 +920,14 @@ def evidence_prompt_block(evidence: MatchEvidence) -> str:
     """Deterministic findings handed to the model, so it judges meaning instead
     of redoing arithmetic it cannot see. Grounding the AI on verifiable facts
     measurably cuts hallucinated skill claims."""
+    location_match = {True: "match", False: "mismatch", None: "unstated"}.get(
+        evidence.location_match, "unstated"
+    )
+    location_score = evidence.signals.get("location", {}).get("score", 0)
     return "\n".join([
         f"deterministic_score: {evidence.score}/100",
+        f"location_match: {location_match}",
+        f"location_score: {location_score}/{WEIGHTS['location']}",
         f"your_skills_mentioned_in_posting: {', '.join(evidence.matched_skills) or 'none'}",
         f"your_skills_not_mentioned: {', '.join(evidence.missing_skills[:10]) or 'none'}",
         f"skills_named_in_posting: {', '.join(evidence.job_skills[:12]) or 'not detectable'}",

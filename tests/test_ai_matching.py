@@ -741,6 +741,8 @@ def test_deterministic_evidence_is_included_in_the_ai_request():
     assert "your_skills_not_mentioned:" in prompt
     assert "skills_named_in_posting:" in prompt
     assert "work_mode:" in prompt
+    assert "location_match: match" in prompt
+    assert "location_score:" in prompt
     assert "transferable_evidence:" in prompt
     for skill in evidence.matched_skills[:2]:       # what the code already found
         assert skill in prompt
@@ -749,6 +751,7 @@ def test_deterministic_evidence_is_included_in_the_ai_request():
 def test_the_model_is_told_the_evidence_is_ground_truth():
     assert "deterministic evidence" in SYSTEM_PROMPT.lower()
     assert "do not invent skills" in SYSTEM_PROMPT.lower()
+    assert "do not count them a second time" in SYSTEM_PROMPT.lower()
 
 
 def test_the_evidence_reaches_the_wire_not_just_the_prompt_builder():

@@ -98,6 +98,8 @@ def test_empty_profile_scores_neutral_everywhere():
         assert evidence.signals[name]["score"] == pytest.approx(
             WEIGHTS[name] * 0.6, abs=0.01
         ), f"{name} should be neutral, not zero"
+    assert evidence.location_match is None
+    assert not evidence.hard_reject
 
 
 # --- skills -------------------------------------------------------------------
@@ -235,6 +237,18 @@ def test_different_city_scores_much_lower():
 
     assert evidence.location_match is False
     assert evidence.signals["location"]["score"] < WEIGHTS["location"] * 0.2
+
+
+def test_ai_location_claim_does_not_override_deterministic_location_evidence():
+    evidence = analyze(make_job(location="Mumbai"), make_profile(preferred_locations=["Pune"]))
+    ai = AIResponse(
+        relevant=True, priority=Priority.P2, match_score=70, location_match=True
+    )
+
+    verdict = combine(evidence, None, ai)
+
+    assert evidence.location_match is False
+    assert verdict.location_match is False
 
 
 def test_remote_is_a_strong_signal_when_preferred():

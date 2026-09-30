@@ -345,14 +345,53 @@ def test_experience_far_beyond_the_ceiling_is_a_reject():
 # ===========================================================================
 
 def test_exact_preferred_city_is_a_full_signal():
-    evidence = analyze(job(location="Pune, Maharashtra"), profile())
+    evidence = analyze(job(location="Pune"), profile())
     assert evidence.location_match is True
     assert evidence.signals["location"]["score"] == pytest.approx(WEIGHTS["location"])
 
 
-def test_city_alias_is_still_an_exact_match():
-    p = profile(preferred_locations=["Bengaluru"])
-    assert analyze(job(location="Bangalore, Karnataka"), p).location_match is True
+@pytest.mark.parametrize(
+    "preferred,job_location",
+    [("Bengaluru", "Bangalore, Karnataka"), ("Bangalore", "Bengaluru, Karnataka")],
+)
+def test_city_alias_is_an_exact_match_in_either_direction(preferred, job_location):
+    assert analyze(job(location=job_location), profile(preferred_locations=[preferred])).location_match is True
+
+
+@pytest.mark.parametrize("location", ["Maharashtra", "India", "Maharashtra / India"])
+def test_a_broad_job_region_is_neutral_for_a_contained_city(location):
+    evidence = analyze(job(location=location), profile(preferred_locations=["Pune"]))
+
+    assert evidence.location_match is None
+    assert evidence.signals["location"]["score"] == pytest.approx(0.7 * WEIGHTS["location"])
+
+
+def test_nearby_city_is_not_assumed_to_be_an_exact_alias():
+    evidence = analyze(
+        job(location="Pimpri-Chinchwad / PCMC"), profile(preferred_locations=["Pune"])
+    )
+
+    assert evidence.location_match is False
+    assert evidence.signals["location"]["score"] < 0.2 * WEIGHTS["location"]
+    assert not evidence.hard_reject
+
+
+def test_location_matching_normalizes_case_and_whitespace():
+    evidence = analyze(
+        job(location="  pUnE   "), profile(preferred_locations=["  Pune  "])
+    )
+
+    assert evidence.location_match is True
+    assert evidence.signals["location"]["score"] == pytest.approx(WEIGHTS["location"])
+
+
+def test_any_exact_city_in_a_multiple_location_posting_matches():
+    evidence = analyze(
+        job(location="Mumbai / Pune / Bengaluru"), profile(preferred_locations=["Pune"])
+    )
+
+    assert evidence.location_match is True
+    assert evidence.signals["location"]["score"] == pytest.approx(WEIGHTS["location"])
 
 
 @pytest.mark.parametrize("location", ["Mumbai, India", "Bangalore, Karnataka, India"])
@@ -369,7 +408,7 @@ def test_a_different_city_beats_nothing_but_loses_to_the_exact_one(location):
 
 
 def test_missing_location_is_neutral_not_a_rejection():
-    for empty in ("", "Not specified", "unknown"):
+    for empty in ("", "Not specified", "unknown", "TBD", "Multiple locations", "???"):
         evidence = analyze(job(location=empty), profile())
         assert evidence.location_match is None
         assert not evidence.hard_reject
@@ -392,6 +431,21 @@ def test_a_broad_location_alone_still_matches():
     assert evidence.signals["location"]["score"] > 0.5 * WEIGHTS["location"]
 
 
+def test_city_match_and_broad_region_use_the_deterministic_hybrid_score_once():
+    from hirevia.core.matching import combine
+    from hirevia.core.models import AIResponse, Priority
+
+    evidence = analyze(job(location="India"), profile(preferred_locations=["Pune"]))
+    verdict = combine(
+        evidence, None,
+        AIResponse(relevant=True, priority=Priority.P2, match_score=70),
+    )
+
+    assert verdict.location_match is None
+    assert verdict.deterministic_score == evidence.score
+    assert verdict.match_score == round(evidence.score * 0.6 + 70 * 0.4)
+
+
 # ===========================================================================
 # Remote / work mode
 # ===========================================================================
@@ -401,11 +455,22 @@ def test_remote_is_strong_when_preferred():
 
     assert job_remote_mode(job(location="Remote")) == "remote"
     assert evidence.signals["remote"]["score"] == pytest.approx(WEIGHTS["remote"])
+    assert evidence.location_match is None
+    assert evidence.signals["location"]["score"] == pytest.approx(0.55 * WEIGHTS["location"])
 
 
 def test_hybrid_sits_between_remote_and_onsite():
     hybrid = analyze(job(location="Pune", description="Hybrid, 2 days in office. Python, SQL."), profile())
+    assert hybrid.location_match is True
+    assert hybrid.signals["location"]["score"] == pytest.approx(WEIGHTS["location"])
     assert hybrid.signals["remote"]["score"] == pytest.approx(0.7 * WEIGHTS["remote"])
+
+
+def test_hybrid_without_a_stated_city_does_not_claim_a_location_mismatch():
+    evidence = analyze(job(location="Hybrid"), profile(preferred_locations=["Pune"]))
+
+    assert evidence.location_match is None
+    assert evidence.signals["location"]["score"] == pytest.approx(NEUTRAL * WEIGHTS["location"])
 
 
 def test_onsite_is_penalised_when_remote_is_only_acceptable():

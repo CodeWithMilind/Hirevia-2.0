@@ -51,8 +51,8 @@ Judge, in this order:
    ground truth for which skills the posting mentions; do not invent skills and
    do not claim a skill match the evidence contradicts.
 3. Experience/seniority fit, including whether the range is a real bar or boilerplate.
-4. Location / remote / employment-type fit.
-5. Career trajectory: would applying here make sense for this person next?
+4. Career trajectory: would applying here make sense for this person next,
+   excluding location / remote / employment-type fit.
 
 Rules:
 - Be selective. relevant=true only when there is a realistic chance AND genuine
@@ -60,6 +60,9 @@ Rules:
   engineer) is false even if keywords overlap.
 - A vague posting (no company, no clear role, no apply link) is not a strong match.
 - Transferable skills earn partial credit, never full credit.
+- Location, remote mode and employment type are already scored in the
+    deterministic evidence. Do not use those signals to change relevance,
+    match_score or priority; do not count them a second time.
 - match_score: integer 0-100. Stay within ~10 points of the deterministic score
   unless the posting clearly contradicts it; explain a larger gap in reasons.
 - priority: P1 apply now, P2 worth applying, P3 weak/marginal.
