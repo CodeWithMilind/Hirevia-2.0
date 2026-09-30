@@ -209,6 +209,12 @@ class OpenAICompatibleClient:
         Rate limits and timeouts are retried with backoff; auth and unknown
         model errors surface immediately because retrying cannot help.
         """
+        if (
+            self.provider_name == "nvidia"
+            and self.model.rsplit("/", 1)[-1].casefold() == "nemotron-3.5-lightning-30b-a3b"
+        ):
+            return await self._prompt_json_completion(messages, schema, temperature, max_tokens)
+
         response_format = {"type": "json_schema", "json_schema": {"name": "response", "schema": schema}}
 
         last_error: Optional[Exception] = None
@@ -262,16 +268,39 @@ class OpenAICompatibleClient:
     ) -> dict:
         """Fallback path for models without structured-output support."""
         schema_hint = json.dumps(schema, ensure_ascii=False)[:1500]
-        prompt = [dict(messages[0])] if messages and messages[0].get("role") == "system" else []
-        rest = messages[len(prompt):]
-        prompt.append({"role": "user", "content": "JSON schema:\n" + schema_hint})
-        prompt.extend(rest)
-        prompt[-1] = {**prompt[-1], "content": prompt[-1].get("content", "") + self._JSON_INSTRUCTION}
+        is_nemotron = (
+            self.provider_name == "nvidia"
+            and self.model.rsplit("/", 1)[-1].casefold() == "nemotron-3.5-lightning-30b-a3b"
+        )
+        if is_nemotron:
+            task = "\n\n".join(
+                str(message.get("content", ""))
+                for message in messages
+                if message.get("content")
+            )
+            prompt = [{
+                "role": "user",
+                "content": "JSON schema:\n" + schema_hint + "\n\n" + task + self._JSON_INSTRUCTION,
+            }]
+        else:
+            prompt = [dict(messages[0])] if messages and messages[0].get("role") == "system" else []
+            rest = messages[len(prompt):]
+            prompt.append({"role": "user", "content": "JSON schema:\n" + schema_hint})
+            prompt.extend(rest)
+            prompt[-1] = {
+                **prompt[-1],
+                "content": prompt[-1].get("content", "") + self._JSON_INSTRUCTION,
+            }
 
         content = await self.chat_completion(
             messages=prompt, temperature=temperature, max_tokens=max_tokens, response_format=None
         )
-        return extract_json_object(content)
+        try:
+            return extract_json_object(content)
+        except json.JSONDecodeError as error:
+            raise AIInvalidResponseError(
+                f"model returned unusable JSON: {error.msg}"
+            ) from error
 
 
 class NVIDIAClient(OpenAICompatibleClient):

@@ -7,12 +7,15 @@ every ScanStats field the pipeline reports.
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
 
+from hirevia.ai.client import AIInvalidResponseError
+from hirevia.ai.matcher import MATCH_RESPONSE_SCHEMA
 from hirevia import cli as cli_module
 from hirevia.cli import _build_notifier, _print_stats, _resolve_nvidia_key, cli
 from hirevia.config import Config
@@ -210,14 +213,17 @@ def test_telegram_message_details_are_debug_not_normal_info(caplog):
 def test_logging_configuration_is_idempotent_and_verbose_is_debug(monkeypatch):
     root = logging.getLogger()
     telethon_logger = logging.getLogger("telethon")
+    httpx_logger = logging.getLogger("httpx")
     original_handlers = root.handlers
     original_level = root.level
     original_telethon_level = telethon_logger.level
+    original_httpx_level = httpx_logger.level
     root.handlers = []
     try:
         monkeypatch.delenv("HIREVIA_LOG_LEVEL", raising=False)
         cli_module.configure_logging()
         assert telethon_logger.level == logging.WARNING
+        assert httpx_logger.level == logging.WARNING
         first_count = len(root.handlers)
         cli_module.configure_logging()
         assert first_count == len(root.handlers) == 1
@@ -225,6 +231,7 @@ def test_logging_configuration_is_idempotent_and_verbose_is_debug(monkeypatch):
         assert root.level == logging.DEBUG
         assert root.handlers[0].level == logging.DEBUG
         assert telethon_logger.level == logging.DEBUG
+        assert httpx_logger.level == logging.DEBUG
         monkeypatch.setenv("HIREVIA_LOG_LEVEL", "DEBUG")
         cli_module.configure_logging()
         assert root.level == logging.DEBUG
@@ -235,6 +242,7 @@ def test_logging_configuration_is_idempotent_and_verbose_is_debug(monkeypatch):
         root.handlers = original_handlers
         root.setLevel(original_level)
         telethon_logger.setLevel(original_telethon_level)
+        httpx_logger.setLevel(original_httpx_level)
 
 
 def test_scan_verbose_option_enables_debug_logs(monkeypatch, tmp_path):
@@ -254,6 +262,14 @@ def test_scan_verbose_option_enables_debug_logs(monkeypatch, tmp_path):
     assert seen["level"] == logging.DEBUG
 
 
+def test_unimplemented_sources_are_disabled_by_default():
+    config = Config()
+    for name in ("naukri", "indeed", "internshala", "cutshort", "unstop"):
+        assert name in config.sources.sources
+        assert config.sources.sources[name].enabled is False
+    assert config.sources.sources["telegram"].enabled is True
+
+
 def test_ai_status_reports_configuration_without_secrets(monkeypatch):
     monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
     monkeypatch.setenv("GROQ_API_KEY", "groq-CANARY-do-not-print")
@@ -265,6 +281,138 @@ def test_ai_status_reports_configuration_without_secrets(monkeypatch):
     assert "NVIDIA (primary)" in result.output
     assert "GROQ" in result.output and "configured" in result.output
     assert "groq-CANARY-do-not-print" not in result.output
+
+
+def test_httpx2_logging_is_quiet_at_info_and_visible_at_debug():
+    logger = logging.getLogger("httpx2")
+    previous_level = logger.level
+    try:
+        cli_module.configure_logging(verbose=False)
+        assert logger.level == logging.WARNING
+        assert not logger.isEnabledFor(logging.INFO)
+
+        cli_module.configure_logging(verbose=True)
+        assert logger.level == logging.DEBUG
+        assert logger.isEnabledFor(logging.INFO)
+    finally:
+        logger.setLevel(previous_level)
+
+
+def test_ai_set_primary_persists_configured_provider(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLAMACPP_API_KEY", "llama-secret-CANARY")
+    monkeypatch.setenv("LLAMACPP_MODEL", "hirevia-qwen3-1.7b")
+    monkeypatch.setattr(cli_module, "load_config", lambda: Config(ai={"primary": "nvidia"}))
+
+    result = CliRunner().invoke(cli, ["ai", "set-primary", "llamacpp"])
+
+    assert result.exit_code == 0, result.output
+    assert "Previous: nvidia" in result.output
+    assert "Primary : llamacpp" in result.output
+    assert "Model   : hirevia-qwen3-1.7b" in result.output
+    assert "llama-secret-CANARY" not in result.output
+    assert (tmp_path / ".env").read_text(encoding="utf-8").strip() == "AI_PRIMARY_PROVIDER=llamacpp"
+
+
+def test_ai_set_primary_nvidia_and_status_show_selection(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-secret-CANARY")
+    monkeypatch.setattr(cli_module, "load_config", lambda: Config(ai={"primary": "llamacpp"}))
+
+    result = CliRunner().invoke(cli, ["ai", "set-primary", "nvidia"])
+    monkeypatch.setattr(cli_module, "load_config", lambda: Config(ai={"primary": "nvidia"}))
+    status = CliRunner().invoke(cli, ["ai", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "nvidia-secret-CANARY" not in result.output
+    assert status.exit_code == 0, status.output
+    assert "NVIDIA (primary)" in status.output
+    assert "nvidia-secret-CANARY" not in status.output
+
+
+def test_ai_set_primary_unknown_or_unconfigured_leaves_config_unchanged(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_PRIMARY_PROVIDER", "nvidia")
+    monkeypatch.setattr(cli_module, "load_config", lambda: Config(ai={"primary": "nvidia"}))
+
+    unknown = CliRunner().invoke(cli, ["ai", "set-primary", "unknown"])
+    unconfigured = CliRunner().invoke(cli, ["ai", "set-primary", "groq"])
+
+    assert unknown.exit_code != 0
+    assert "Unknown AI provider" in unknown.output
+    assert unconfigured.exit_code != 0
+    assert "Status: not configured" in unconfigured.output
+    assert not (tmp_path / ".env").exists()
+    assert os.environ["AI_PRIMARY_PROVIDER"] == "nvidia"
+
+
+def test_ai_test_calls_only_selected_primary_provider(monkeypatch):
+    called = []
+
+    class FakeProvider:
+        model = "hirevia-qwen3-1.7b"
+
+        async def structured_completion(self, **kwargs):
+            called.append(kwargs)
+            return {
+                "match": True,
+                "match_score": 72,
+                "priority": "P2",
+                "reason": "Python backend skills fit the role.",
+                "matched_skills": ["Python", "SQL"],
+            }
+
+    config = Config(ai={"primary": "llamacpp"})
+    monkeypatch.setattr(cli_module, "load_config", lambda: config)
+    monkeypatch.setattr(cli_module, "provider_status", lambda config: [
+        {"name": "llamacpp", "model": "hirevia-qwen3-1.7b", "configured": True}
+    ])
+    monkeypatch.setattr(cli_module, "build_ai_provider_router", lambda config: SimpleNamespace(
+        primary="llamacpp", providers={"llamacpp": FakeProvider()}
+    ))
+
+    result = CliRunner().invoke(cli, ["ai", "test"])
+
+    assert result.exit_code == 0, result.output
+    assert "Provider: llamacpp" in result.output
+    assert "Model: hirevia-qwen3-1.7b" in result.output
+    assert "✓ Connection successful" in result.output
+    assert "✓ Model responded" in result.output
+    assert len(called) == 1
+    assert called[0]["schema"] == MATCH_RESPONSE_SCHEMA
+    assert called[0]["temperature"] == 0.1
+    assert called[0]["max_tokens"] == 600
+    assert called[0]["messages"][0]["role"] == "system"
+    assert called[0]["messages"][1]["role"] == "user"
+    assert "Junior Python Backend Developer" in called[0]["messages"][1]["content"]
+
+
+def test_ai_test_rejects_unusable_matching_response(monkeypatch):
+    class FakeProvider:
+        model = "openai/gpt-oss-20b"
+
+        async def structured_completion(self, **kwargs):
+            raise AIInvalidResponseError("model returned unusable JSON: Expecting value")
+
+    config = Config(ai={"primary": "nvidia"})
+    monkeypatch.setattr(cli_module, "load_config", lambda: config)
+    monkeypatch.setattr(cli_module, "provider_status", lambda config: [
+        {"name": "nvidia", "model": "openai/gpt-oss-20b", "configured": True}
+    ])
+    monkeypatch.setattr(cli_module, "build_ai_provider_router", lambda config: SimpleNamespace(
+        primary="nvidia", providers={"nvidia": FakeProvider()}
+    ))
+
+    result = CliRunner().invoke(cli, ["ai", "test"])
+
+    assert result.exit_code == 1
+    assert "Provider test failed" in result.output
+    assert "AI provider is ready" not in result.output
+
+
+def test_router_removes_primary_from_fallback_and_keeps_other_providers():
+    from hirevia.ai.providers import AIProviderRouter
+
+    router = AIProviderRouter({}, "llamacpp", ["nvidia", "groq", "ollama", "llamacpp"])
+
+    assert router.fallback == ["nvidia", "groq", "ollama"]
 
 
 def test_start_loop_survives_errors_and_closes_the_notifier(monkeypatch, tmp_path):

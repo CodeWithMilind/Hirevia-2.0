@@ -39,6 +39,7 @@ from hirevia.ai.client import (
     AIRateLimitError,
     AIServerError,
     AITimeoutError,
+    OpenAICompatibleClient,
     NVIDIAClient,
     classify_api_error,
     extract_json_object,
@@ -57,6 +58,7 @@ from hirevia.core.models import AIResponse, CandidateProfile, Job, MatchResult, 
 # stored payload or prompt anywhere in the AI layer.
 API_KEY = "nvapi-CANARY-s3cr3t-never-log-me"
 BASE_URL = "https://integrate.api.nvidia.com/v1"
+NEMOTRON_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 
 VALID_PAYLOAD = {
     "match": True,
@@ -624,7 +626,7 @@ def test_client_is_wired_from_the_config_never_a_hardcoded_model():
     visible on the dataclass - an explicit NVIDIA_MODEL wins over .env, which is
     covered by test_nvidia_model_env_var_reaches_the_request.)
     """
-    assert Config().nvidia_model == "meta/llama-3.1-70b-instruct"   # documented fallback
+    assert Config().nvidia_model == "openai/gpt-oss-20b"   # documented fallback
 
     from_config = load_config()
     assert from_config.nvidia_model.strip()
@@ -657,6 +659,58 @@ def test_an_endpoint_that_rejects_structured_output_falls_back_to_prompted_json(
     assert "response_format" in fake.calls[0] and "response_format" not in fake.calls[1]
     assert fake.calls[1]["messages"][1]["content"].startswith("JSON schema:")
     assert fake.calls[1]["messages"][-1]["content"].endswith("No markdown, no commentary.")
+
+
+def test_nvidia_nemotron_uses_prompted_json_without_response_format():
+    config = make_config(nvidia_model=NEMOTRON_MODEL)
+    config.ai.fallback = []
+    matcher, fake = make_matcher(completion(VALID_JSON), config=config)
+
+    response = ask(matcher)
+
+    assert response.degraded is False and response.match_score == 82
+    assert len(fake.calls) == 1
+    sent = fake.calls[0]
+    assert "response_format" not in sent
+    assert len(sent["messages"]) == 1
+    assert sent["messages"][0]["role"] == "user"
+    assert SYSTEM_PROMPT in sent["messages"][0]["content"]
+    assert "JSON schema:" in sent["messages"][0]["content"]
+    assert "JOB POSTING:" in sent["messages"][0]["content"]
+    assert sent["messages"][0]["content"].endswith(
+        "Respond with ONLY a valid JSON object matching the provided schema. "
+        "No markdown, no commentary."
+    )
+    assert sent["temperature"] == 0.1 and sent["max_tokens"] == 600
+
+
+def test_nvidia_nemotron_malformed_prompted_json_becomes_invalid_response():
+    config = make_config(nvidia_model=NEMOTRON_MODEL)
+    config.ai.fallback = []
+    matcher, fake = make_matcher(completion("not JSON"), config=config)
+
+    response = ask(matcher)
+
+    assert response.degraded is True and response.status == "failed"
+    assert "unusable JSON" in response.error
+    assert "not JSON" not in response.error
+    assert len(fake.calls) == 1
+    assert "response_format" not in fake.calls[0]
+
+
+def test_nemotron_specialization_is_scoped_to_nvidia_provider():
+    client = OpenAICompatibleClient(
+        "https://example.test/v1", NEMOTRON_MODEL, "fake-key", provider_name="groq"
+    )
+    fake = wire(client, completion(VALID_JSON))
+
+    result = asyncio.run(client.structured_completion(
+        messages=[{"role": "user", "content": "Return JSON."}],
+        schema={"type": "object"}, retries=0,
+    ))
+
+    assert result["match_score"] == 82
+    assert "response_format" in fake.calls[0]
 
 
 def test_the_prompted_json_fallback_cannot_hide_a_second_bad_answer():

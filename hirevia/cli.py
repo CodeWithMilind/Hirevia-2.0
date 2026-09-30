@@ -12,10 +12,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from hirevia.ai.client import AIError
 from hirevia.ai.matcher import AIMatcher
-from hirevia.ai.providers import provider_status
+from hirevia.ai.providers import build_ai_provider_router, provider_status
 from hirevia.config import Config, load_config, get_telegram_token
-from hirevia.core.models import ScanStats
+from hirevia.core.matching import analyze
+from hirevia.core.models import CandidateProfile, Job, ScanStats
 from hirevia.core.pipeline import run_single_scan
 from hirevia.core.verification import classify_application_url
 from hirevia.core.freshness import freshness_label
@@ -38,6 +40,10 @@ def configure_logging(verbose: bool = False) -> None:
     logging.getLogger("telethon").setLevel(
         logging.DEBUG if level <= logging.DEBUG else logging.WARNING
     )
+    for logger_name in ("httpx", "httpx2"):
+        logging.getLogger(logger_name).setLevel(
+            logging.DEBUG if level <= logging.DEBUG else logging.WARNING
+        )
     if not root.handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter(
@@ -432,12 +438,113 @@ def ai_status():
     if not config.ai.enabled:
         console.print("AI matching: disabled")
         return
-    for provider in provider_status(config):
+    for provider in sorted(provider_status(config), key=lambda item: not item["primary"]):
         role = " (primary)" if provider["primary"] else ""
         state = "configured" if provider["configured"] else "not configured"
         console.print(f"\n{provider['name'].upper()}{role}")
         console.print(f"  Model: {provider['model'] or 'not set'}")
         console.print(f"  Status: {state}")
+
+
+def _persist_primary_provider(provider: str) -> None:
+    """Persist the non-secret primary provider setting in the existing dotenv file."""
+    env_path = Path.cwd() / ".env"
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    setting = f"AI_PRIMARY_PROVIDER={provider}"
+    updated = False
+    for index, line in enumerate(lines):
+        key = line.strip().removeprefix("export ").partition("=")[0].strip()
+        if key == "AI_PRIMARY_PROVIDER":
+            lines[index] = setting
+            updated = True
+    if not updated:
+        lines.append(setting)
+    content = "\n".join(lines) + "\n"
+    temp_path = env_path.with_name(env_path.name + ".tmp")
+    try:
+        temp_path.write_text(content, encoding="utf-8")
+        temp_path.replace(env_path)
+    except OSError:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+@ai.command(name="set-primary")
+@click.argument("provider")
+def ai_set_primary(provider: str):
+    """Set the primary AI provider after validating its configuration."""
+    name = provider.strip().lower()
+    config = load_config()
+    previous = config.ai.primary
+    if name not in {"nvidia", "groq", "ollama", "llamacpp"} or name not in config.ai.providers:
+        console.print(f"[red]✗ Unknown AI provider: {provider}[/red]")
+        raise click.ClickException("Supported providers: nvidia, groq, ollama, llamacpp")
+
+    row = next((item for item in provider_status(config) if item["name"] == name), None)
+    if row is None or not row["configured"]:
+        console.print(f"[red]✗ Cannot set {name.title()} as primary[/red]")
+        console.print(f"\n  Provider: {name}\n  Status: not configured\n\n  Configure the provider first.")
+        raise click.exceptions.Exit(1)
+
+    try:
+        _persist_primary_provider(name)
+    except OSError as error:
+        raise click.ClickException(f"Could not persist primary provider ({type(error).__name__})") from error
+    console.print("[green]✓ Primary AI provider changed[/green]")
+    console.print(f"\n  Previous: {previous}\n  Primary : {name}\n  Model   : {row['model']}\n  Status  : configured")
+
+
+@ai.command(name="test")
+def ai_test():
+    """Send a representative matching request to the configured primary provider."""
+    config = load_config()
+    primary = config.ai.primary
+    row = next((item for item in provider_status(config) if item["name"] == primary), None)
+    if row is None or not row["configured"]:
+        console.print(f"[red]✗ Primary provider {primary} is not configured[/red]")
+        raise click.exceptions.Exit(1)
+
+    router = build_ai_provider_router(config)
+    provider = router.providers.get(primary)
+    if provider is None:
+        console.print(f"[red]✗ Primary provider {primary} could not be initialized[/red]")
+        raise click.exceptions.Exit(1)
+
+    console.print("Testing primary provider...\n")
+    console.print(f"Provider: {primary}\nModel: {row['model']}")
+    job = Job(
+        source="ai-health-check",
+        source_job_id="synthetic-python-backend-role",
+        title="Junior Python Backend Developer",
+        company="Example Co",
+        location="Remote",
+        description="Fresher-friendly backend role using Python and SQL. 0-2 years.",
+        url="https://example.com/jobs/ai-health-check",
+        application_url="https://example.com/jobs/ai-health-check/apply",
+    )
+    profile = CandidateProfile(
+        candidate_type="fresher",
+        experience_years=0,
+        target_max_experience_years=2,
+        accept_fresher=True,
+        skills=["Python", "SQL"],
+        preferred_roles=["Python Developer", "Backend Developer"],
+        preferred_locations=["Remote"],
+    )
+    matcher = AIMatcher(config, provider=provider)
+    response = asyncio.run(matcher.match(job, profile, analyze(job, profile)))
+    if response.degraded or response.status != "ok":
+        reason = response.error or "model returned an unusable matching response"
+        for spec in config.ai.providers.values():
+            secret = os.getenv(spec.api_key_env) if spec.api_key_env else None
+            if secret:
+                reason = reason.replace(secret, "[redacted]")
+        console.print(f"[red]✗ Provider test failed: {reason}[/red]")
+        raise click.exceptions.Exit(1)
+
+    console.print("\n[green]✓ Connection successful[/green]")
+    console.print("[green]✓ Model responded[/green]")
+    console.print("[green]✓ AI provider is ready[/green]")
 
 
 def _print_stats(stats: ScanStats):

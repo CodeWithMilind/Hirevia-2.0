@@ -16,19 +16,19 @@ sources:
     enabled: false
 
   naukri:
-    enabled: true
+    enabled: false
 
   linkedin:
     enabled: false
 
   indeed:
-    enabled: true
+    enabled: false
 
   internshala:
-    enabled: true
+    enabled: false
 
   cutshort:
-    enabled: true
+    enabled: false
 
   hirist:
     enabled: false
@@ -40,7 +40,7 @@ sources:
     enabled: false
 
   unstop:
-    enabled: true
+    enabled: false
 
   telegram:
     enabled: true

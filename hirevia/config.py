@@ -32,8 +32,28 @@ class SourceConfig(BaseModel):
     enabled: bool = False
 
 
+DEFAULT_SOURCES = {
+    "company_careers": SourceConfig(enabled=False),
+    "greenhouse": SourceConfig(enabled=False),
+    "lever": SourceConfig(enabled=False),
+    "ashby": SourceConfig(enabled=False),
+    "smartrecruiters": SourceConfig(enabled=False),
+    "naukri": SourceConfig(enabled=False),
+    "linkedin": SourceConfig(enabled=False),
+    "indeed": SourceConfig(enabled=False),
+    "internshala": SourceConfig(enabled=False),
+    "cutshort": SourceConfig(enabled=False),
+    "hirist": SourceConfig(enabled=False),
+    "instahyre": SourceConfig(enabled=False),
+    "wellfound": SourceConfig(enabled=False),
+    "unstop": SourceConfig(enabled=False),
+    "telegram": SourceConfig(enabled=True),
+    "whatsapp": SourceConfig(enabled=False),
+}
+
+
 class SourcesConfig(BaseModel):
-    sources: Dict[str, SourceConfig] = Field(default_factory=dict)
+    sources: Dict[str, SourceConfig] = Field(default_factory=lambda: {name: config.model_copy() for name, config in DEFAULT_SOURCES.items()})
 
     def get_enabled_sources(self) -> list[str]:
         return [name for name, config in self.sources.items() if config.enabled]
@@ -59,7 +79,7 @@ def _default_ai_providers() -> Dict[str, AIProviderConfig]:
     return {
         "nvidia": AIProviderConfig(
             base_url="https://integrate.api.nvidia.com/v1",
-            model="meta/llama-3.1-70b-instruct",
+            model="openai/gpt-oss-20b",
             api_key_env="NVIDIA_API_KEY",
         ),
         "groq": AIProviderConfig(
@@ -81,7 +101,7 @@ def _default_ai_providers() -> Dict[str, AIProviderConfig]:
 class AIConfig(BaseModel):
     enabled: bool = True
     primary: str = "nvidia"
-    fallback: List[str] = Field(default_factory=lambda: ["groq", "ollama", "llamacpp"])
+    fallback: List[str] = Field(default_factory=lambda: ["nvidia", "groq", "ollama", "llamacpp"])
     timeout_seconds: int = Field(default=20, ge=1, le=300)
     max_retries: int = Field(default=1, ge=0, le=3)
     cooldown_seconds: int = Field(default=120, ge=1, le=300)
@@ -93,7 +113,7 @@ class Config(BaseModel):
     filters: FilterConfig = Field(default_factory=FilterConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nvidia_model: str = "meta/llama-3.1-70b-instruct"
+    nvidia_model: str = "openai/gpt-oss-20b"
     scan_interval_minutes: int = 30
     notification_retry_attempts: int = 3
     notification_retry_delay_seconds: int = 60
@@ -201,6 +221,7 @@ def load_config(
     nvidia = provider_data["nvidia"]
     nvidia["base_url"] = os.getenv("NVIDIA_BASE_URL", nvidia["base_url"])
     nvidia["model"] = os.getenv("NVIDIA_MODEL", nvidia["model"])
+    ai_data["primary"] = os.getenv("AI_PRIMARY_PROVIDER", ai_data.get("primary", "nvidia"))
     ai_data["providers"] = provider_data
     if os.getenv("AI_TIMEOUT_SECONDS"):
         ai_data["timeout_seconds"] = _env_int("AI_TIMEOUT_SECONDS", 20)

@@ -40,7 +40,6 @@ class AIProviderRouter:
         AIRateLimitError,
         AIServerError,
         AIModelUnavailableError,
-        AIInvalidResponseError,
     )
 
     def __init__(
@@ -128,6 +127,12 @@ class AIProviderRouter:
                 self.last_provider = name
                 self.last_model = provider.model
                 return result
+            except AIInvalidResponseError as error:
+                last_error = error
+                logger.debug(
+                    "[AI] provider %s returned unusable model output (%s); trying fallback",
+                    name, type(error).__name__,
+                )
             except self._FALLBACK_ERRORS as error:
                 last_error = error
                 delay = max(self.cooldown_seconds, getattr(error, "retry_after", 0.0))

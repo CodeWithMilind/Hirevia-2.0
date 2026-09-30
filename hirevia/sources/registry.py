@@ -31,6 +31,7 @@ class SourceRegistry:
     def __init__(self, config: Config):
         self.config = config
         self._sources: Dict[str, JobSource] = {}
+        self._warned_source_errors: set[str] = set()
         self._load_sources()
 
     def _load_sources(self):
@@ -53,9 +54,14 @@ class SourceRegistry:
                                 break
                     logger.debug("Loaded source: %s", source_name)
                 except Exception as e:
-                    logger.warning(f"Failed to load source {source_name}: {e}")
+                    signature = f"{source_name}:{type(e).__name__}:{str(e)}"
+                    if signature not in self._warned_source_errors:
+                        logger.warning("Failed to load source %s: %s", source_name, e)
+                        self._warned_source_errors.add(signature)
             else:
-                logger.warning(f"Unknown source: {source_name}")
+                if source_name not in self._warned_source_errors:
+                    logger.warning(f"Unknown source: {source_name}")
+                    self._warned_source_errors.add(source_name)
 
     def get_enabled_sources(self) -> List[JobSource]:
         return list(self._sources.values())

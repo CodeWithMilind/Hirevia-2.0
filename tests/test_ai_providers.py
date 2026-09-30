@@ -17,9 +17,10 @@ from hirevia.ai.client import (
     OpenAICompatibleClient,
     classify_api_error,
 )
-from hirevia.ai.matcher import AIMatcher
+from hirevia.ai.matcher import AIMatcher, MATCH_RESPONSE_SCHEMA, SYSTEM_PROMPT
 from hirevia.ai.providers import AIConfigurationError, AIProviderRouter, build_ai_provider_router, provider_status
 from hirevia.config import AIConfig, Config, load_config
+from hirevia.core.matching import analyze
 from hirevia.core.models import CandidateProfile, Job
 
 
@@ -47,6 +48,92 @@ class FakeProvider:
 
 def invoke(router):
     return asyncio.run(router.structured_completion(messages=[], schema={}))
+
+
+def make_openai_fake(provider_name, content, model):
+    calls = []
+
+    async def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=content)
+        )])
+
+    endpoint = "http://127.0.0.1:8080/v1" if provider_name == "llamacpp" else "https://example.test/v1"
+    client = OpenAICompatibleClient(
+        endpoint, model, "fake-api-key", provider_name=provider_name
+    )
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    return client, calls
+
+
+def test_llamacpp_simple_structured_request_parses_valid_json():
+    provider, calls = make_openai_fake(
+        "llamacpp", '{"match": true, "match_score": 81, "priority": "P2", "reason": "Python role."}',
+        "hirevia-qwen3-1.7b",
+    )
+
+    result = asyncio.run(provider.structured_completion(
+        messages=[{"role": "user", "content": "Reply with JSON."}],
+        schema={"type": "object"}, retries=0,
+    ))
+
+    assert result["match_score"] == 81
+    assert calls[0]["response_format"]["type"] == "json_schema"
+    assert provider.model == "hirevia-qwen3-1.7b"
+
+
+def test_llamacpp_matching_request_shape_returns_parsed_verdict():
+    content = '{"match": true, "match_score": 81, "priority": "P2", "reason": "Python role."}'
+    provider, calls = make_openai_fake("llamacpp", content, "hirevia-qwen3-1.7b")
+    router = AIProviderRouter({"llamacpp": provider}, "llamacpp", [])
+    matcher = AIMatcher(Config(), provider=router)
+    job = Job(
+        source="diagnostic", source_job_id="one", title="Junior Python Developer",
+        company="Example Co", location="Remote",
+        description="Entry-level backend role using Python and SQL.",
+        url="https://example.test/jobs/one",
+        application_url="https://example.test/jobs/one/apply",
+    )
+    profile = CandidateProfile(skills=["Python", "SQL"], preferred_roles=["Python Developer"])
+
+    response = asyncio.run(matcher.match(job, profile, analyze(job, profile)))
+
+    assert response.status == "ok" and response.degraded is False
+    assert response.raw_data["provider"] == "llamacpp"
+    assert calls[0]["messages"][0]["content"] == SYSTEM_PROMPT
+    assert "Junior Python Developer" in calls[0]["messages"][1]["content"]
+    assert calls[0]["response_format"]["json_schema"]["schema"] == MATCH_RESPONSE_SCHEMA
+    assert calls[0]["temperature"] == 0.1 and calls[0]["max_tokens"] == 600
+
+
+@pytest.mark.parametrize("content", [None, "not JSON"])
+def test_nvidia_empty_or_malformed_content_is_a_model_response_error(content):
+    provider, _ = make_openai_fake("nvidia", content, "openai/gpt-oss-20b")
+
+    with pytest.raises(AIInvalidResponseError):
+        asyncio.run(provider.structured_completion(
+            messages=[{"role": "user", "content": "Return JSON."}],
+            schema={"type": "object"}, retries=0,
+        ))
+
+
+def test_model_response_failure_falls_back_without_cooling_primary(caplog):
+    llamacpp = FakeProvider(AIInvalidResponseError("empty completion"), VALID_RESULT)
+    nvidia = FakeProvider(VALID_RESULT)
+    router = AIProviderRouter(
+        {"llamacpp": llamacpp, "nvidia": nvidia},
+        "llamacpp", ["nvidia"], cooldown_seconds=10,
+    )
+
+    assert invoke(router) == VALID_RESULT
+    assert "llamacpp" not in router._cooldown_until
+    assert invoke(router) == VALID_RESULT
+    assert llamacpp.calls == 2
+    assert router.last_provider == "llamacpp"
+    assert "temporarily unavailable" not in caplog.text
 
 
 def test_primary_provider_success_does_not_call_fallback():
@@ -166,6 +253,17 @@ def test_unconfigured_providers_are_skipped_and_reported(monkeypatch, tmp_path):
     with pytest.raises(AIConfigurationError):
         invoke(router)
     assert all(not row["configured"] for row in provider_status(config))
+
+
+def test_primary_provider_loads_from_environment(monkeypatch, tmp_path):
+    monkeypatch.setattr("hirevia.config._ensure_dotenv", lambda: None)
+    monkeypatch.setenv("AI_PRIMARY_PROVIDER", "llamacpp")
+
+    config = load_config(base_dir=tmp_path)
+
+    assert config.ai.primary == "llamacpp"
+    router = AIProviderRouter({}, config.ai.primary, config.ai.fallback)
+    assert router.fallback == ["nvidia", "groq", "ollama"]
 
 
 def test_invalid_primary_endpoint_does_not_silently_use_fallback(monkeypatch):
