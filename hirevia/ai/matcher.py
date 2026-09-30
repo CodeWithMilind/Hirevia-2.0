@@ -92,6 +92,10 @@ def build_user_prompt(
         [raw.get("source_channel")] if raw.get("source_channel") else []
     )
     salary = raw.get("salary") or "not stated"
+    employment_type = (
+        job.employment_type.value if job.employment_type
+        else raw.get("employment_type_label") or "not stated"
+    )
     sources = ", ".join(str(c) for c in channels if c) or job.source
 
     blocks = [
@@ -103,13 +107,22 @@ def build_user_prompt(
         f"company: {job.company or 'not stated'}",
         f"location: {job.location or 'not stated'}",
         f"experience_required: {job.experience or 'not stated'}",
-        f"employment_type: {job.employment_type.value if job.employment_type else 'not stated'}",
+        f"employment_type: {employment_type}",
+        f"work_mode: {raw.get('work_mode') or 'not stated'}",
         f"salary_or_stipend: {salary}",
         f"source: {sources}",
         f"application_link_present: {'yes' if job.application_url else 'no'}",
         "description:",
         (job.description or "").strip()[:2200] or "(empty)",
     ]
+    extraction_evidence = raw.get("extraction_evidence") or {}
+    if extraction_evidence:
+        blocks += ["", "SOURCE FIELD EVIDENCE (verbatim from the posting):"]
+        blocks.extend(
+            f"{field}: {value}"
+            for field, value in extraction_evidence.items()
+            if value
+        )
     if evidence is not None:
         blocks += ["", "DETERMINISTIC EVIDENCE (computed from the posting text):", evidence_prompt_block(evidence)]
     blocks += ["", "Judge this posting now. Reply with the JSON object only."]

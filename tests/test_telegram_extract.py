@@ -9,12 +9,14 @@ from hirevia.sources.telegram_extract import (
     extract_company,
     extract_experience,
     extract_employment_type,
+    extract_employment_type_label,
     extract_fresher_signals,
     extract_links,
     extract_location,
     extract_salary,
     extract_skills,
     extract_title,
+    extract_work_mode,
     freshness_label,
     looks_like_job,
     message_to_job,
@@ -117,16 +119,102 @@ def test_experience_range_and_fresher():
     assert extract_experience("nothing about experience") is None
 
 
+def test_explicit_experience_and_multi_eligibility_variants():
+    cases = {
+        "Freshers": "Freshers",
+        "Fresher": "Freshers",
+        "Experience: Freshers / Experienced": "Freshers / Experienced",
+        "JobType: Freshers/ Experienced": "Freshers / Experienced",
+        "Freshers & Experienced": "Freshers / Experienced",
+        "Experienced/Freshers": "Freshers / Experienced",
+        "0–1 years": "0-1 years",
+        "0-2 years": "0-2 years",
+        "Entry Level": "Entry Level",
+        "Entry-level": "Entry Level",
+        "No Experience Required": "No Experience Required",
+        "No prior experience required": "No Experience Required",
+        "Experience: 0 years": "0 years",
+        "Recent Graduate": "Recent Graduate",
+        "Graduate": "Graduate",
+    }
+    for source, expected in cases.items():
+        assert extract_experience(source) == expected
+
+
+def test_explicit_location_preserves_full_place_name():
+    assert extract_location("Job Location: Navi Mumbai") == "Navi Mumbai"
+
+
 def test_employment_type_prefers_internship():
     assert extract_employment_type("Internship for freshers, full time later") == EmploymentType.INTERNSHIP
     assert extract_employment_type("Full-time senior role") == EmploymentType.FULL_TIME
     assert extract_employment_type("no hint") is None
 
 
+def test_explicit_work_modes_and_employment_types():
+    assert extract_work_mode("Work From Home") == "Remote"
+    assert extract_work_mode("WFH") == "Remote"
+    assert extract_work_mode("Remote Work") == "Remote"
+    assert extract_work_mode("Work From Office") == "On-site"
+    assert extract_work_mode("WFO") == "On-site"
+    assert extract_work_mode("On-site") == "On-site"
+    assert extract_work_mode("Hybrid") == "Hybrid"
+    assert extract_employment_type("Internship") == EmploymentType.INTERNSHIP
+    assert extract_employment_type("Full time") == EmploymentType.FULL_TIME
+    assert extract_employment_type_label("Apprenticeship") == "Apprenticeship"
+    assert extract_employment_type("trainee with stipend") is None
+    assert extract_employment_type("no employment information") is None
+
+
 def test_salary_and_stipend():
     assert extract_salary("Salary: ₹4-6 LPA good benefits") == "₹4-6 LPA"
     assert extract_salary("Stipend: ₹15,000/month,") == "₹15,000/month"
     assert extract_salary("no money mentioned at all") is None
+
+
+def test_explicit_salary_formats():
+    assert extract_salary("Expected Salary: ₹18k – ₹40k/ Month") == "₹18k – ₹40k/Month"
+    assert extract_salary("Salary: 18,000 - 40,000 per month") == "18,000 - 40,000 per month"
+    assert extract_salary("Salary: ₹18,000/month") == "₹18,000/month"
+    assert extract_salary("Salary: ₹5 LPA") == "₹5 LPA"
+    assert extract_salary("Salary: 5-8 LPA") == "5-8 LPA"
+
+
+def test_metadata_extraction_ignores_promotional_and_link_lines():
+    text = (
+        "Join our Python course in Pune\n"
+        "Testimonial: fresher hired remotely for ₹5 LPA\n"
+        "More details https://example.com/remote-fresher-pune\n"
+        "Follow @fresher_jobs for updates"
+    )
+    assert extract_experience(text) is None
+    assert extract_location(text) == "Not specified"
+    assert extract_work_mode(text) is None
+    assert extract_employment_type(text) is None
+    assert extract_salary(text) is None
+
+
+def test_sutherland_post_preserves_explicit_job_metadata():
+    text = (
+        "Company Name: Sutherland\n"
+        "Post Name: Applicant – Associate/Sr. Associate\n"
+        "Expected Salary: ₹18k – ₹40k/ Month\n"
+        "Job Location: Navi Mumbai\n"
+        "JobType: Freshers/ Experienced\n"
+        "Apply: https://job4freshers.co.in/sutherland-associate-sr-associate/"
+    )
+    job = message_to_job(msg(text))
+
+    assert job is not None
+    assert job.company == "Sutherland"
+    assert job.title == "Applicant – Associate/Sr. Associate"
+    assert job.experience == "Freshers / Experienced"
+    assert job.location == "Navi Mumbai"
+    assert job.raw_data["salary"] == "₹18k – ₹40k/Month"
+    assert str(job.application_url) == "https://job4freshers.co.in/sutherland-associate-sr-associate/"
+    assert job.description == text
+    assert job.raw_data["extraction_evidence"]["experience"] == "JobType: Freshers/ Experienced"
+    assert job.raw_data["extraction_evidence"]["location"] == "Job Location: Navi Mumbai"
 
 
 def test_freshness_ladder():

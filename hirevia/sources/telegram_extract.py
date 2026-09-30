@@ -285,8 +285,11 @@ _NEGATIVE_SIGNAL_RES = [re.compile(r"(?<!\w)" + re.escape(s).replace(r"\ ", r"[\
 
 FRESHER_SIGNALS = [
     "fresher", "freshers", "fresh graduate", "fresh grad", "fresher friendly",
-    "entry level", "entry-level", "0 years", "0+ years", "0-1 years", "0–1 years",
+    "freshers / experienced", "freshers & experienced", "freshers and experienced",
+    "experienced/freshers", "entry level", "entry-level", "graduate",
+    "recent graduate", "0 years", "0+ years", "0-1 years", "0–1 years",
     "0 to 1 years", "0-2 years", "0–2 years", "no experience",
+    "no experience required", "no prior experience required",
     "internship", "intern", "trainee", "apprentice", "junior",
     "recent graduate", "new batch", "2024 batch", "2025 batch", "2026 batch",
 ]
@@ -327,11 +330,11 @@ def looks_like_job(text: str) -> Tuple[bool, List[str]]:
 
 
 def extract_fresher_signals(text: str) -> List[str]:
-    lower = " " + (text or "").lower() + " "
+    lines = _metadata_lines(text)
     found = []
     for signal in FRESHER_SIGNALS:
-        needle = " " + signal + " "
-        if needle in lower:
+        pattern = re.escape(signal).replace(r"\ ", r"\s+")
+        if any(re.search(r"(?<!\w)" + pattern + r"(?!\w)", line, re.IGNORECASE) for line in lines):
             found.append(signal)
     return sorted(set(found))
 
@@ -587,32 +590,71 @@ def extract_company(text: str, best_url: Optional[str]) -> str:
 
 
 _CITY_RE = re.compile(
-    r"\b(bengaluru|bangalore|mumbai|pune|hyderabad|delhi|ncr|gurgaon|gurugram|"
+    r"\b(navi\s+mumbai|bengaluru|bangalore|mumbai|pune|hyderabad|delhi|ncr|gurgaon|gurugram|"
     r"noida|chennai|kolkata|ahmedabad|jaipur|indore|kochi|coimbatore|chandigarh|"
     r"bhopal|nagpur|vadodara|lucknow)\b",
     re.IGNORECASE,
 )
-_WORK_MODE_RE = re.compile(r"\b(remote|work from home|wfh|hybrid|onsite|on-site)\b", re.IGNORECASE)
+_WORK_MODE_RE = re.compile(
+    r"\b(work\s+from\s+home|wfh|remote(?:\s+work)?|work\s+from\s+office|wfo|"
+    r"on[ -]?site|onsite|hybrid)\b",
+    re.IGNORECASE,
+)
 _LOCATION_LINE_RE = re.compile(
-    r"^\s*(?:\W*\s*)?(?:location|loc|locations|based)\s*[:\-]\s*(.{3,100})$",
+    r"^\s*(?:\W*\s*)?(?:job\s+)?(?:location|loc|locations|based)\s*[:\-]\s*(.{3,100})$",
     re.IGNORECASE | re.MULTILINE,
 )
+
+_METADATA_NOISE_RE = re.compile(
+    r"\b(?:course|bootcamp|testimonial|review|subscribe|follow\b|"
+    r"advertisement|sponsored|promotion|promotional|instruction\w*|comment\w*|"
+    r"dm\s+(?:me|us))\b",
+    re.IGNORECASE,
+)
+
+
+def _metadata_lines(text: str) -> List[str]:
+    """Keep job-content lines and ignore links or obvious unrelated promotion."""
+    return [
+        line.strip()
+        for line in (text or "").splitlines()
+        if line.strip()
+        and not URL_RE.search(line)
+        and not re.search(r"(?:^|\s)@[A-Za-z0-9_]{3,}", line)
+        and not _METADATA_NOISE_RE.search(line)
+    ]
 
 
 def extract_location(text: str) -> str:
     text = text or ""
+    text = "\n".join(_metadata_lines(text))
     match = _LOCATION_LINE_RE.search(text)
     if match:
         return match.group(1).strip().strip("-:* ")
     parts = []
-    mode = _WORK_MODE_RE.search(text)
+    mode = extract_work_mode(text)
     if mode:
-        parts.append(mode.group(1).lower().replace("on-site", "onsite"))
+        parts.append(mode.lower())
     cities = [m.group(1).title() for m in _CITY_RE.finditer(text)]
     seen = set()
     cities = [c for c in cities if not (c.lower() in seen or seen.add(c.lower()))]
     parts.extend(cities[:3])
     return ", ".join(parts) if parts else "Not specified"
+
+
+def extract_work_mode(text: str) -> Optional[str]:
+    """Normalize an explicitly stated work arrangement; silence stays unknown."""
+    for line in _metadata_lines(text):
+        match = _WORK_MODE_RE.search(line)
+        if not match:
+            continue
+        value = re.sub(r"\s+", " ", match.group(1).lower())
+        if value in {"wfh", "work from home", "remote", "remote work"}:
+            return "Remote"
+        if value in {"wfo", "work from office", "on-site", "onsite", "on site"}:
+            return "On-site"
+        return "Hybrid"
+    return None
 
 
 _KNOWN_SKILLS = [
@@ -637,25 +679,68 @@ def extract_skills(text: str, cap: int = 15) -> List[str]:
 
 
 _EXPERIENCE_RANGE_RE = re.compile(r"(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})\s*(?:years?|yrs?)", re.IGNORECASE)
+_EXPERIENCE_LABEL_RE = re.compile(
+    r"^\s*(?:experience(?:\s+required)?|eligibility|candidate\s+eligibility|"
+    r"job\s*type|jobtype|experience\s+level)\s*[:\-]\s*(.+)$",
+    re.IGNORECASE,
+)
+_MULTI_ELIGIBILITY_RE = re.compile(
+    r"\b(?:freshers?|experienced)\b\s*(?:/|&|and)\s*\b(?:freshers?|experienced)\b",
+    re.IGNORECASE,
+)
+_EXPERIENCE_PHRASE_RE = re.compile(
+    r"\b(?:no\s+(?:prior\s+)?experience\s+required|entry[ -]level|recent\s+graduate|"
+    r"graduate|freshers?|\d{1,2}\s*(?:-|–|to)\s*\d{1,2}\s*(?:years?|yrs?)|"
+    r"\d{1,2}\s*(?:years?|yrs?))\b",
+    re.IGNORECASE,
+)
+
+
+def _experience_value(line: str) -> Optional[str]:
+    multi = _MULTI_ELIGIBILITY_RE.search(line)
+    if multi:
+        return "Freshers / Experienced"
+    range_match = _EXPERIENCE_RANGE_RE.search(line)
+    if range_match:
+        return f"{range_match.group(1)}-{range_match.group(2)} years"
+    phrase = _EXPERIENCE_PHRASE_RE.search(line)
+    if not phrase:
+        return None
+    value = phrase.group(0).lower()
+    if re.search(r"\bfresher[- ]friendly\b", line, re.IGNORECASE):
+        return "Fresher / Entry level"
+    if "no " in value:
+        return "No Experience Required"
+    if "entry" in value:
+        return "Entry Level"
+    if "recent" in value:
+        return "Recent Graduate"
+    if value == "graduate":
+        return "Graduate"
+    if value.startswith("fresh"):
+        return "Freshers"
+    if re.fullmatch(r"\d{1,2}\s*(?:years?|yrs?)", value):
+        return f"{int(re.search(r'\d+', value).group())} years"
+    return None
 
 
 def extract_experience(text: str) -> Optional[str]:
     """Human-readable experience requirement. Missing info stays None -
     never a rejection (the existing filter/AI layers handle that)."""
-    text = text or ""
-    range_match = _EXPERIENCE_RANGE_RE.search(text)
-    if range_match:
-        return f"{range_match.group(1)}-{range_match.group(2)} years"
-    years = extract_years_experience(text)
+    for line in _metadata_lines(text):
+        label = _EXPERIENCE_LABEL_RE.match(line)
+        candidate = label.group(1) if label else line
+        value = _experience_value(candidate)
+        if value:
+            return value
+    years = extract_years_experience(text or "")
     if years is not None:
-        return "0 years" if years == 0 else f"{years}+ years"
-    if extract_fresher_signals(text):
-        return "Fresher / Entry level"
+        return f"{years} years" if years == 0 else f"{years}+ years"
     return None
 
 
 _EMPLOYMENT_PATTERNS = [
-    (EmploymentType.INTERNSHIP, re.compile(r"\b(internship|intern\b|trainee|stipend)\b", re.IGNORECASE)),
+    (EmploymentType.INTERNSHIP, re.compile(r"\b(internship|intern\b)\b", re.IGNORECASE)),
     (EmploymentType.PART_TIME, re.compile(r"\bpart[- ]time\b", re.IGNORECASE)),
     (EmploymentType.CONTRACT, re.compile(r"\b(contract|freelance|gig)\b", re.IGNORECASE)),
     (EmploymentType.FULL_TIME, re.compile(r"\bfull[- ]time\b", re.IGNORECASE)),
@@ -663,30 +748,65 @@ _EMPLOYMENT_PATTERNS = [
 
 
 def extract_employment_type(text: str) -> Optional[EmploymentType]:
-    text = text or ""
-    for emp_type, rx in _EMPLOYMENT_PATTERNS:
-        if rx.search(text):
-            return emp_type
+    for line in _metadata_lines(text):
+        for emp_type, rx in _EMPLOYMENT_PATTERNS:
+            if rx.search(line):
+                return emp_type
+    return None
+
+
+def extract_employment_type_label(text: str) -> Optional[str]:
+    """Display label also covers Apprenticeship without expanding the Job schema."""
+    for line in _metadata_lines(text):
+        if re.search(r"\bapprenticeship\b", line, re.IGNORECASE):
+            return "Apprenticeship"
+        emp_type = extract_employment_type(line)
+        if emp_type:
+            return {
+                EmploymentType.INTERNSHIP: "Internship",
+                EmploymentType.PART_TIME: "Part-time",
+                EmploymentType.CONTRACT: "Contract",
+                EmploymentType.FULL_TIME: "Full-time",
+            }[emp_type]
     return None
 
 
 _SALARY_RE = re.compile(
-    r"(?:₹|rs\.?|inr)?\s?\d+(?:[.,]\d+)?\s*(?:[-–to]+\s*(?:₹|rs\.?|inr)?\s?\d+(?:[.,]\d+)?)?\s*"
-    r"(?:lpa|lakhs?|lakh|lac|kpa|k/month|/month|k per month|per month|p\.?m\.?|per annum|pa\b)",
+    r"(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?\s*k?\s*"
+    r"(?:[-–]|\bto\b)\s*(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?\s*k?\s*"
+    r"(?:/\s*month|per\s+month|lpa|lakhs?|lacs?)|"
+    r"(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?\s*k?\s*"
+    r"(?:/\s*month|per\s+month|lpa|lakhs?|lacs?|kpa|per\s+annum|p\.?m\.?)",
     re.IGNORECASE,
 )
 _STIPEND_RE = re.compile(r"stipend[^\n]{0,40}", re.IGNORECASE)
 
 
 def extract_salary(text: str) -> Optional[str]:
-    text = text or ""
-    match = _SALARY_RE.search(text)
-    if match:
-        return " ".join(match.group(0).split())
-    match = _STIPEND_RE.search(text)
-    if match:
-        return " ".join(match.group(0).split()).rstrip(".,;")
+    for line in _metadata_lines(text):
+        match = _SALARY_RE.search(line)
+        if match:
+            value = " ".join(match.group(0).split())
+            return re.sub(
+                r"\s*/\s*(month)", lambda part: "/" + part.group(1),
+                value, flags=re.IGNORECASE,
+            )
+        match = _STIPEND_RE.search(line)
+        if match:
+            return " ".join(match.group(0).split()).rstrip(".,;")
     return None
+
+
+def _field_evidence(text: str, extractor) -> Optional[str]:
+    """Return the source line supporting a deterministic metadata value."""
+    value = extractor(text)
+    if value is None or value == "Not specified":
+        return None
+    lines = _metadata_lines(text)
+    for line in lines:
+        if value.casefold() in line.casefold():
+            return line
+    return next((line for line in lines if extractor(line) == value), None)
 
 
 def freshness_label(posted_at: datetime, now: Optional[datetime] = None) -> str:
@@ -781,6 +901,19 @@ def message_to_job(msg: TgMessage, intent: Optional[IntentDecision] = None) -> O
                 "content_risk": content_risk_signals(text),
                 "fresher_signals": extract_fresher_signals(text),
                 "salary": extract_salary(text),
+                "work_mode": extract_work_mode(text),
+                "employment_type_label": extract_employment_type_label(text),
+                "extraction_evidence": {
+                    key: evidence
+                    for key, evidence in {
+                        "experience": _field_evidence(text, extract_experience),
+                        "location": _field_evidence(text, extract_location),
+                        "employment_type": _field_evidence(text, extract_employment_type_label),
+                        "work_mode": _field_evidence(text, extract_work_mode),
+                        "salary": _field_evidence(text, extract_salary),
+                    }.items()
+                    if evidence
+                },
                 "links": links[:10],
             },
         )

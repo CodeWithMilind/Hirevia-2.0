@@ -780,6 +780,30 @@ def test_prompt_builder_output_carries_no_credential():
     assert "api key" not in prompt.lower()
 
 
+def test_prompt_includes_normalized_metadata_and_source_evidence():
+    job = make_job(
+        experience="Freshers / Experienced",
+        raw_data={
+            "salary": "₹18k – ₹40k/Month",
+            "work_mode": "Remote",
+            "employment_type_label": "Internship",
+            "extraction_evidence": {
+                "experience": "JobType: Freshers/ Experienced",
+                "location": "Job Location: Navi Mumbai",
+            },
+        },
+    )
+
+    prompt = build_user_prompt(job, make_profile(), None)
+
+    assert "experience_required: Freshers / Experienced" in prompt
+    assert "salary_or_stipend: ₹18k – ₹40k/Month" in prompt
+    assert "work_mode: Remote" in prompt
+    assert "employment_type: Internship" in prompt
+    assert "JobType: Freshers/ Experienced" in prompt
+    assert "Job Location: Navi Mumbai" in prompt
+
+
 # --- 13. the deterministic evidence reaches the model -------------------------
 
 
