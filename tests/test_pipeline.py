@@ -269,11 +269,17 @@ def test_p3_below_threshold_is_not_alerted(repo):
 
 
 def test_p3_above_threshold_is_alerted(repo):
+    """P3 job with hybrid score above notify_min_match_score should alert.
+    
+    Uses ai_match_weight=1.0 so hybrid score == AI score, isolating the
+    notification threshold logic from deterministic blending.
+    """
     source = FakeSource([make_job(apply="https://boards.greenhouse.io/acme/jobs/8")])
     strong = FakeMatcher(default=AIResponse(relevant=True, priority=Priority.P3, match_score=88,
                                            reasons=["strong score"]))
     notifier = FakeNotifier()
-    stats = run(build_pipeline([source], repo, strong, notifier, notify_min_match_score=80))
+    stats = run(build_pipeline([source], repo, strong, notifier,
+                               notify_min_match_score=80, ai_match_weight=1.0))
 
     assert notifier.sent == ["Backend Developer"] and stats.jobs_notified == 1
 

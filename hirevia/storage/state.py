@@ -19,10 +19,27 @@ JOB_COLUMNS = [
     "deadline", "employment_type", "experience", "skills", "raw_data",
     "application_status", "fingerprint", "first_seen", "last_seen",
     "expires_at", "notified_at", "notification_channel", "ai_decision",
+    "match_result",
 ]
 
 # Columns never overwritten on the UPDATE path (identity + lifecycle anchors).
 UPSERT_IMMUTABLE_COLUMNS = {"id", "source", "source_job_id", "first_seen"}
+
+
+def _load_json(raw, expect: type):
+    """Decode a JSON column defensively.
+
+    NULL, unreadable text and a payload of the wrong shape all come back as None
+    rather than crashing the read of an otherwise perfectly good job - a type
+    mismatch would also break pydantic's field validation on Job.
+    """
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return value if isinstance(value, expect) else None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -50,6 +67,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     notified_at TEXT,
     notification_channel TEXT,
     ai_decision TEXT,
+    match_result TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -97,7 +115,8 @@ class JobRepository:
     def _migrate_schema(self, conn: sqlite3.Connection):
         """Lightweight additive migration: CREATE TABLE IF NOT EXISTS never
         touches a pre-existing table, so an old DB missing newer columns
-        (e.g. ai_decision) would break INSERTs. Add anything missing."""
+        (e.g. ai_decision, match_result) would break INSERTs. Add anything
+        missing."""
         existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
         for column in JOB_COLUMNS:
             if column not in existing:
@@ -119,6 +138,14 @@ class JobRepository:
             conn.close()
 
     def _row_to_job(self, row: sqlite3.Row) -> Job:
+        def json_col(name: str, expect: type):
+            """Read a JSON column, tolerating one the SELECT never returned
+            (a row written before that column existed)."""
+            try:
+                return _load_json(row[name], expect)
+            except (IndexError, KeyError):
+                return None
+
         return Job(
             id=row["id"],
             source=row["source"],
@@ -134,8 +161,8 @@ class JobRepository:
             deadline=datetime.fromisoformat(row["deadline"]) if row["deadline"] else None,
             employment_type=row["employment_type"],
             experience=row["experience"],
-            skills=json.loads(row["skills"]) if row["skills"] else [],
-            raw_data=json.loads(row["raw_data"]) if row["raw_data"] else {},
+            skills=json_col("skills", list) or [],
+            raw_data=json_col("raw_data", dict) or {},
             application_status=ApplicationStatus(row["application_status"]),
             fingerprint=row["fingerprint"],
             first_seen=datetime.fromisoformat(row["first_seen"]) if row["first_seen"] else None,
@@ -143,7 +170,8 @@ class JobRepository:
             expires_at=datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None,
             notified_at=datetime.fromisoformat(row["notified_at"]) if row["notified_at"] else None,
             notification_channel=row["notification_channel"],
-            ai_decision=json.loads(row["ai_decision"]) if row["ai_decision"] else None,
+            ai_decision=json_col("ai_decision", dict),
+            match_result=json_col("match_result", dict),
         )
 
     def _job_to_dict(self, job: Job) -> Dict[str, Any]:
@@ -175,6 +203,8 @@ class JobRepository:
             "notified_at": job.notified_at.isoformat() if job.notified_at else None,
             "notification_channel": job.notification_channel,
             "ai_decision": json.dumps(job.ai_decision) if job.ai_decision else None,
+            # Phase 7: the canonical hybrid verdict (see MatchResult).
+            "match_result": json.dumps(job.match_result) if job.match_result else None,
         }
 
     def _job_to_row(self, job: Job) -> Tuple:
@@ -193,7 +223,7 @@ class JobRepository:
         """
         with self._get_conn() as conn:
             cursor = conn.execute(
-                "SELECT id, first_seen FROM jobs WHERE source = ? AND source_job_id = ?",
+                "SELECT id, first_seen, match_result FROM jobs WHERE source = ? AND source_job_id = ?",
                 (job.source, job.source_job_id),
             )
             existing = cursor.fetchone()
@@ -201,13 +231,27 @@ class JobRepository:
             if existing:
                 # Update existing
                 job.id = existing["id"]
-                job.first_seen = datetime.fromisoformat(existing["first_seen"])
+                # Nullable in the schema, and rows written by early code left it
+                # empty - treat "unknown" as "now" rather than crashing the scan.
+                job.first_seen = (
+                    datetime.fromisoformat(existing["first_seen"])
+                    if existing["first_seen"]
+                    else datetime.utcnow()
+                )
                 job.last_seen = datetime.utcnow()
                 if job.expires_at is None:
                     from datetime import timedelta
                     job.expires_at = job.first_seen + timedelta(hours=24)
 
                 values = self._job_to_dict(job)
+                if not values["match_result"] and existing["match_result"]:
+                    # A pass with no verdict (a collector re-writing the row, or
+                    # a duplicate seen before matching runs) must not erase the
+                    # stored score that the dashboard and alert retry read.
+                    stored = _load_json(existing["match_result"], dict)
+                    if stored is not None:
+                        job.match_result = stored
+                        values["match_result"] = existing["match_result"]
                 update_cols = [c for c in JOB_COLUMNS if c not in UPSERT_IMMUTABLE_COLUMNS]
                 sql = (
                     f"UPDATE jobs SET {', '.join(f'{c} = ?' for c in update_cols)} WHERE id = ?"

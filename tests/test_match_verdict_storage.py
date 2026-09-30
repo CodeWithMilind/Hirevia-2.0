@@ -1,0 +1,320 @@
+"""Persistence and presentation of the Phase 7 verdict.
+
+The pipeline produces one canonical MatchResult; this file pins the two things
+that make it useful afterwards:
+
+  * storage writes it as one JSON column, reads it back intact, migrates an
+    older database that never had the column, and never lets a verdict-less pass
+    erase a score the dashboard and the alert-retry path depend on;
+  * Job.verdict()/verdict_model() and the alert text agree on which number is
+    "the" score, and unreadable payloads degrade to "no verdict" instead of
+    raising, because one bad row must not break a whole scan.
+"""
+
+import asyncio
+import sqlite3
+from datetime import datetime
+
+from hirevia.core.models import AIResponse, Job, MatchResult, Priority
+from hirevia.notifications.base import Notifier
+from hirevia.storage.state import JOB_COLUMNS, JobRepository
+
+
+# --- helpers ------------------------------------------------------------------
+
+
+def make_job(**overrides) -> Job:
+    defaults = dict(
+        source="telegram",
+        source_job_id="jobs_alpha-1",
+        title="Python Developer",
+        company="Acme Corp",
+        location="Pune",
+        description="Python and FastAPI. Fresher friendly, 0-1 years.",
+        url="https://t.me/jobs_alpha/1",
+        application_url="https://boards.greenhouse.io/acme/jobs/1",
+    )
+    defaults.update(overrides)
+    return Job(**defaults)
+
+
+def hybrid_result(**overrides) -> MatchResult:
+    defaults = dict(
+        match=True,
+        match_score=86,
+        priority=Priority.P2,
+        reason="Python Developer role wants 2 of your 4 skills",
+        matched_skills=["Python", "FastAPI"],
+        missing_skills=["Docker"],
+        experience_match=True,
+        ai_status="ok",
+        ai_model="nvidia/mistral",
+        ai_score=90,
+        deterministic_score=74,
+    )
+    defaults.update(overrides)
+    return MatchResult(**defaults)
+
+
+def stored(result: MatchResult):
+    """The dict shape Job.match_result holds (what a JSON round trip gives back)."""
+    return result.model_dump(mode="json")
+
+
+class RecordingNotifier(Notifier):
+    """Concrete notifier with no transport, so only the rendering is tested."""
+
+    name = "recording"
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, job: Job, decision: AIResponse) -> bool:
+        self.sent.append(job.title)
+        return True
+
+
+def render(job: Job, decision: AIResponse) -> str:
+    return RecordingNotifier().format_message(job, decision)
+
+
+# --- storage -------------------------------------------------------------------
+
+
+def test_match_result_survives_a_storage_round_trip(tmp_path):
+    repo = JobRepository(tmp_path / "hirevia.db")
+    job = make_job()
+    job.match_result = stored(hybrid_result())
+
+    assert repo.upsert_job(job) is True
+    loaded = repo.get_by_source_id(job.source, job.source_job_id)
+
+    assert loaded.match_result["match_score"] == 86
+    verdict = loaded.verdict_model()
+    assert verdict.match and verdict.match_score == 86
+    assert verdict.priority is Priority.P2
+    assert verdict.matched_skills == ["Python", "FastAPI"]
+    assert verdict.deterministic_score == 74 and verdict.ai_score == 90
+    assert verdict.experience_match is True
+
+
+def test_an_old_database_gains_the_match_result_column(tmp_path):
+    """A pre-Phase-7 DB has no match_result column at all. Reading, migrating and
+    writing must all work - CREATE TABLE IF NOT EXISTS never touches it."""
+    db = tmp_path / "legacy.db"
+    legacy_cols = [c for c in JOB_COLUMNS if c != "match_result"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE jobs ("
+            + ", ".join(f"{c} TEXT" for c in legacy_cols)
+            + ", created_at TEXT, updated_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO jobs (id, source, source_job_id, title, company, location,"
+            " description, url, detected_at, skills, raw_data, application_status,"
+            " ai_decision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "legacy-1", "telegram", "jobs_alpha-1", "Python Developer", "Acme Corp",
+                "Pune", "Python FastAPI", "https://t.me/jobs_alpha/1",
+                datetime.utcnow().isoformat(), "[]", "{}", "unknown",
+                '{"relevant": true, "priority": "P2", "match_score": 77, "reasons": ["decent"]}',
+            ),
+        )
+
+    repo = JobRepository(db)  # runs the additive migration
+
+    loaded = repo.get_job("legacy-1")
+    assert loaded.match_result is None
+    assert loaded.verdict()["match_score"] == 77  # falls back to ai_decision
+
+    repo.upsert_job(loaded)  # must not fail on the newly added column
+    assert repo.get_job("legacy-1").match_result is None
+
+
+def test_a_verdict_less_pass_does_not_erase_the_stored_one(tmp_path):
+    """Collectors re-write rows the pipeline already scored. Losing the score
+    would silently blind the dashboard and kill the alert retry."""
+    repo = JobRepository(tmp_path / "hirevia.db")
+    job = make_job()
+    job.match_result = stored(hybrid_result())
+    repo.upsert_job(job)
+
+    re_seen = make_job()  # same source/source_job_id, no verdict this time
+    assert repo.upsert_job(re_seen) is False
+
+    assert re_seen.match_result["match_score"] == 86  # the object is honest too
+    assert repo.get_job(job.id).match_result["match_score"] == 86
+
+
+def test_a_newer_verdict_does_overwrite_the_stored_one(tmp_path):
+    repo = JobRepository(tmp_path / "hirevia.db")
+    job = make_job()
+    job.match_result = stored(hybrid_result())
+    repo.upsert_job(job)
+
+    rescored = make_job()
+    rescored.match_result = stored(hybrid_result(match_score=31, match=False, priority=Priority.P3))
+    repo.upsert_job(rescored)
+
+    assert repo.get_job(job.id).match_result["match_score"] == 31
+
+
+def test_unreadable_payloads_are_no_verdict_not_a_crash(tmp_path):
+    """Garbage in a JSON column is a missing verdict, never a broken scan - and
+    never a type pydantic would reject on the Job model."""
+    repo = JobRepository(tmp_path / "hirevia.db")
+    job = make_job()
+    repo.upsert_job(job)
+
+    with sqlite3.connect(tmp_path / "hirevia.db") as conn:
+        conn.execute("UPDATE jobs SET match_result = 'not json', skills = 'null' WHERE id = ?",
+                     (job.id,))
+
+    loaded = repo.get_job(job.id)
+    assert loaded.match_result is None
+    assert loaded.verdict_model() is None
+    assert loaded.skills == []  # a null payload is treated as "no skills"
+    assert repo.upsert_job(loaded) is False  # and the row is still writable
+
+
+# --- which score is the real one ----------------------------------------------
+
+
+def test_verdict_prefers_the_hybrid_result_over_the_raw_ai_answer():
+    job = make_job()
+    job.ai_decision = AIResponse(relevant=True, priority=Priority.P1, match_score=95,
+                                 reasons=["the model was enthusiastic"]).model_dump(mode="json")
+    job.match_result = stored(hybrid_result())
+
+    assert job.verdict()["match_score"] == 86  # evidence-checked, not raw AI
+    assert job.verdict_model().match_score == 86
+
+
+def test_verdict_is_empty_when_a_job_was_never_matched():
+    job = make_job()
+    assert job.verdict() == {}
+    assert job.verdict_model() is None
+
+
+def test_verdict_model_upgrades_a_legacy_ai_decision():
+    """Rows written before Phase 7 only carry the AI's own answer; the alert
+    retry must still be able to replay them without re-spending on the model."""
+    job = make_job()
+    job.ai_decision = AIResponse(relevant=True, priority=Priority.P2, match_score=77,
+                                 reasons=["decent overlap"]).model_dump(mode="json")
+
+    verdict = job.verdict_model()
+    assert verdict.match and verdict.match_score == 77
+    assert verdict.priority is Priority.P2
+    assert verdict.reason == "decent overlap"
+    assert verdict.ai_status == "ok" and verdict.degraded is False
+    # The stored number was the model's, so both halves honestly show it.
+    assert verdict.deterministic_score == 77 and verdict.ai_score == 77
+
+    replay = verdict.to_ai_response()
+    assert replay.relevant and replay.match_score == 77 and replay.priority is Priority.P2
+
+
+def test_unreadable_verdict_payloads_read_as_no_verdict():
+    job = make_job(match_result={"match_score": "huge"})  # not coercible to int
+    assert job.verdict_model() is None
+
+    job = make_job(ai_decision={"relevant": True, "priority": "P9", "match_score": 50})
+    assert job.verdict_model() is None  # a tier the model never issues
+
+
+# --- alert rendering ----------------------------------------------------------
+
+
+def test_alert_text_reports_both_halves_of_a_hybrid_score():
+    job = make_job(match_result=stored(hybrid_result()))
+    text = render(job, hybrid_result().to_ai_response())
+
+    assert "P2 - Job Match (86%)" in text          # the blended number, not AI 90
+    assert "Matched: Python, FastAPI" in text
+    assert "Missing: Docker" in text
+    assert "Evidence 74% + AI 90%" in text
+
+
+def test_alert_text_says_so_when_the_ai_was_unavailable():
+    degraded = hybrid_result(match_score=61, ai_status="failed", ai_score=None,
+                             ai_error="timeout")
+    job = make_job(match_result=stored(degraded))
+    text = render(job, degraded.to_ai_response())
+
+    assert "P2 - Job Match (61%)" in text
+    assert "AI unavailable" in text
+    assert "Evidence" not in text  # only one half produced a score, so say so
+
+
+def test_alert_text_without_a_verdict_keeps_the_ai_reasons():
+    """The Phase 6 contract still works for callers that never ran matching."""
+    job = make_job()
+    decision = AIResponse(relevant=True, priority=Priority.P1, match_score=91,
+                          reasons=["Python + FastAPI overlap", "Pune location"])
+    text = render(job, decision)
+
+    assert "P1 - Job Match (91%)" in text
+    assert "- Python + FastAPI overlap" in text
+    assert "- Pune location" in text
+    assert "Evidence" not in text
+
+
+def test_alert_text_with_nothing_to_say_still_renders():
+    job = make_job()
+    text = render(job, AIResponse(relevant=True, priority=Priority.P3, match_score=60))
+    assert "- Matched your profile preferences" in text
+
+
+def test_notifier_send_contract_is_unchanged():
+    """Phase 7 changed what the alert says, not how the pipeline calls it."""
+    notifier = RecordingNotifier()
+    job = make_job(match_result=stored(hybrid_result()))
+
+    assert asyncio.run(notifier.send(job, hybrid_result().to_ai_response())) is True
+    assert notifier.sent == ["Python Developer"]
+
+
+# --- dashboard payload --------------------------------------------------------
+
+
+def test_dashboard_fields_survive_the_api_response_model():
+    """Whatever the state layer writes must be declared on JobResponse: pydantic
+    silently drops undeclared keys, so the UI would lose the evidence behind the
+    score without any error anywhere."""
+    from hirevia.web.api.models import JobResponse
+    from hirevia.web.state import _match_fields
+
+    payload = _match_fields(make_job(match_result=stored(hybrid_result())))
+    assert set(payload) <= set(JobResponse.model_fields), set(payload) - set(JobResponse.model_fields)
+
+    response = JobResponse(
+        id="1", source="telegram", source_job_id="1", title="Python Developer",
+        company="Acme Corp", location="Pune", description="d", url="https://t.me/x/1",
+        detected_at="2026-09-29T00:00:00", application_status="open", **payload,
+    )
+    assert response.match_score == 86 and response.match_priority == "P2"
+    assert response.deterministic_score == 74 and response.ai_score == 90
+    assert response.matched_skills == ["Python", "FastAPI"]
+    assert response.missing_skills == ["Docker"]
+    assert response.hard_reject is False and response.degraded is False
+
+
+def test_dashboard_marks_a_degraded_verdict_as_degraded():
+    """A score produced without the model must not render as a normal match."""
+    from hirevia.web.state import _match_fields
+
+    degraded = _match_fields(make_job(match_result=stored(
+        hybrid_result(ai_status="failed", ai_score=None, ai_error="timeout")
+    )))
+    assert degraded["degraded"] is True and degraded["ai_score"] is None
+    assert degraded["ai_error"] == "timeout"
+
+    vetoed = _match_fields(make_job(match_result=stored(
+        hybrid_result(hard_reject=True, reject_reasons=["asks 5+ years"])
+    )))
+    assert vetoed["hard_reject"] is True
+
+    never_matched = _match_fields(make_job())
+    assert never_matched["match_score"] is None
+    assert never_matched["matched_skills"] == [] and never_matched["match_reason"] == ""

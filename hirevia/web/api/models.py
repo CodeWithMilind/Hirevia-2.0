@@ -104,6 +104,19 @@ class JobResponse(BaseModel):
     freshness_minutes: Optional[int] = None
     match_score: Optional[int] = None
     match_priority: Optional[str] = None
+    # Phase 7 hybrid verdict (deterministic evidence + AI). Declared here so
+    # JobResponse does not silently drop them: pydantic ignores undeclared
+    # fields, and the dashboard would lose the evidence behind the score.
+    match_result: Optional[Dict[str, Any]] = None
+    deterministic_score: Optional[int] = None
+    ai_score: Optional[int] = None
+    ai_status: Optional[str] = None
+    ai_error: Optional[str] = None
+    matched_skills: List[str] = []
+    missing_skills: List[str] = []
+    match_reason: str = ""
+    hard_reject: bool = False
+    degraded: bool = False
 
 
 class JobsResponse(BaseModel):

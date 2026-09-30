@@ -12,10 +12,41 @@ from hirevia.core.pipeline import Pipeline, run_single_scan
 from hirevia.storage.state import JobRepository
 from hirevia.ai.matcher import AIMatcher
 from hirevia.notifications.telegram import TelegramNotifier
-from hirevia.web.api.models import SystemStatus, SourceStatus
+# NOTE: hirevia.web.api.models is imported inside the methods that need it.
+# hirevia.web.api's __init__ imports routes, which imports this module - a
+# module-level import here would deadlock that cycle and make
+# `import hirevia.web.state` fail unless the API package happened to load first.
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _match_fields(job: Job) -> Dict[str, Any]:
+    """The match-related fields the dashboard renders.
+
+    One helper so the list and detail endpoints cannot disagree about which
+    score is the real one. Empty/neutral when a job was never matched.
+    """
+    result = job.match_result or {}
+    verdict = job.verdict()
+    return {
+        "ai_decision": job.ai_decision,
+        "match_result": job.match_result,
+        "match_score": verdict.get("match_score"),
+        "match_priority": verdict.get("priority"),
+        "deterministic_score": result.get("deterministic_score"),
+        "ai_score": result.get("ai_score"),
+        "ai_status": result.get("ai_status"),
+        "matched_skills": result.get("matched_skills") or [],
+        "missing_skills": result.get("missing_skills") or [],
+        "match_reason": result.get("reason") or "",
+        # The UI must be able to tell "the model was down" and "a hard rule
+        # vetoed this" apart from an ordinary low score - all three look the
+        # same if you only show the number.
+        "hard_reject": bool(result.get("hard_reject", False)),
+        "degraded": result.get("ai_status") == "failed",
+        "ai_error": result.get("ai_error"),
+    }
 
 
 class ActivityEntry:
@@ -198,16 +229,23 @@ class WebUIState:
         # Get recently added open jobs
         jobs = self.repo.get_active_jobs(limit=100)
         for job in jobs:
-            if job.ai_decision and job.ai_decision.get("relevant"):
-                try:
-                    ai_response = type("AIResponse", (), job.ai_decision)()
-                    await self.notifier.send(job, ai_response)
-                    self.repo.mark_notified(job.id, "telegram")
-                except Exception as e:
-                    logger.error(f"Failed to send notification for {job.id}: {e}")
+            if job.notified_at:
+                continue
+            # Phase 7: the stored hybrid verdict is canonical, and to_ai_response
+            # keeps the notifier interface intact instead of faking an object.
+            verdict = job.verdict_model()
+            if verdict is None or not verdict.match or verdict.degraded:
+                continue
+            try:
+                await self.notifier.send(job, verdict.to_ai_response())
+                self.repo.mark_notified(job.id, "telegram")
+            except Exception as e:
+                logger.error(f"Failed to send notification for {job.id}: {e}")
     
     def get_status(self) -> Dict[str, Any]:
         """Get current system status"""
+        from hirevia.web.api.models import SystemStatus  # see module note
+
         return {
             "status": (
                 SystemStatus.SCANNING.value if self.is_scanning
@@ -225,6 +263,8 @@ class WebUIState:
     
     def get_source_status(self) -> List[Dict[str, Any]]:
         """Get status of all sources"""
+        from hirevia.web.api.models import SourceStatus  # see module note
+
         sources = []
         for source_name in self.config.sources.get_enabled_sources():
             count = 0
@@ -316,7 +356,7 @@ class WebUIState:
             jobs = [j for j in jobs if j.application_status.value == status]
         
         if min_match is not None:
-            jobs = [j for j in jobs if j.ai_decision and j.ai_decision.get("match_score", 0) >= min_match]
+            jobs = [j for j in jobs if (j.verdict().get("match_score") or 0) >= min_match]
         
         if location:
             loc_lower = location.lower()
@@ -328,7 +368,6 @@ class WebUIState:
         # Convert to response format
         job_responses = []
         for job in jobs:
-            ai_decision = job.ai_decision or {}
             freshness = None
             if job.detected_at:
                 delta = datetime.utcnow() - job.detected_at
@@ -357,10 +396,8 @@ class WebUIState:
                 "expires_at": job.expires_at.isoformat() if job.expires_at else None,
                 "notified_at": job.notified_at.isoformat() if job.notified_at else None,
                 "notification_channel": job.notification_channel,
-                "ai_decision": job.ai_decision,
                 "freshness_minutes": freshness,
-                "match_score": ai_decision.get("match_score"),
-                "match_priority": ai_decision.get("priority"),
+                **_match_fields(job),
             })
         
         return {
@@ -376,7 +413,6 @@ class WebUIState:
         if not job:
             return None
         
-        ai_decision = job.ai_decision or {}
         freshness = None
         if job.detected_at:
             delta = datetime.utcnow() - job.detected_at
@@ -405,10 +441,8 @@ class WebUIState:
             "expires_at": job.expires_at.isoformat() if job.expires_at else None,
             "notified_at": job.notified_at.isoformat() if job.notified_at else None,
             "notification_channel": job.notification_channel,
-            "ai_decision": job.ai_decision,
             "freshness_minutes": freshness,
-            "match_score": ai_decision.get("match_score"),
-            "match_priority": ai_decision.get("priority"),
+            **_match_fields(job),
         }
     
     def get_config(self) -> Dict[str, Any]:

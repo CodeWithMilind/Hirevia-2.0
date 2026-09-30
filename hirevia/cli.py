@@ -241,9 +241,10 @@ def status(db_path: str, limit: int):
     table.add_column("AI Score", style="white", max_width=8)
 
     for job in jobs:
-        ai_score = ""
-        if job.ai_decision:
-            ai_score = f"{job.ai_decision.get('match_score', 0)}%"
+        # The hybrid verdict is the score that matters; ai_decision rows written
+        # before Phase 7 still display through Job.verdict().
+        verdict = job.verdict()
+        ai_score = f"{verdict.get('match_score', 0)}%" if verdict else ""
 
         # Freshness + link verdict are computed during the scan and stored on
         # the job; fall back to recomputing for rows written by older versions.

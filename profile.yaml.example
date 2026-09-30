@@ -1,42 +1,138 @@
+# Hirevia candidate profile - THE single source of truth for who you are.
+#
+# Copy to profile.yaml and edit. Both the deterministic matcher and the AI
+# prompt read this one file, so updating the candidate is a one-file change.
+# Nothing here is duplicated elsewhere: filters.yaml stays the hard-veto layer,
+# this file is the relevance layer.
+#
+# Everything is optional. A field you leave out is scored NEUTRAL, never as a
+# mismatch - silence is not a rejection. If this file is missing entirely,
+# Hirevia falls back to filters.yaml so a scan still works.
+
 name: "Your Name"
-summary: "Python backend developer with experience in FastAPI, SQL, and ML basics. Looking for entry-level backend or AI roles."
-skills:
-  - Python
-  - FastAPI
-  - Flask
-  - SQL
-  - PostgreSQL
-  - Machine Learning
-  - Pandas
-  - NumPy
-  - Git
-  - Docker
-  - REST API
 
-experience_years: 1
+summary: >-
+  Entry-level Python developer interested in backend and AI/ML engineering.
+  Building real projects with FastAPI, SQL and machine learning.
 
+# --- Where you stand ---------------------------------------------------------
+# candidate_type: fresher | entry_level | experienced
+# target_max_experience_years: postings asking more than this score lower
+#   (they are not auto-rejected unless they are far out of range).
+candidate_type: "fresher"
+experience_years: 0
+target_max_experience_years: 2
+graduation_year: 2026
+
+# Roles that ask for no prior experience (or 0-1 years) are a good fit.
+accept_fresher: true
+
+# Set false if you no longer want internships/trainee posts.
+internship_preference: true
+
+# --- Education ---------------------------------------------------------------
+# degree drives the (informational) education signal; education is the
+# descriptive field shown in the AI prompt.
+education: "B.E. Computer Engineering"
+degree: "B.E / B.Tech"
+
+# --- Skills ------------------------------------------------------------------
+# Categorised so the file stays readable. skill_groups are flattened into one
+# canonical skill list used by matching, prompts and storage, so a skill listed
+# in two groups is still counted once.
+skill_groups:
+  languages:
+    - Python
+    - JavaScript
+    - SQL
+  frameworks:
+    - FastAPI
+    - Flask
+    - Django
+  ai_ml:
+    - Machine Learning
+    - Deep Learning
+    - Scikit-learn
+    - Natural Language Processing
+  data_science:
+    - Statistics
+    - Data Analysis
+    - Data Visualization
+    - Pandas
+    - NumPy
+    - Jupyter
+  backend:
+    - REST API
+    - PostgreSQL
+    - Redis
+    - AsyncIO
+    - Testing
+  tools:
+    - Git
+    - Docker
+    - Linux
+
+# Any skill not captured by the groups above. `tools` is merged into the same
+# canonical list as skill_groups, so do not repeat a tool in both places.
+tools: []
+
+# Projects are shown to the AI as evidence of what you can actually build.
+# Keep them concrete - "FastAPI + PostgreSQL expense tracker" beats "several
+# projects".
+projects:
+  - "Expense tracker API built with FastAPI, SQLAlchemy and PostgreSQL"
+  - "Machine learning model trained on a public dataset using scikit-learn and Pandas"
+
+# --- What you want -----------------------------------------------------------
+# Roles you actively target. Matched as a phrase inside the job title.
 preferred_roles:
   - Python Developer
   - Backend Developer
   - AI Engineer
   - ML Engineer
   - Data Scientist
+  - Data Analyst
+  - GenAI Engineer
+  - Automation Developer
   - Software Engineer
 
+# Related titles that are still worth your time, even though they do not
+# contain a preferred_roles phrase verbatim ("Python Backend Engineer" for a
+# "Backend Developer" seeker). Valid keys:
+#   python_backend, ai_ml, data, full_stack, devops, qa
+role_families:
+  - python_backend
+  - ai_ml
+  - data
+
+# Leave locations empty only if you truly do not care where the job is.
 preferred_locations:
   - Pune
-  - Mumbai
-  - Bangalore
-  - Remote
+  - Maharashtra
   - India
+  - Remote
 
-# Optional: specific companies to prioritize or avoid
+# remote_preference: any | preferred | only | none
+#   any       - work mode does not matter
+#   preferred - remote scores best, hybrid is fine, onsite is acceptable
+#   only      - onsite/hybrid roles are vetoed
+remote_preference: "preferred"
+
+# Which engagement types you accept. Omit the key entirely to accept any.
+employment_types:
+  - full_time
+  - internship
+  - contract
+
+# Optional company-level preferences.
 preferred_companies: []
 avoid_companies: []
+avoid_roles: []
 
-# Optional: salary expectations (annual in INR)
+# --- Compensation ------------------------------------------------------------
+# Optional. Annual INR. Left empty, salary is out of scope for matching.
 salary_min: 600000
 salary_max: 2000000
 
-# Optional: notice period in days
+# Optional notice period in days.
 notice_period_days: 30

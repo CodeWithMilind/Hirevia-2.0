@@ -5,14 +5,19 @@ Stage order (each stage logs one line so a scan is auditable end to end):
     1. expire stale jobs
     2. collect from enabled sources    (per-source failures are isolated)
     3. deduplicate                      (fingerprint, then source id)
-    4. deterministic filters            (filters.yaml)
-    5. AI relevance / priority / score  (never fatal - see AIMatcher)
+    4. deterministic filters            (filters.yaml - hard vetoes)
+    5. matching                         (5a cheap link gate, 5b hybrid match:
+                                         deterministic profile evidence +
+                                         AI judgement -> one MatchResult)
     6. application link verification, storage, notification
 
 Failure policy: one bad job never stops a scan and one dead source never stops
-the others. Job-level failures land in ScanStats.jobs_failed / errors.
+the others. Job-level failures land in ScanStats.jobs_failed / errors. An AI
+that is switched off or completely down costs confidence, never a scan: the
+deterministic half still scores every job (see hirevia.core.matching).
 """
 
+import inspect
 import logging
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -22,10 +27,11 @@ from hirevia.config import Config
 from hirevia.core.dedup import compute_fingerprint
 from hirevia.core.filtering import apply_filters
 from hirevia.core.freshness import freshness_label, sort_by_freshness
-from hirevia.core.models import AIResponse, ApplicationStatus, Job, Priority, ScanStats
+from hirevia.core.matching import analyze, combine
+from hirevia.core.models import AIResponse, ApplicationStatus, Job, MatchResult, Priority, ScanStats
 from hirevia.core.verification import classify_application_url, verify_application
 from hirevia.notifications.base import Notifier
-from hirevia.profile.profile import load_profile
+from hirevia.profile.profile import load_profile, validate_profile
 from hirevia.sources.registry import SourceRegistry
 from hirevia.storage.state import JobRepository
 
@@ -39,6 +45,24 @@ ALERT_PRIORITIES = {Priority.P1, Priority.P2}
 # Telegram/WhatsApp channel, a shortener or an aggregator is stored for history
 # but never alerted on: the candidate cannot apply through it.
 ALERTABLE_QUALITIES = {"ats", "company", "job_board", "generic"}
+
+
+def _accepts_evidence(matcher) -> bool:
+    """Does this matcher accept the deterministic evidence as a third argument?
+
+    Phase 6 matchers (and test doubles) only take (job, profile). Probing the
+    signature once keeps those working instead of raising TypeError mid-scan.
+    """
+    if matcher is None:
+        return False
+    try:
+        params = inspect.signature(matcher.match).parameters
+    except (TypeError, ValueError):  # builtins / exotic callables
+        return False
+    if any(p.kind is p.VAR_POSITIONAL or p.kind is p.VAR_KEYWORD for p in params.values()):
+        return True
+    positional = [p for p in params.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    return len(positional) >= 3
 
 
 class Pipeline:
@@ -56,6 +80,15 @@ class Pipeline:
         self.registry = SourceRegistry(config)
         self.profile = load_profile()
         self.stats = ScanStats()
+        self._matcher_takes_evidence = _accepts_evidence(ai_matcher)
+        for warning in validate_profile(self.profile):
+            logger.warning("%s profile: %s", PREFIX, warning)
+        logger.info(
+            "%s profile '%s': %d skill(s), %d role(s), %d yr experience, remote=%s%s",
+            PREFIX, self.profile.name, len(self.profile.skills), len(self.profile.preferred_roles),
+            self.profile.experience_years, self.profile.remote_preference,
+            "" if self.ai_matcher else " | AI disabled - deterministic scoring only",
+        )
 
     # -- scan loop ----------------------------------------------------------
 
@@ -109,7 +142,8 @@ class Pipeline:
         s = self.stats
         return (
             f"found={s.jobs_found} new={s.jobs_new} dup={s.jobs_duplicate} "
-            f"filtered={s.jobs_filtered} ai_ok={s.jobs_ai_matched} ai_no={s.jobs_ai_rejected} "
+            f"filtered={s.jobs_filtered} matched={s.jobs_matched} below_match={s.jobs_below_match} "
+            f"ai_ok={s.jobs_ai_matched} ai_no={s.jobs_ai_rejected} "
             f"ai_errors={s.ai_failures} verified={s.jobs_verified} unknown={s.jobs_unverified} "
             f"closed={s.jobs_closed} no_apply_link={s.jobs_link_rejected} "
             f"notified={s.jobs_notified} alerts_skipped={s.jobs_skipped_notification} "
@@ -187,17 +221,19 @@ class Pipeline:
             )
             return
 
-        # Stage 5b: AI relevance
-        decision = await self._match(job, tag)
-        if decision is not None and not decision.relevant:
-            self.stats.jobs_ai_rejected += 1
+        # Stage 5b: hybrid matching. Deterministic profile evidence first
+        # (free, auditable), then the model's semantic judgement, then one
+        # verdict that storage, notifications and the dashboard all read.
+        verdict = await self._match(job, tag)
+        if not verdict.match:
+            self.stats.jobs_below_match += 1
             logger.info(
-                "%s Stage 5: AI rejected %r (%d%%) - %s",
-                PREFIX, job.title, decision.match_score, "; ".join(decision.reasons[:2]) or "no reason",
+                "%s %s Stage 5: no match for %r (%d%%, deterministic %d%%) - %s",
+                PREFIX, tag, job.title, verdict.match_score, verdict.deterministic_score,
+                verdict.reason[:160] or "below the match threshold",
             )
             return
-        if decision is not None:
-            self.stats.jobs_ai_matched += 1
+        self.stats.jobs_matched += 1
 
         # Stage 6: light-touch availability check on the application page
         status, quality = await self._verify(job, tag)
@@ -215,13 +251,13 @@ class Pipeline:
         if is_new:
             self.stats.jobs_new += 1
 
-        blocked = self._alert_block(job, decision, quality, is_new)
+        blocked = self._alert_block(job, verdict, quality, is_new)
         if blocked:
             self.stats.jobs_skipped_notification += 1
             logger.info("%s %s Stage 7: no alert for %r - %s", PREFIX, tag, job.title, blocked)
             return
 
-        await self._notify(job, decision)
+        await self._notify(job, verdict)
 
     def _stamp(self, job: Job, quality) -> None:
         """Persist the freshness + link-quality verdicts on the job itself."""
@@ -252,51 +288,70 @@ class Pipeline:
 
         A duplicate means the posting is live again, the job already has a
         stored verdict, and `notified_at` is still empty because the send
-        failed - so this reuses the saved AI decision (no new AI spend) instead
-        of waiting for a scan that never re-sees the message.
+        failed - so this reuses the saved match (no new AI spend) instead of
+        waiting for a scan that never re-sees the message.
         """
-        if self.notifier is None or existing.notified_at or not existing.ai_decision:
+        if self.notifier is None or existing.notified_at:
             return
-        try:
-            decision = AIResponse(**existing.ai_decision)
-        except Exception as e:  # noqa: BLE001 - a stale payload shape is not fatal
-            logger.debug("%s duplicate %s has an unreadable AI decision (%s)", PREFIX, existing.id, e)
+        verdict = existing.verdict_model()
+        if verdict is None:
             return
         quality = classify_application_url(
             str(existing.application_url) if existing.application_url else None
         )
-        blocked = self._alert_block(existing, decision, quality, is_new=False, allow_known=True)
+        blocked = self._alert_block(existing, verdict, quality, is_new=False, allow_known=True)
         if blocked:
             return
         logger.info("%s Stage 3: retrying the alert that never landed for %r", PREFIX, existing.title)
-        await self._notify(existing, decision)
+        await self._notify(existing, verdict)
 
 
 
     # -- stage helpers ------------------------------------------------------
 
-    async def _match(self, job: Job, tag: str) -> Optional[AIResponse]:
-        """Stage 5: ask the model. Returns None when AI is switched off."""
-        if self.ai_matcher is None:
-            logger.debug("%s Stage 5: AI disabled - unranked pass-through", PREFIX)
-            return None
+    async def _match(self, job: Job, tag: str) -> MatchResult:
+        """Stage 5b: one hybrid verdict, always available.
 
-        decision = await self.ai_matcher.match(job, self.profile)  # never raises
-        job.ai_decision = decision.model_dump()
-        if decision.degraded:
-            self.stats.ai_failures += 1
-            self._record_error(f"AI degraded ({job.source}/{job.source_job_id}): {decision.error}")
-            logger.warning(
-                "%s Stage 5: AI unavailable for %r (%s) - kept for manual review, no alert",
-                PREFIX, job.title, decision.error,
-            )
+        The deterministic half always runs: it is free, it is auditable, and it
+        means every job still carries a score when the AI is switched off or the
+        provider is down. The model then supplies the judgement a regex cannot
+        make (seniority, role intent, transferability), grounded on the evidence
+        block so it cannot invent skills.
+        """
+        evidence = analyze(job, self.profile)
+
+        decision: Optional[AIResponse] = None
+        if self.ai_matcher is None:
+            logger.debug("%s Stage 5: AI disabled - scoring on profile evidence only", PREFIX)
         else:
-            logger.info(
-                "%s Stage 5: AI matched %r - %s, %d%% (%s)",
-                PREFIX, job.title, decision.priority.value, decision.match_score,
-                "; ".join(decision.reasons[:2]) or "no reason",
-            )
-        return decision
+            args = (job, self.profile, evidence) if self._matcher_takes_evidence else (job, self.profile)
+            decision = await self.ai_matcher.match(*args)  # never raises
+            job.ai_decision = decision.model_dump()
+            if decision.degraded:
+                self.stats.ai_failures += 1
+                self._record_error(f"AI degraded ({job.source}/{job.source_job_id}): {decision.error}")
+                logger.warning(
+                    "%s Stage 5: AI unavailable for %r (%s) - scored on evidence alone",
+                    PREFIX, job.title, decision.error,
+                )
+            elif decision.relevant:
+                self.stats.jobs_ai_matched += 1
+            else:
+                self.stats.jobs_ai_rejected += 1
+
+        verdict = combine(evidence, self.config, decision, getattr(self.ai_matcher, "model", None))
+        job.match_result = verdict.model_dump(mode="json")
+        # Mirrors for the dashboard's existing flat readers.
+        job.raw_data["deterministic_score"] = verdict.deterministic_score
+        job.raw_data["ai_status"] = verdict.ai_status
+        logger.info(
+            "%s Stage 5: %r -> %d%% (%s) = deterministic %d%% + ai %s | %s",
+            PREFIX, job.title, verdict.match_score, verdict.priority.value,
+            verdict.deterministic_score,
+            "n/a" if verdict.ai_score is None else f"{verdict.ai_score}%",
+            verdict.reason[:140] or "no reason given",
+        )
+        return verdict
 
     async def _verify(self, job: Job, tag: str):
         """Stage 6: reachability of the application page (best effort)."""
@@ -318,7 +373,7 @@ class Pipeline:
     def _alert_block(
         self,
         job: Job,
-        decision: Optional[AIResponse],
+        verdict: MatchResult,
         quality,
         is_new: bool,
         allow_known: bool = False,
@@ -334,16 +389,16 @@ class Pipeline:
             return "already known before this scan"
         if job.notified_at:
             return f"already notified via {job.notification_channel}"
-        if decision is None:
+        if verdict.ai_status == "skipped":
             return "no AI ranking (run with AI enabled to receive alerts)"
-        if decision.degraded:
-            return f"AI unavailable ({decision.error})"
+        if verdict.degraded:
+            return f"AI unavailable ({verdict.ai_error})"
         if (
-            decision.priority not in ALERT_PRIORITIES
-            and decision.match_score < self.config.notify_min_match_score
+            verdict.priority not in ALERT_PRIORITIES
+            and verdict.match_score < self.config.notify_min_match_score
         ):
             return (
-                f"{decision.priority.value}/{decision.match_score}% below alert threshold "
+                f"{verdict.priority.value}/{verdict.match_score}% below alert threshold "
                 f"(P3 needs >= {self.config.notify_min_match_score}%)"
             )
         if quality.quality not in ALERTABLE_QUALITIES:
@@ -354,7 +409,7 @@ class Pipeline:
             return f"posted over {max_age}h ago (freshness: {job.raw_data.get('freshness_label')})"
         return None
 
-    async def _notify(self, job: Job, decision: AIResponse) -> None:
+    async def _notify(self, job: Job, verdict: MatchResult) -> None:
         """Stage 7: deliver one alert.
 
         The notifier owns transport-level retries. If it still fails we leave
@@ -362,7 +417,7 @@ class Pipeline:
         later - picks the job up again instead of blocking this one.
         """
         try:
-            sent = await self.notifier.send(job, decision)
+            sent = await self.notifier.send(job, verdict)
         except Exception as e:  # noqa: BLE001
             logger.error("%s Stage 7: notification crashed for %r: %s", PREFIX, job.title, e)
             self._record_error(f"notify {job.source_job_id}: {type(e).__name__}: {e}")
@@ -381,9 +436,9 @@ class Pipeline:
         except Exception as e:  # noqa: BLE001 - alert is already out; do not fail the scan
             logger.warning("%s could not record notification for %s: %s", PREFIX, job.id, e)
         logger.info(
-            "%s Stage 7: alerted %r @ %s (%s, %d%%) via %s",
-            PREFIX, job.title, job.company, decision.priority.value, decision.match_score,
-            self.notifier.name,
+            "%s Stage 7: alerted %r @ %s (%s, %d%% / det %d%%) via %s",
+            PREFIX, job.title, job.company, verdict.priority.value, verdict.match_score,
+            verdict.deterministic_score, self.notifier.name,
         )
 
 
