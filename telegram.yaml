@@ -29,17 +29,18 @@ telegram:
     max_messages: 25
 
   channels:
-    - username: AiIndiaJobs
+    # - username: AiIndiaJobs
     # - username: codinghelpdesk
-    - username: datasciencefree
-    - username: datasciencefun
-    - username: dot_aware
-    - username: engineerjobsindia
-    - username: fresher_offcampus_drives
-    - username: freshercareersdotin
-    - username: Fresherjobsadda
+    # - username: datasciencefree
+    # - username: datasciencefun
+    # - username: dot_aware
+    # - username: engineerjobsindia
+    # - username: fresher_offcampus_drives
+    # - username: freshercareersdotin
+    # - username: Fresherjobsadda
     - username: fresheroffcampus
     - username: freshershunt
+    - username: hirevia1
     # - username: getjobss
     # - username: gocareers
     # - username: HireMeFresh

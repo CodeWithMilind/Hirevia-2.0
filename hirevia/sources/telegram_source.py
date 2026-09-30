@@ -85,15 +85,16 @@ def _cursor_for(channel: str) -> int:
 
 
 def _remember(channel: str, message_id: int) -> None:
-    """Advance the cursor (monotonic) and persist it when a store is bound."""
+    """Advance a channel cursor only after its collected messages are handled."""
     if message_id <= _cursor_for(channel):
         return
-    _last_seen_ids[channel] = message_id
     if _state_store is not None:
         try:
             _state_store.set_source_state("telegram", CURSOR_KEY.format(channel), message_id)
         except Exception as e:  # noqa: BLE001 - worst case: a restart re-reads messages
             logger.debug("%s cursor write failed for %s: %s", PREFIX, channel, e)
+            return
+    _last_seen_ids[channel] = message_id
 
 
 
@@ -233,6 +234,22 @@ class TelegramSource(JobSource):
             "aggregator_rejected": 0,
             "intent_ambiguous": 0,
         }
+        self._pending_message_ids: Dict[str, int] = {}
+        self._has_more_backfill = False
+        self._last_collection_failed = False
+        self._event_queue = None
+        self._event_mode = False
+        self._active_event = None
+        self._retry_event = None
+        self._event_channels: Dict[str, TelegramChannel] = {}
+        self._event_channel_by_peer: Dict[int, str] = {}
+        self._overflow_channels = set()
+        self._highest_enqueued_ids: Dict[str, int] = {}
+        self._recovery_task = None
+        self._listener_client = None
+        self._listener_handler = None
+        self._connection_task = None
+        self._stop_connection_watch = asyncio.Event()
 
     def bind_state(self, repo) -> None:
         """Called by the Pipeline: store per-channel cursors in the jobs DB."""
@@ -249,14 +266,22 @@ class TelegramSource(JobSource):
             logger.info("%s No enabled channels in telegram.yaml - skipping", PREFIX)
             return []
 
+        if self._event_mode:
+            return await self._collect_queued_message(channels)
+
+        self._has_more_backfill = False
+        self._last_collection_failed = False
+
         logger.info("%s Monitoring %d channels", PREFIX, len(channels))
 
         try:
             client = await self._ensure_client()
         except TelegramAuthError as e:
+            self._last_collection_failed = True
             logger.warning("%s %s", PREFIX, e)
             return []
         except Exception as e:
+            self._last_collection_failed = True
             logger.error("%s Connection failed: %s", PREFIX, _safe_err(e))
             return []
 
@@ -280,6 +305,7 @@ class TelegramSource(JobSource):
             try:
                 messages = await self._fetch_channel_messages(client, channel)
             except FloodWaitError as e:
+                self._last_collection_failed = True
                 wait_seconds = min(int(getattr(e, "seconds", 30) or 30), 60)
                 logger.warning(
                     "%s Rate limited - waiting %ss, will resume from last message",
@@ -288,13 +314,21 @@ class TelegramSource(JobSource):
                 await asyncio.sleep(wait_seconds)
                 continue
             except (UsernameNotOccupiedError, ValueError) as e:
+                self._last_collection_failed = True
                 logger.warning("%s Channel unavailable: %s (%s)", PREFIX, channel.username, _safe_err(e))
                 continue
             except Exception as e:
+                self._last_collection_failed = True
                 logger.error("%s Channel %s failed: %s - continuing", PREFIX, channel.username, _safe_err(e))
                 continue
 
             messages_checked += len(messages)
+            if (
+                channel.max_messages > 0
+                and _cursor_for(channel.username)
+                and len(messages) >= channel.max_messages
+            ):
+                self._has_more_backfill = True
             channel_jobs = self._normalize_messages(channel, messages)
             jobs_detected += len(channel_jobs)
             printed_ids = set()
@@ -338,6 +372,279 @@ class TelegramSource(JobSource):
         # Collapse reposts of the same opening inside one scan; cross-scan
         # reposts are absorbed later by repository dedup (source+source_job_id).
         return list(unique.values())
+
+    async def start_continuous_monitoring(self) -> int:
+        """Subscribe to new channel messages and queue them for the pipeline."""
+        settings = load_telegram_settings()
+        if not settings.enabled:
+            raise TelegramAuthError("Telegram is disabled in telegram.yaml")
+        channels = settings.get_enabled_channels()
+        if not channels:
+            raise TelegramAuthError("No enabled Telegram channels are configured")
+
+        self._event_channels = {channel.username.casefold(): channel for channel in channels}
+        self._event_queue = asyncio.Queue(maxsize=1000)
+        self._stop_connection_watch = asyncio.Event()
+        client = await self._ensure_client()
+        await self._register_event_handler(client, channels)
+        self._listener_client = client
+        self._schedule_overflow_recovery()
+        self._connection_task = asyncio.create_task(self._watch_connection(channels))
+        logger.info("%s Continuous monitoring started", PREFIX)
+        logger.info("%s Monitoring %d enabled channels", PREFIX, len(channels))
+        return len(channels)
+
+    async def _register_event_handler(self, client, channels) -> None:
+        from telethon import events
+        from telethon.utils import get_peer_id
+
+        entities = []
+        self._event_channel_by_peer.clear()
+        for channel in channels:
+            try:
+                entity = await client.get_entity(channel.username)
+                entities.append(entity)
+                self._event_channel_by_peer[get_peer_id(entity)] = channel.username
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not initialize Telegram channel {channel.username}: {_safe_err(e)}"
+                ) from e
+
+        self._listener_handler = self._on_new_message
+        client.add_event_handler(
+            self._listener_handler,
+            events.NewMessage(chats=entities),
+        )
+        self._listener_client = client
+        await client.catch_up()
+
+    async def _on_new_message(self, event) -> None:
+        message = getattr(event, "message", None)
+        if message is None or self._event_queue is None:
+            return
+
+        chat = getattr(event, "chat", None)
+        username = getattr(chat, "username", None)
+        if not username:
+            username = self._event_channel_by_peer.get(getattr(event, "chat_id", None))
+        channel = self._event_channels.get(username.casefold()) if username else None
+        if channel is None:
+            logger.warning("%s Received an update for an unconfigured channel", PREFIX)
+            return
+        username = channel.username
+
+        message_id = int(getattr(message, "id", 0) or 0)
+        if message_id <= _cursor_for(username):
+            return
+        if username in self._overflow_channels:
+            return
+        try:
+            self._event_queue.put_nowait((username, message))
+            self._highest_enqueued_ids[username] = max(
+                message_id, self._highest_enqueued_ids.get(username, 0)
+            )
+        except asyncio.QueueFull:
+            self._overflow_channels.add(username)
+            self._schedule_overflow_recovery()
+            logger.warning(
+                "%s Message queue full; recovering channel %s from its saved cursor",
+                PREFIX, username,
+            )
+            return
+        logger.info(
+            "%s New message: channel=%s message_id=%s",
+            PREFIX, username, message_id,
+        )
+
+    async def _collect_queued_message(self, enabled_channels) -> List[Job]:
+        if self._event_queue is None:
+            raise RuntimeError("Telegram event queue is not initialized")
+
+        self._intent_counts = {
+            "promotional_rejected": 0,
+            "educational_rejected": 0,
+            "informational_rejected": 0,
+            "spam_rejected": 0,
+            "selection_rejected": 0,
+            "aggregator_rejected": 0,
+            "intent_ambiguous": 0,
+        }
+        queued = self._retry_event
+        if queued is not None:
+            self._retry_event = None
+        else:
+            queued = await self._event_queue.get()
+
+        username, message = queued
+        channel = self._event_channels.get(username.casefold())
+        if channel is None:
+            return []
+        message_id = int(getattr(message, "id", 0) or 0)
+        self._active_event = queued
+        if message_id <= _cursor_for(username):
+            self.last_stats = {"channels_scanned": 1, "messages_checked": 0}
+            return []
+
+        self._pending_message_ids[username] = max(
+            message_id, self._pending_message_ids.get(username, 0)
+        )
+        tg_message = to_tgmessage(message, username)
+        jobs = self._normalize_messages(channel, [tg_message])
+        unique = {job.source_job_id: job for job in jobs}
+        self.last_stats = {
+            "channels_scanned": 1,
+            "messages_checked": 1,
+            "jobs_detected": len(jobs),
+            "jobs_normalized": len(unique),
+            **self._intent_counts,
+        }
+        return list(unique.values())
+
+    def enable_event_mode(self) -> None:
+        self._event_mode = True
+
+    @property
+    def has_more_backfill(self) -> bool:
+        return self._has_more_backfill
+
+    @property
+    def last_collection_failed(self) -> bool:
+        return self._last_collection_failed
+
+    def retry_uncommitted_event(self) -> bool:
+        """Retry the active update if its pipeline processing was incomplete."""
+        if self._active_event is None:
+            return False
+        username, message = self._active_event
+        message_id = int(getattr(message, "id", 0) or 0)
+        if self._pending_message_ids.get(username, 0) < message_id:
+            return False
+        self._retry_event = self._active_event
+        return True
+
+    def commit_processed_messages(self) -> bool:
+        """Persist cursors for messages only after successful pipeline work."""
+        committed = True
+        for username, message_id in list(self._pending_message_ids.items()):
+            previous = _cursor_for(username)
+            _remember(username, message_id)
+            if _cursor_for(username) < message_id:
+                committed = False
+                continue
+            self._pending_message_ids.pop(username, None)
+            if previous >= message_id:
+                continue
+        return committed
+
+    async def _watch_connection(self, channels) -> None:
+        delay = 2
+        while not self._stop_connection_watch.is_set():
+            try:
+                await asyncio.wait_for(self._stop_connection_watch.wait(), timeout=5)
+                return
+            except asyncio.TimeoutError:
+                pass
+
+            client = self._listener_client
+            try:
+                if client is not None and client.is_connected():
+                    delay = 2
+                    continue
+                logger.warning("%s Connection lost; reconnecting", PREFIX)
+                await asyncio.sleep(delay)
+                await self._reconnect_listener(channels)
+                self._schedule_overflow_recovery()
+                delay = 2
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("%s Reconnect failed: %s", PREFIX, _safe_err(e))
+                delay = min(delay * 2, 60)
+
+    async def _reconnect_listener(self, channels) -> None:
+        client = await self._ensure_client()
+        if client is not self._listener_client:
+            await self._register_event_handler(client, channels)
+        else:
+            await client.catch_up()
+        self._listener_client = client
+
+    def _schedule_overflow_recovery(self) -> None:
+        if self._overflow_channels and (
+            self._recovery_task is None or self._recovery_task.done()
+        ):
+            self._recovery_task = asyncio.create_task(self._recover_overflowed_channels())
+
+    async def _recover_overflowed_channels(self) -> None:
+        delay = 1
+        while self._overflow_channels and not self._stop_connection_watch.is_set():
+            username = next(iter(self._overflow_channels))
+            channel = self._event_channels.get(username.casefold())
+            client = self._listener_client
+            try:
+                if channel is None or client is None or not client.is_connected():
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 60)
+                    continue
+                if channel.max_messages <= 0:
+                    raise ValueError(f"invalid max_messages for {username}")
+
+                entity = await client.get_entity(username)
+                min_id = max(
+                    _cursor_for(username),
+                    self._highest_enqueued_ids.get(username, 0),
+                )
+                count = 0
+                async for message in client.iter_messages(
+                    entity,
+                    min_id=min_id,
+                    reverse=True,
+                    limit=channel.max_messages,
+                ):
+                    message_id = int(getattr(message, "id", 0) or 0)
+                    await self._event_queue.put((username, message))
+                    self._highest_enqueued_ids[username] = max(
+                        message_id, self._highest_enqueued_ids.get(username, 0)
+                    )
+                    count += 1
+
+                if count < channel.max_messages:
+                    self._overflow_channels.discard(username)
+                delay = 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "%s Queue recovery failed for %s: %s",
+                    PREFIX, username, _safe_err(e),
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
+    async def stop_continuous_monitoring(self) -> None:
+        self._stop_connection_watch.set()
+        if self._recovery_task is not None:
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
+            self._recovery_task = None
+        if self._connection_task is not None:
+            self._connection_task.cancel()
+            try:
+                await self._connection_task
+            except asyncio.CancelledError:
+                pass
+            self._connection_task = None
+        if self._listener_client is not None and self._listener_handler is not None:
+            try:
+                self._listener_client.remove_event_handler(self._listener_handler)
+            except Exception:
+                pass
+        self._listener_handler = None
+        self._event_mode = False
+        await close_shared_client()
 
     @staticmethod
     def _print_channel_header(channel_name: str) -> None:
@@ -401,7 +708,12 @@ class TelegramSource(JobSource):
 
         collected: List[TgMessage] = []
         if last_seen_id:
-            iterator = client.iter_messages(entity, offset_id=last_seen_id, limit=channel.max_messages)
+            iterator = client.iter_messages(
+                entity,
+                min_id=last_seen_id,
+                reverse=True,
+                limit=channel.max_messages,
+            )
         else:
             cutoff = datetime.now(timezone.utc) - timedelta(hours=channel.lookback_hours)
             iterator = self._lookback_iterator(client, entity, channel, cutoff)
@@ -410,7 +722,10 @@ class TelegramSource(JobSource):
             collected.append(to_tgmessage(message, channel.username))
 
         if collected:
-            _remember(channel.username, max(m.message_id for m in collected))
+            self._pending_message_ids[channel.username] = max(
+                max(m.message_id for m in collected),
+                self._pending_message_ids.get(channel.username, 0),
+            )
         return collected
 
     async def _lookback_iterator(self, client, entity, channel: TelegramChannel, cutoff):

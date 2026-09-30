@@ -372,6 +372,63 @@ def test_scan_prints_empty_final_results(monkeypatch, tmp_path):
     assert "Processed       : 0" in result.output
 
 
+def test_monitor_uses_telegram_only_and_no_notify_still_starts(monkeypatch, tmp_path):
+    config = Config()
+    config.sources.sources["greenhouse"].enabled = True
+    source_calls = []
+    pipeline_configs = []
+
+    class FakeTelegramSource:
+        last_collection_failed = False
+        has_more_backfill = False
+
+        async def start_continuous_monitoring(self):
+            source_calls.append("started")
+            return 36
+
+        def enable_event_mode(self):
+            source_calls.append("event_mode")
+
+        def retry_uncommitted_event(self):
+            return False
+
+        async def stop_continuous_monitoring(self):
+            source_calls.append("stopped")
+
+    source = FakeTelegramSource()
+
+    class FakePipeline:
+        def __init__(self, monitor_config, repo, ai_matcher, notifier, **kwargs):
+            pipeline_configs.append(monitor_config)
+            self.registry = SimpleNamespace(get_source=lambda name: source if name == "telegram" else None)
+            self.scan_calls = 0
+
+        async def run_scan(self):
+            self.scan_calls += 1
+            if self.scan_calls == 1:
+                return ScanStats()
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli_module, "Pipeline", FakePipeline)
+    monkeypatch.setattr(cli_module, "_build_ai_matcher", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_build_notifier",
+        lambda *a, **k: pytest.fail("--no-notify must not create a notifier"),
+    )
+
+    result = CliRunner().invoke(
+        cli, ["monitor", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "monitor.db")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert source_calls == ["started", "event_mode", "stopped"]
+    assert pipeline_configs[0].sources.get_enabled_sources() == ["telegram"]
+    assert config.sources.get_enabled_sources() == ["greenhouse", "telegram"]
+    assert "Telegram notifications: DISABLED (--no-notify)" in result.output
+
+
 def test_status_shows_freshness_and_link_verdict(monkeypatch, tmp_path):
     job = Job(
         source="telegram", source_job_id="alpha-1", title="Backend Developer",

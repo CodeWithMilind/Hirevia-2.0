@@ -18,7 +18,7 @@ from hirevia.ai.providers import build_ai_provider_router, provider_status
 from hirevia.config import Config, load_config, get_telegram_token
 from hirevia.core.matching import analyze
 from hirevia.core.models import CandidateProfile, Job, ScanStats
-from hirevia.core.pipeline import run_single_scan
+from hirevia.core.pipeline import Pipeline, run_single_scan
 from hirevia.core.verification import classify_application_url
 from hirevia.core.freshness import freshness_label
 from hirevia.notifications.telegram import TelegramNotifier
@@ -227,6 +227,101 @@ def scan(
             duration=stats.duration_seconds,
             notifications_enabled=bool(notify and notifier),
         )
+
+
+@cli.command()
+@click.option("--db-path", default="hirevia.db", help="SQLite database path")
+@click.option("--no-ai", is_flag=True, help="Run without AI matching")
+@click.option("--notify/--no-notify", "notify", default=False, help="Send Telegram alerts")
+@click.option("--telegram-token", default=None, help="Telegram bot token (or TELEGRAM_BOT_TOKEN)")
+@click.option("--chat-id", default=None, help="Telegram chat id (or TELEGRAM_CHAT_ID)")
+@click.option("--verbose", is_flag=True, help="Show per-job and provider diagnostics")
+def monitor(
+    db_path: str,
+    no_ai: bool,
+    notify: bool,
+    telegram_token: str,
+    chat_id: str,
+    verbose: bool,
+):
+    """Continuously process new Telegram channel messages."""
+    configure_logging(verbose)
+    config = load_config()
+    telegram_config = config.sources.sources.get("telegram")
+    if telegram_config is None or not telegram_config.enabled:
+        raise click.ClickException("Enable the Telegram source before starting monitor mode")
+
+    monitor_config = config.model_copy(deep=True)
+    for name, source_config in monitor_config.sources.sources.items():
+        source_config.enabled = name == "telegram" and source_config.enabled
+
+    repo = JobRepository(Path(db_path))
+    ai_matcher = _build_ai_matcher(config, no_ai)
+    if not ai_matcher and not no_ai:
+        console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
+    notifier = _build_notifier(config, telegram_token, chat_id) if notify else None
+    progress_reporter = _make_ai_progress_reporter(
+        notifications_enabled=bool(notify and notifier)
+    )
+    pipeline = Pipeline(
+        monitor_config,
+        repo,
+        ai_matcher,
+        notifier,
+        ai_progress_callback=progress_reporter,
+    )
+    source = pipeline.registry.get_source("telegram")
+    if source is None or not callable(getattr(source, "start_continuous_monitoring", None)):
+        if notifier:
+            asyncio.run(notifier.close())
+        raise click.ClickException("Telegram collector could not be initialized")
+
+    async def _run_monitor():
+        started_at = asyncio.get_running_loop().time()
+        retry_delay = 2
+        try:
+            await source.start_continuous_monitoring()
+            while True:
+                stats = await pipeline.run_scan()
+                if source.last_collection_failed or stats.jobs_failed:
+                    logger.warning(
+                        "[Telegram] Startup catch-up incomplete; retrying in %ss",
+                        retry_delay,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
+                    continue
+                if source.has_more_backfill:
+                    continue
+                break
+
+            source.enable_event_mode()
+            retry_delay = 2
+            while True:
+                stats = await pipeline.run_scan()
+                if source.retry_uncommitted_event():
+                    logger.warning(
+                        "[Telegram] Message processing incomplete; retrying in %ss",
+                        retry_delay,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
+                else:
+                    retry_delay = 2
+        finally:
+            await source.stop_continuous_monitoring()
+            if notifier:
+                await notifier.close()
+            progress_reporter(
+                "complete",
+                duration=asyncio.get_running_loop().time() - started_at,
+                notifications_enabled=bool(notify and notifier),
+            )
+
+    try:
+        asyncio.run(_run_monitor())
+    except KeyboardInterrupt:
+        console.print("\n[Telegram] Continuous monitoring stopped")
 
 
 

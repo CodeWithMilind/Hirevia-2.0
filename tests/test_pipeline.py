@@ -8,6 +8,8 @@ network access happens.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -208,6 +210,174 @@ def test_deterministic_only_job_is_reported_as_ai_skipped(repo):
     assert events[3][1]["status"] == "AI SKIPPED"
     assert events[3][1]["score"] == events[2][1]["rule_score"]
     assert stats.jobs_rule_scored == 1
+
+
+def test_collector_cursor_commits_after_successful_pipeline_run(repo):
+    class CommitSource(FakeSource):
+        def __init__(self, jobs):
+            super().__init__(jobs)
+            self.commits = 0
+
+        def commit_processed_messages(self):
+            self.commits += 1
+            return True
+
+    source = CommitSource([
+        make_job(apply="https://jobs.lever.co/acme/backend")
+    ])
+
+    stats = run(build_pipeline([source], repo))
+
+    assert stats.jobs_failed == 0
+    assert source.commits == 1
+
+
+def test_collector_cursor_is_not_committed_after_job_failure(repo):
+    class CommitSource(FakeSource):
+        def __init__(self, jobs):
+            super().__init__(jobs)
+            self.commits = 0
+
+        def commit_processed_messages(self):
+            self.commits += 1
+            return True
+
+    source = CommitSource([
+        make_job(apply="https://jobs.lever.co/acme/backend")
+    ])
+    pipeline = build_pipeline([source], repo)
+
+    async def fail_job(*args, **kwargs):
+        raise RuntimeError("simulated processing failure")
+
+    pipeline._process_job = fail_job
+
+    stats = run(pipeline)
+
+    assert stats.jobs_failed == 1
+    assert source.commits == 0
+
+
+def test_event_messages_use_pipeline_job_dedup_and_notification_protection(repo, tmp_path):
+    from hirevia.sources import telegram_source
+    from hirevia.sources.telegram_config import TelegramChannel
+    from hirevia.sources.telegram_source import TelegramSource
+
+    telegram_source._last_seen_ids.pop("jobs_alpha", None)
+    Path("telegram.yaml").write_text(
+        "telegram:\n  enabled: true\n  channels:\n    - username: jobs_alpha\n",
+        encoding="utf-8",
+    )
+    source = TelegramSource()
+    source.bind_state(repo)
+    source._event_mode = True
+    source._event_channels = {"jobs_alpha": TelegramChannel(username="jobs_alpha")}
+    source._event_queue = asyncio.Queue()
+    posted_text = (
+        "Hiring: Backend Developer\n"
+        "Company: Acme Corp\n"
+        "Location: Pune\n"
+        "Experience: 1-3 years\n"
+        "Apply: https://jobs.lever.co/acme/backend"
+    )
+    for message_id in (105, 106):
+        source._event_queue.put_nowait((
+            "jobs_alpha",
+            SimpleNamespace(
+                id=message_id,
+                date=datetime.now(timezone.utc),
+                raw_text=posted_text,
+                message=posted_text,
+                entities=[],
+            ),
+        ))
+
+    notifier = FakeNotifier()
+    pipeline = build_pipeline(
+        [source], repo, FakeMatcher(), notifier, notify_min_match_score=0
+    )
+
+    first = run(pipeline)
+    second = run(pipeline)
+
+    assert first.jobs_new == 1
+    assert second.jobs_duplicate == 1
+    assert notifier.sent == ["Backend Developer"]
+    assert repo.get_source_state(
+        "telegram", telegram_source.CURSOR_KEY.format("jobs_alpha")
+    ) == "106"
+
+
+def test_telegram_event_queue_receives_updates_while_ai_is_processing(repo, tmp_path):
+    from hirevia.sources import telegram_source
+    from hirevia.sources.telegram_config import TelegramChannel
+    from hirevia.sources.telegram_source import TelegramSource
+
+    telegram_source._last_seen_ids.pop("jobs_alpha", None)
+    Path("telegram.yaml").write_text(
+        "telegram:\n  enabled: true\n  channels:\n    - username: jobs_alpha\n",
+        encoding="utf-8",
+    )
+    source = TelegramSource()
+    source.bind_state(repo)
+    source._event_mode = True
+    source._event_channels = {"jobs_alpha": TelegramChannel(username="jobs_alpha")}
+    source._event_queue = asyncio.Queue(maxsize=2)
+
+    def telegram_message(message_id, text):
+        return SimpleNamespace(
+            id=message_id,
+            date=datetime.now(timezone.utc),
+            raw_text=text,
+            message=text,
+            entities=[],
+        )
+
+    first_text = (
+        "Hiring: Backend Developer\nCompany: Acme Corp\nLocation: Pune\n"
+        "Experience: 1-3 years\nApply: https://jobs.lever.co/acme/backend"
+    )
+    second_text = (
+        "Hiring: Data Analyst\nCompany: Beta Labs\nLocation: Remote\n"
+        "Experience: 1-3 years\nApply: https://jobs.lever.co/beta/analyst"
+    )
+    source._event_queue.put_nowait(("jobs_alpha", telegram_message(201, first_text)))
+
+    class WaitingMatcher:
+        def __init__(self):
+            self.calls = []
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def match(self, job, profile):
+            self.calls.append(job.title)
+            if len(self.calls) == 1:
+                self.started.set()
+                await self.release.wait()
+            return AIResponse(
+                relevant=True, priority=Priority.P1, match_score=92,
+                reasons=["test verdict"],
+            )
+
+    matcher = WaitingMatcher()
+    pipeline = build_pipeline([source], repo, matcher)
+
+    async def run_with_pending_update():
+        first_scan = asyncio.create_task(pipeline.run_scan())
+        await matcher.started.wait()
+        await source._on_new_message(SimpleNamespace(
+            chat=SimpleNamespace(username="jobs_alpha"),
+            message=telegram_message(202, second_text),
+        ))
+        assert source._event_queue.qsize() == 1
+        matcher.release.set()
+        await first_scan
+        await pipeline.run_scan()
+
+    asyncio.run(run_with_pending_update())
+
+    assert matcher.calls == ["Backend Developer", "Data Analyst"]
+    assert telegram_source._cursor_for("jobs_alpha") == 202
 
 
 def test_ai_progress_is_printable_before_matcher_wait_and_completes_after_pipeline(repo):

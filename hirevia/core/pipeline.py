@@ -133,7 +133,9 @@ class Pipeline:
 
             total = len(all_jobs)
             if self.ai_progress_callback:
-                self._emit_ai_progress("start", total=total)
+                if not getattr(self, "_progress_started", False):
+                    self._emit_ai_progress("start", total=total)
+                    self._progress_started = True
             for index, job in enumerate(all_jobs, start=1):
                 self._job_progress_state = {"status": "AI SKIPPED", "score": None}
                 if self.ai_progress_callback:
@@ -158,6 +160,19 @@ class Pipeline:
                             job=job,
                             **self._job_progress_state,
                         )
+            if self.stats.jobs_failed == 0:
+                for source in sources:
+                    commit = getattr(source, "commit_processed_messages", None)
+                    if callable(commit):
+                        try:
+                            if commit() is False:
+                                self._record_error(
+                                    f"{source.name}: message cursor persistence failed"
+                                )
+                        except Exception as e:  # noqa: BLE001 - uncommitted messages replay safely
+                            self._record_error(
+                                f"{source.name}: cursor commit failed ({type(e).__name__})"
+                            )
         except Exception as e:  # noqa: BLE001
             logger.error("%s scan failed: %s", PREFIX, e, exc_info=True)
             self._record_error(f"Pipeline: {type(e).__name__}: {e}")
