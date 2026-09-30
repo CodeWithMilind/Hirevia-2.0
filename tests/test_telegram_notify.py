@@ -7,12 +7,13 @@ carries everything a candidate needs to apply.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
-from hirevia.core.models import AIResponse, Job, Priority
+from hirevia.core.models import AIResponse, Job, MatchResult, Priority
 from hirevia.notifications import telegram as tg
 from hirevia.notifications.telegram import TelegramNotifier, _retry_after
 
@@ -120,6 +121,36 @@ def test_network_exception_is_retried_then_gives_up(monkeypatch, sleeps):
     assert len(sleeps) == 2
 
 
+def test_timeout_is_retried(monkeypatch, sleeps):
+    notifier = build(monkeypatch, [TimeoutError("fake timeout"), FakeResponse(200)])
+
+    assert send(notifier) is True
+    assert len(notifier.client.calls) == 2
+    assert sleeps == [1.0]
+
+
+def test_http_200_without_telegram_ok_is_not_success(monkeypatch, sleeps):
+    notifier = build(monkeypatch, [FakeResponse(200, payload={"ok": False})], retry_attempts=1)
+
+    assert send(notifier) is False
+    assert len(notifier.client.calls) == 1
+
+
+def test_transport_and_response_errors_never_log_the_bot_token(monkeypatch, sleeps, caplog):
+    token = "123:private-test-token"
+    notifier = TelegramNotifier(token, "42", retry_attempts=2, retry_delay=1)
+    notifier.client = FakeClient([
+        FakeResponse(500, text=token),
+        RuntimeError(f"request failed at {notifier.base_url}"),
+    ])
+
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(notifier.send(make_job(), DECISION)) is False
+
+    assert token not in caplog.text
+    assert notifier.base_url not in caplog.text
+
+
 def test_attempts_and_delay_are_configurable(monkeypatch, sleeps):
     notifier = build(monkeypatch, [FakeResponse(500), FakeResponse(500), FakeResponse(500)],
                      retry_attempts=1)
@@ -179,4 +210,102 @@ def test_alert_text_is_apply_ready_and_escaped(monkeypatch):
     assert "Source: jobs_alpha" in text
     assert "Python + FastAPI overlap" in text
     assert "fresh" in text.lower()
+
+
+def test_canonical_verdict_is_used_without_exposing_ai_private_text(monkeypatch):
+    notifier = build(monkeypatch, [])
+    job = make_job(match_result=MatchResult(
+        match=True,
+        match_score=84,
+        priority=Priority.P2,
+        reason="Python and FastAPI match your profile.",
+        ai_status="ok",
+        ai_score=90,
+        deterministic_score=80,
+    ).model_dump(mode="json"))
+    decision = AIResponse(
+        relevant=True,
+        priority=Priority.P1,
+        match_score=99,
+        reasons=["PRIVATE_CHAIN_OF_THOUGHT must not appear"],
+    )
+
+    text = notifier.format_message(job, decision)
+
+    assert "P2 - Job Match (84%)" in text
+    assert "Python and FastAPI match your profile." in text
+    assert "PRIVATE_CHAIN_OF_THOUGHT" not in text
+
+
+def test_hard_veto_reason_is_rendered_as_a_veto_not_a_normal_match(monkeypatch):
+    notifier = build(monkeypatch, [])
+    verdict = MatchResult(
+        match=False,
+        match_score=40,
+        priority=Priority.P3,
+        reason="rejected: asks 8+ years, candidate targets 2",
+        hard_reject=True,
+        reject_reasons=["asks 8+ years, candidate targets 2"],
+        ai_status="ok",
+        ai_score=100,
+        deterministic_score=95,
+    )
+
+    text = notifier.format_message(make_job(match_result=verdict.model_dump(mode="json")), verdict)
+
+    assert "Vetoed by a hard rule: asks 8+ years" in text
+    assert "Evidence 95% + AI 100%" not in text
+
+
+def test_degraded_error_details_are_not_exposed_in_the_message(monkeypatch):
+    notifier = build(monkeypatch, [])
+    verdict = MatchResult(
+        match=True,
+        match_score=61,
+        priority=Priority.P2,
+        reason="AI unavailable (private stack trace and secret)",
+        ai_status="failed",
+        ai_error="private stack trace and secret",
+        deterministic_score=68,
+    )
+    job = make_job(match_result=verdict.model_dump(mode="json"))
+
+    text = notifier.format_message(job, verdict)
+
+    assert "AI unavailable - score is the deterministic evidence only" in text
+    assert "private stack trace" not in text
+
+
+def test_malformed_notification_fields_and_timezone_aware_age_do_not_crash(monkeypatch):
+    notifier = build(monkeypatch, [])
+    job = make_job(posted_at=datetime.now(timezone.utc) - timedelta(minutes=20))
+    job.employment_type = "full_time"
+    job.application_status = None
+
+    text = notifier.format_message(job, DECISION)
+
+    assert "Type: Full Time" in text
+    assert "Application: UNKNOWN" in text
+    assert "Freshness:" in text
+
+
+def test_malformed_stored_verdict_with_matchresult_input_still_formats(monkeypatch):
+    notifier = build(monkeypatch, [])
+    job = make_job(match_result={"match_score": "not-a-score"})
+    decision = MatchResult(match=True, match_score=65, priority=Priority.P2)
+
+    text = notifier.format_message(job, decision)
+
+    assert "P2 - Job Match (65%)" in text
+    assert "Matched your profile preferences" in text
+
+
+def test_bot_token_is_redacted_from_formatted_message(monkeypatch, sleeps):
+    token = "123:token"
+    notifier = TelegramNotifier(token, "42", retry_attempts=1)
+    notifier.client = FakeClient([FakeResponse(200)])
+    job = make_job(title=f"Backend {token}")
+
+    assert asyncio.run(notifier.send(job, DECISION)) is True
+    assert token not in notifier.client.calls[0]["json"]["text"]
 

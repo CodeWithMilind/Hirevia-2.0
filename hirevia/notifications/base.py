@@ -1,11 +1,14 @@
 """Notification base interface"""
 
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from html import escape
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from hirevia.core.freshness import freshness_label
 from hirevia.core.models import AIResponse, Job, MatchResult
+
+NotificationDecision = Union[AIResponse, MatchResult]
 
 
 class Notifier(ABC):
@@ -14,11 +17,11 @@ class Notifier(ABC):
     name: str = "base"
 
     @abstractmethod
-    async def send(self, job: Job, decision: AIResponse) -> bool:
+    async def send(self, job: Job, decision: NotificationDecision) -> bool:
         """Send notification for a matched job. Returns True if successful."""
         pass
 
-    def format_message(self, job: Job, decision: AIResponse) -> str:
+    def format_message(self, job: Job, decision: NotificationDecision) -> str:
         """Render the alert.
 
         Fixed layout (Phase 6, enriched in Phase 7): priority banner, title,
@@ -47,8 +50,9 @@ class Notifier(ABC):
             f"Experience: {job.experience or 'Not specified'}",
         ]
 
-        if job.employment_type:
-            lines.append(f"Type: {job.employment_type.value.replace('_', ' ').title()}")
+        employment_type = getattr(job.employment_type, "value", job.employment_type)
+        if employment_type:
+            lines.append(f"Type: {str(employment_type).replace('_', ' ').title()}")
         salary = (job.raw_data or {}).get("salary")
         if salary:
             lines.append(f"Compensation: {salary}")
@@ -63,7 +67,8 @@ class Notifier(ABC):
 
         lines.append("")
         lines.append(f"Freshness: {_freshness_text(job)}")
-        lines.append(f"Application: {job.application_status.value.upper()}")
+        application_status = getattr(job.application_status, "value", job.application_status)
+        lines.append(f"Application: {str(application_status or 'unknown').upper()}")
         lines.append(f"Apply: {job.application_url or job.url}")
 
         channels = (job.raw_data or {}).get("source_channels") or [
@@ -74,15 +79,24 @@ class Notifier(ABC):
         return escape("\n".join(lines), quote=False)
 
 
-def _why_bullets(decision: AIResponse, result: Optional[MatchResult] = None) -> List[str]:
+def _why_bullets(
+    decision: NotificationDecision, result: Optional[MatchResult] = None
+) -> List[str]:
     """The 'Why it matches' bullets, honest about where the score came from."""
     if result is None:  # pre-Phase-7 caller: only the model's own words exist
-        return [reason for reason in decision.reasons[:4] if reason]
+        if isinstance(decision, AIResponse):
+            return [reason for reason in decision.reasons[:4] if reason]
+        return []
 
     bullets: List[str] = []
-    if result.reason:
+    if result.hard_reject:
+        detail = ": " + "; ".join(result.reject_reasons[:2]) if result.reject_reasons else ""
+        bullets.append(f"Vetoed by a hard rule{detail}")
+    elif result.degraded:
+        bullets.append("AI unavailable - score is the deterministic evidence only")
+    elif result.reason:
         bullets.append(result.reason)
-    else:
+    elif isinstance(decision, AIResponse):
         bullets.extend(reason for reason in decision.reasons[:3] if reason)
 
     if result.matched_skills:
@@ -90,12 +104,12 @@ def _why_bullets(decision: AIResponse, result: Optional[MatchResult] = None) -> 
     if result.missing_skills:
         bullets.append("Missing: " + ", ".join(result.missing_skills[:4]))
 
-    if result.hard_reject:
-        detail = (": " + "; ".join(result.reject_reasons[:2])) if result.reject_reasons else ""
-        bullets.append(f"Vetoed by a hard rule{detail}")
-    elif result.degraded:
-        bullets.append("AI unavailable - score is the deterministic evidence only")
-    elif result.deterministic_score is not None and result.ai_score is not None:
+    if (
+        not result.hard_reject
+        and not result.degraded
+        and result.deterministic_score is not None
+        and result.ai_score is not None
+    ):
         bullets.append(f"Evidence {result.deterministic_score}% + AI {result.ai_score}%")
 
     return [bullet for bullet in bullets if bullet][:5]
@@ -107,8 +121,8 @@ def _freshness_text(job: Job) -> str:
     label = freshness_label(reference)
     if reference is None:
         return label.replace("_", " ")
-    from datetime import datetime
-
+    if reference.tzinfo is not None:
+        reference = reference.astimezone(timezone.utc).replace(tzinfo=None)
     delta = datetime.utcnow() - reference
     minutes = int(delta.total_seconds() // 60)
     if minutes < 1:

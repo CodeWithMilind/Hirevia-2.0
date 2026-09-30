@@ -6,8 +6,8 @@ from typing import Optional
 
 import httpx
 
-from hirevia.core.models import Job, AIResponse
-from hirevia.notifications.base import Notifier
+from hirevia.core.models import Job
+from hirevia.notifications.base import NotificationDecision, Notifier
 
 logger = logging.getLogger(__name__)
 
@@ -30,14 +30,14 @@ class TelegramNotifier(Notifier):
         self._retry_attempts = max(1, int(retry_attempts))
         self._retry_delay = max(0.0, float(retry_delay))
 
-    async def send(self, job: Job, decision: AIResponse) -> bool:
+    async def send(self, job: Job, decision: NotificationDecision) -> bool:
         """Send one alert, retrying transient failures with backoff.
 
         Telegram's own rate limit (429) is respected through its retry_after
         hint; anything else just backs off. Permanent client errors (400/403 -
         bad chat id, bot blocked) fail fast so a scan is not held hostage.
         """
-        message = self.format_message(job, decision)
+        message = self.format_message(job, decision).replace(self.bot_token, "[redacted]")
 
         for attempt in range(self._retry_attempts):
             delay = self._retry_delay * (attempt + 1)
@@ -52,10 +52,17 @@ class TelegramNotifier(Notifier):
                     },
                 )
                 if resp.status_code == 200:
-                    logger.info(f"Telegram notification sent for {job.title}")
-                    return True
+                    try:
+                        payload = resp.json()
+                    except Exception:
+                        payload = None
+                    if isinstance(payload, dict) and payload.get("ok") is True:
+                        logger.info("Telegram notification sent for %s", job.title)
+                        return True
+                    logger.warning("Telegram API returned an invalid success response")
+                else:
+                    logger.warning("Telegram API error: HTTP %s", resp.status_code)
 
-                logger.warning(f"Telegram API error: {resp.status_code} - {resp.text[:200]}")
                 if resp.status_code in (400, 403, 404):
                     # Bad chat id / bot blocked / bad payload: retrying cannot help.
                     logger.error(
@@ -66,7 +73,9 @@ class TelegramNotifier(Notifier):
                 if resp.status_code == 429:
                     delay = max(delay, _retry_after(resp))
             except Exception as e:
-                logger.warning(f"Telegram send attempt {attempt + 1} failed: {e}")
+                logger.warning(
+                    "Telegram send attempt %d failed (%s)", attempt + 1, type(e).__name__
+                )
 
             if attempt < self._retry_attempts - 1:
                 await asyncio.sleep(delay)

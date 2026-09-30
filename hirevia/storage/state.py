@@ -6,7 +6,9 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
+from hirevia.core.dedup import normalize_url
 from hirevia.core.models import Job, ApplicationStatus, ScanStats
 
 
@@ -288,6 +290,26 @@ class JobRepository:
             cursor = conn.execute("SELECT * FROM jobs WHERE fingerprint = ?", (fingerprint,))
             row = cursor.fetchone()
             return self._row_to_job(row) if row else None
+
+    def get_by_application_url(self, application_url: str) -> Optional[Job]:
+        """Find a stored job by canonical application URL, across sources."""
+        normalized = normalize_url(str(application_url))
+        host = urlparse(str(application_url)).netloc.lower().replace("www.", "", 1)
+        if not normalized or not host:
+            return None
+
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE application_url IS NOT NULL "
+                "AND instr(lower(replace(application_url, 'www.', '')), ?) > 0 "
+                "ORDER BY detected_at DESC",
+                (host,),
+            ).fetchall()
+        for row in rows:
+            job = self._row_to_job(row)
+            if job.application_url and normalize_url(str(job.application_url)) == normalized:
+                return job
+        return None
 
     def get_by_source_id(self, source: str, source_job_id: str) -> Optional[Job]:
         with self._get_conn() as conn:

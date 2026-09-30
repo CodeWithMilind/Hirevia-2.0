@@ -7,12 +7,12 @@ network access happens.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from hirevia.config import Config
-from hirevia.core.models import AIResponse, ApplicationStatus, Job, MatchResult, Priority
+from hirevia.core.models import AIResponse, ApplicationStatus, CandidateProfile, Job, MatchResult, Priority
 from hirevia.core.pipeline import Pipeline
 from hirevia.core.verification import UrlQuality
 from hirevia.storage.state import JobRepository
@@ -235,6 +235,24 @@ def test_second_scan_is_duplicate_and_stays_silent(repo):
     assert len(repo.get_recent_jobs(hours=48)) == 1
 
 
+def test_same_canonical_application_url_is_not_alerted_twice(repo):
+    first = make_job(apply="https://boards.greenhouse.io/acme/jobs/44?source=feed")
+    second = make_job(
+        apply="https://www.boards.greenhouse.io/acme/jobs/44/?source=repost",
+        channel="jobs_beta",
+        message_id=2,
+    )
+    notifier = FakeNotifier()
+
+    first_stats = run(build_pipeline([FakeSource([first])], repo, FakeMatcher(), notifier))
+    second_stats = run(build_pipeline([FakeSource([second])], repo, FakeMatcher(), notifier))
+
+    assert first_stats.jobs_notified == 1
+    assert second_stats.jobs_duplicate == 1
+    assert second_stats.jobs_notified == 0
+    assert notifier.sent == ["Backend Developer"]
+
+
 # --- robustness ---------------------------------------------------------------
 
 def test_dead_source_only_costs_itself(repo):
@@ -293,14 +311,27 @@ def test_ai_outage_keeps_the_job_but_never_alerts(repo):
     source = FakeSource([make_job(apply="https://boards.greenhouse.io/acme/jobs/6")])
     degraded = FakeMatcher(default=AIResponse.failure(RuntimeError("model down")))
     notifier = FakeNotifier()
-    stats = run(build_pipeline([source], repo, degraded, notifier))
+    pipeline = build_pipeline([source], repo, degraded, notifier)
+    pipeline.profile = CandidateProfile(
+        candidate_type="fresher",
+        experience_years=0,
+        target_max_experience_years=2,
+        skills=["Python", "FastAPI"],
+        preferred_roles=["Backend Developer"],
+        preferred_locations=["Remote"],
+        remote_preference="preferred",
+    )
+    stats = run(pipeline)
 
     assert stats.ai_failures == 1
     assert notifier.sent == []
     assert stats.jobs_skipped_notification == 1 and stats.jobs_notified == 0
-    # Stored unranked so a later scan can still rank it (the collector cursor
-    # already moved past this message, so dropping it would lose it forever).
-    assert repo.get_by_source_id("telegram", "jobs_alpha-1") is not None
+    stored = repo.get_by_source_id("telegram", "jobs_alpha-1")
+    assert stored is not None
+    verdict = stored.verdict_model()
+    assert verdict.match is True and verdict.degraded is True
+    assert verdict.ai_error == "model down"
+    assert verdict.ai_score is None and verdict.deterministic_score > 0
     assert any("AI degraded" in err for err in stats.errors)
 
 
@@ -329,6 +360,77 @@ def test_p3_above_threshold_is_alerted(repo):
                                notify_min_match_score=80, ai_match_weight=1.0))
 
     assert notifier.sent == ["Backend Developer"] and stats.jobs_notified == 1
+
+
+def test_p2_with_a_canonical_match_is_alerted(repo):
+    source = FakeSource([make_job(apply="https://boards.greenhouse.io/acme/jobs/80")])
+    p2 = FakeMatcher(default=AIResponse(
+        relevant=True, priority=Priority.P2, match_score=75, reasons=["good fit"]
+    ))
+    notifier = FakeNotifier()
+
+    stats = run(build_pipeline([source], repo, p2, notifier, ai_match_weight=1.0))
+
+    assert stats.jobs_notified == 1
+    assert notifier.sent == ["Backend Developer"]
+
+
+def test_high_ai_and_deterministic_scores_cannot_override_a_hard_veto(repo):
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/81")
+    job.description = "Python FastAPI. Requires 8+ years of experience."
+    matcher = FakeMatcher(default=AIResponse(
+        relevant=True, priority=Priority.P1, match_score=100, reasons=["strong fit"]
+    ))
+    notifier = FakeNotifier()
+    pipeline = build_pipeline([FakeSource([job])], repo, matcher, notifier, ai_match_weight=1.0)
+    pipeline.profile = CandidateProfile(
+        candidate_type="fresher",
+        experience_years=0,
+        target_max_experience_years=2,
+        skills=["Python", "FastAPI"],
+        preferred_roles=["Backend Developer"],
+        preferred_locations=["Remote"],
+        remote_preference="preferred",
+    )
+    original_match = pipeline._match
+    observed_verdicts = []
+
+    async def capture_verdict(job, tag):
+        verdict = await original_match(job, tag)
+        observed_verdicts.append(verdict)
+        return verdict
+
+    pipeline._match = capture_verdict
+
+    stats = run(pipeline)
+
+    assert stats.jobs_below_match == 1
+    assert notifier.sent == []
+    verdict = observed_verdicts[0]
+    assert verdict.hard_reject is True
+    assert "8+ years" in " ".join(verdict.reject_reasons)
+    assert verdict.ai_score == 100
+    assert verdict.deterministic_score >= 75
+
+
+def test_future_timezone_aware_posting_does_not_crash_eligibility(repo):
+    future = datetime.now(timezone.utc) + timedelta(hours=2)
+    job = make_job(
+        apply="https://boards.greenhouse.io/acme/jobs/82",
+        posted_at=future,
+    )
+    naive_job = make_job(
+        apply="https://boards.greenhouse.io/acme/jobs/83",
+        channel="jobs_beta",
+        message_id=2,
+    )
+    notifier = FakeNotifier()
+
+    stats = run(build_pipeline([FakeSource([job, naive_job])], repo, FakeMatcher(), notifier))
+
+    assert stats.jobs_failed == 0
+    assert stats.jobs_notified == 2
+    assert notifier.sent == [job.title, naive_job.title]
 
 
 def test_stale_job_is_recorded_but_not_alerted(repo):
@@ -365,6 +467,9 @@ def test_failed_alert_is_retried_on_the_next_scan(repo):
     working = FakeNotifier()
     second = run(build_pipeline([source], repo, FakeMatcher(), working))
     assert second.jobs_notified == 1 and working.sent == ["Backend Developer"]
+    stored = repo.get_by_source_id("telegram", "jobs_alpha-1")
+    assert stored.notified_at is not None
+    assert stored.notification_channel == "telegram"
 
 
 def test_ai_disabled_stores_without_alerting(repo):

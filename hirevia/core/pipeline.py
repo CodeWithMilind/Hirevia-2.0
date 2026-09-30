@@ -19,7 +19,7 @@ deterministic half still scores every job (see hirevia.core.matching).
 
 import inspect
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from hirevia.ai.matcher import AIMatcher
@@ -187,8 +187,13 @@ class Pipeline:
         # Stage 3: dedup. Fingerprint catches the same posting reached through
         # another source; source id catches a Telegram repost under a new title.
         job.fingerprint = compute_fingerprint(job)
-        existing = self.repo.get_by_fingerprint(job.fingerprint) or self.repo.get_by_source_id(
-            job.source, job.source_job_id
+        existing = (
+            self.repo.get_by_fingerprint(job.fingerprint)
+            or self.repo.get_by_source_id(job.source, job.source_job_id)
+            or (
+                self.repo.get_by_application_url(str(job.application_url))
+                if job.application_url else None
+            )
         )
         if existing is not None:
             self._merge_repost(existing, job)
@@ -389,6 +394,8 @@ class Pipeline:
             return "already known before this scan"
         if job.notified_at:
             return f"already notified via {job.notification_channel}"
+        if verdict.hard_reject:
+            return "canonical verdict contains a hard rejection"
         if not verdict.match:
             return "canonical verdict is not a match"
         if job.application_status in (ApplicationStatus.CLOSED, ApplicationStatus.EXPIRED):
@@ -413,8 +420,11 @@ class Pipeline:
             return f"application link is not directly usable ({quality.reason})"
         max_age = self.config.notify_max_age_hours
         reference = job.posted_at or job.detected_at
-        if max_age and reference and (datetime.utcnow() - reference) > timedelta(hours=max_age):
-            return f"posted over {max_age}h ago (freshness: {job.raw_data.get('freshness_label')})"
+        if max_age and reference:
+            if reference.tzinfo is not None:
+                reference = reference.astimezone(timezone.utc).replace(tzinfo=None)
+            if (datetime.utcnow() - reference) > timedelta(hours=max_age):
+                return f"posted over {max_age}h ago (freshness: {job.raw_data.get('freshness_label')})"
         return None
 
     async def _notify(self, job: Job, verdict: MatchResult) -> None:

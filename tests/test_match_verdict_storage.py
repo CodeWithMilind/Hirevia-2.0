@@ -98,6 +98,36 @@ def test_match_result_survives_a_storage_round_trip(tmp_path):
     assert verdict.experience_match is True
 
 
+def test_veto_and_degraded_error_fields_survive_a_storage_round_trip(tmp_path):
+    repo = JobRepository(tmp_path / "hirevia.db")
+    result = hybrid_result(
+        match=False,
+        match_score=40,
+        priority=Priority.P3,
+        reason="rejected: asks 8+ years",
+        hard_reject=True,
+        reject_reasons=["asks 8+ years, candidate targets 2"],
+        ai_status="failed",
+        ai_score=None,
+        ai_priority=None,
+        ai_error="timeout",
+    )
+    job = make_job(match_result=stored(result))
+
+    repo.upsert_job(job)
+    restored = repo.get_by_source_id(job.source, job.source_job_id).verdict_model()
+
+    assert restored.match is False and restored.priority is Priority.P3
+    assert restored.match_score == 40 and restored.deterministic_score == 74
+    assert restored.ai_score is None and restored.degraded is True
+    assert restored.ai_error == "timeout"
+    assert restored.hard_reject is True
+    assert restored.reject_reasons == ["asks 8+ years, candidate targets 2"]
+    assert restored.matched_skills == ["Python", "FastAPI"]
+    assert restored.missing_skills == ["Docker"]
+    assert restored.reason == "rejected: asks 8+ years"
+
+
 def test_an_old_database_gains_the_match_result_column(tmp_path):
     """A pre-Phase-7 DB has no match_result column at all. Reading, migrating and
     writing must all work - CREATE TABLE IF NOT EXISTS never touches it."""

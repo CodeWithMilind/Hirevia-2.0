@@ -1,6 +1,6 @@
 """Freshness and expiry logic for jobs"""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from hirevia.core.models import Job, ApplicationStatus
@@ -99,11 +99,17 @@ def sort_by_freshness(jobs: list[Job], now: Optional[datetime] = None) -> list[J
     def sort_key(job: Job):
         # Primary: posted_at (known dates first)
         # Secondary: detected_at
-        posted = job.posted_at if job.posted_at else datetime.min
-        detected = job.detected_at
+        posted = _naive_utc(job.posted_at) if job.posted_at else datetime.min
+        detected = _naive_utc(job.detected_at)
         return (posted, detected)
 
     return sorted(jobs, key=sort_key, reverse=True)
+
+
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def mark_expired(job: Job, now: Optional[datetime] = None) -> bool:
