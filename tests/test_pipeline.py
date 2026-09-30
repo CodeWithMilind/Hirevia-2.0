@@ -12,8 +12,9 @@ from datetime import datetime, timedelta
 import pytest
 
 from hirevia.config import Config
-from hirevia.core.models import AIResponse, Job, Priority
+from hirevia.core.models import AIResponse, ApplicationStatus, Job, MatchResult, Priority
 from hirevia.core.pipeline import Pipeline
+from hirevia.core.verification import UrlQuality
 from hirevia.storage.state import JobRepository
 
 
@@ -172,6 +173,52 @@ def test_scan_alerts_only_the_apply_ready_job(repo):
     alerted = repo.get_by_source_id("telegram", "jobs_alpha-1")
     assert alerted.notified_at is not None and alerted.notification_channel == "telegram"
     assert alerted.raw_data["freshness_label"]
+    assert str(alerted.url).startswith("https://t.me/")
+    assert str(alerted.application_url).startswith("https://boards.greenhouse.io/")
+
+
+def test_missing_application_url_is_stored_but_never_matched_or_alerted(repo):
+    job = make_job(apply=None)
+    matcher = FakeMatcher()
+    notifier = FakeNotifier()
+
+    stats = run(build_pipeline([FakeSource([job])], repo, matcher, notifier))
+
+    assert stats.jobs_link_rejected == 1
+    assert matcher.calls == []
+    assert notifier.sent == []
+    stored = repo.get_by_source_id(job.source, job.source_job_id)
+    assert stored is not None
+    assert stored.raw_data["application_url_usable"] is False
+
+
+@pytest.mark.parametrize(
+    "application_url, expected_quality",
+    [
+        ("https://careers.acme.com/jobs/backend", "company"),
+        ("https://indeed.com/viewjob?jk=123", "job_board"),
+    ],
+)
+def test_company_and_job_board_links_remain_alertable(repo, application_url, expected_quality):
+    job = make_job(apply=application_url)
+    notifier = FakeNotifier()
+
+    stats = run(build_pipeline([FakeSource([job])], repo, FakeMatcher(), notifier))
+
+    assert stats.jobs_notified == 1
+    assert notifier.sent == [job.title]
+    stored = repo.get_by_source_id(job.source, job.source_job_id)
+    assert stored.raw_data["application_url_quality"] == expected_quality
+
+
+def test_titleless_posting_is_not_alerted_even_with_a_valid_apply_link(repo):
+    job = make_job(title="", apply="https://jobs.lever.co/acme/backend")
+    notifier = FakeNotifier()
+    stats = run(build_pipeline([FakeSource([job])], repo, FakeMatcher(), notifier))
+
+    assert stats.jobs_matched == 1
+    assert stats.jobs_skipped_notification == 1
+    assert notifier.sent == []
 
 
 def test_second_scan_is_duplicate_and_stays_silent(repo):
@@ -328,4 +375,71 @@ def test_ai_disabled_stores_without_alerting(repo):
     # No ranking means no ranking-based decision to alert on.
     assert stats.jobs_notified == 0 and stats.jobs_new == 1
     assert notifier.sent == [] and stats.jobs_skipped_notification == 1
+
+
+@pytest.mark.parametrize(
+    "status,usable,expected_sent",
+    [
+        (ApplicationStatus.CLOSED, False, []),
+        (ApplicationStatus.UNKNOWN, True, ["Backend Developer"]),
+    ],
+)
+def test_verification_status_controls_alertability_without_live_http(
+    repo, monkeypatch, status, usable, expected_sent
+):
+    job = make_job(apply="https://jobs.lever.co/acme/backend")
+    notifier = FakeNotifier()
+
+    async def fake_verify(*args, **kwargs):
+        return status, UrlQuality("ats", usable, 90 if usable else 0, "fake result")
+
+    monkeypatch.setattr("hirevia.core.pipeline.verify_application", fake_verify)
+    pipeline = build_pipeline([FakeSource([job])], repo, FakeMatcher(), notifier,
+                              verify_application_urls=True)
+    stats = run(pipeline)
+
+    assert notifier.sent == expected_sent
+    stored = repo.get_by_source_id(job.source, job.source_job_id)
+    assert stored.application_status is status
+    if status is ApplicationStatus.CLOSED:
+        assert stats.jobs_closed == 1
+        assert stats.jobs_skipped_notification == 1
+    else:
+        assert stats.jobs_unverified == 1
+
+
+@pytest.mark.parametrize("status", [ApplicationStatus.CLOSED, ApplicationStatus.EXPIRED])
+def test_closed_or_expired_job_is_not_retried_after_a_failed_alert(repo, status):
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/1")
+    job.application_status = status
+    job.match_result = MatchResult(
+        match=True,
+        match_score=92,
+        priority=Priority.P1,
+        ai_status="ok",
+        ai_score=92,
+        deterministic_score=85,
+    ).model_dump(mode="json")
+    repo.upsert_job(job)
+    notifier = FakeNotifier()
+    repost = make_job(apply="https://boards.greenhouse.io/acme/jobs/1")
+
+    stats = run(build_pipeline([FakeSource([repost])], repo, FakeMatcher(), notifier))
+
+    assert stats.jobs_duplicate == 1
+    assert notifier.sent == []
+
+
+def test_failed_alert_retry_respects_the_canonical_nonmatch_verdict(repo):
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/1")
+    job.ai_decision = AIResponse(
+        relevant=False, priority=Priority.P1, match_score=95
+    ).model_dump(mode="json")
+    repo.upsert_job(job)
+    notifier = FakeNotifier()
+    repost = make_job(apply="https://boards.greenhouse.io/acme/jobs/1")
+
+    run(build_pipeline([FakeSource([repost])], repo, FakeMatcher(), notifier))
+
+    assert notifier.sent == []
 

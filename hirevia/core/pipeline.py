@@ -389,6 +389,14 @@ class Pipeline:
             return "already known before this scan"
         if job.notified_at:
             return f"already notified via {job.notification_channel}"
+        if not verdict.match:
+            return "canonical verdict is not a match"
+        if job.application_status in (ApplicationStatus.CLOSED, ApplicationStatus.EXPIRED):
+            return f"application is {job.application_status.value}"
+        if not quality.usable:
+            return f"application link is unusable ({quality.reason})"
+        if not job.title.strip():
+            return "job title is missing"
         if verdict.ai_status == "skipped":
             return "no AI ranking (run with AI enabled to receive alerts)"
         if verdict.degraded:

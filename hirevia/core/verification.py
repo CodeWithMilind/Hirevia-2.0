@@ -18,9 +18,12 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
+from pydantic import HttpUrl, TypeAdapter, ValidationError
+
 from hirevia.core.models import ApplicationStatus, Job
 
 logger = logging.getLogger(__name__)
+_HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
 
 # Link families that can never be a real application page on their own.
 SOCIAL_HOSTS = {
@@ -97,6 +100,10 @@ def classify_application_url(url: Optional[str]) -> UrlQuality:
     text = str(url).strip()
     if not text.lower().startswith(("http://", "https://")):
         return UrlQuality("none", False, 0, "application link is not a URL")
+    try:
+        text = str(_HTTP_URL_ADAPTER.validate_python(text))
+    except ValidationError:
+        return UrlQuality("none", False, 0, "application link is malformed")
 
     host = _host_of(text)
     if not host:
@@ -156,7 +163,7 @@ async def verify_application(
         try:
             response = await client.head(url)
             status_code = response.status_code
-            if status_code in (403, 405, 500, 501):
+            if status_code in (405, 500, 501):
                 response = await client.get(url)
                 status_code = response.status_code
         except Exception as e:  # timeout / DNS / connection reset: undetermined
