@@ -132,10 +132,14 @@ class Pipeline:
             )
 
             total = len(all_jobs)
-            self._ai_progress_processed = 0
-            if self.ai_matcher is not None and self.ai_progress_callback:
+            if self.ai_progress_callback:
                 self._emit_ai_progress("start", total=total)
             for index, job in enumerate(all_jobs, start=1):
+                self._job_progress_state = {"status": "AI SKIPPED", "score": None}
+                if self.ai_progress_callback:
+                    self._emit_ai_progress(
+                        "processing", index=index, total=total, job=job
+                    )
                 try:
                     await self._process_job(job, index, total)
                 except Exception as e:  # noqa: BLE001 - a job must not kill the scan
@@ -145,8 +149,15 @@ class Pipeline:
                         "%s [%d/%d] job %r (%s) failed: %s",
                         PREFIX, index, total, job.title, job.source, e, exc_info=True,
                     )
-            if self.ai_matcher is not None and self.ai_progress_callback:
-                self._emit_ai_progress("complete")
+                finally:
+                    if self.ai_progress_callback:
+                        self._emit_ai_progress(
+                            "job_complete",
+                            index=index,
+                            total=total,
+                            job=job,
+                            **self._job_progress_state,
+                        )
         except Exception as e:  # noqa: BLE001
             logger.error("%s scan failed: %s", PREFIX, e, exc_info=True)
             self._record_error(f"Pipeline: {type(e).__name__}: {e}")
@@ -231,6 +242,12 @@ class Pipeline:
         if existing is not None:
             self._merge_repost(existing, job)
             self.stats.jobs_duplicate += 1
+            existing_verdict = existing.verdict_model()
+            if existing_verdict is not None:
+                self._job_progress_state = {
+                    "status": "AI SKIPPED",
+                    "score": existing_verdict.match_score,
+                }
             logger.debug("%s Stage 3: duplicate of %s - %r", PREFIX, existing.id, job.title)
             # A repost proves the opening is still live: if an earlier alert
             # never got out (Telegram was down), this is our retry.
@@ -255,6 +272,7 @@ class Pipeline:
         )
 
         evidence = analyze(job, self.profile)
+        self._job_progress_state = {"status": "AI SKIPPED", "score": evidence.score}
         self.stats.jobs_rule_scored += 1
         self.stats.jobs_rule_strong += int(evidence.score >= self.config.match_min_score)
         if evidence.hard_reject:
@@ -289,26 +307,45 @@ class Pipeline:
         if self.ai_matcher is not None and not _should_call_ai(evidence, self.config):
             self.stats.jobs_ai_skipped += 1
             verdict = combine(evidence, self.config)
+            self._job_progress_state = {"status": "AI SKIPPED", "score": evidence.score}
             job.match_result = verdict.model_dump(mode="json")
             job.raw_data["deterministic_score"] = verdict.deterministic_score
             job.raw_data["ai_status"] = verdict.ai_status
+            if self.ai_progress_callback:
+                self._emit_ai_progress(
+                    "skipped",
+                    job=job,
+                    rule_score=evidence.score,
+                )
             if not verdict.match:
                 self.stats.jobs_below_match += 1
                 return
         else:
             self.stats.jobs_matching_attempted += 1
-            verdict = await self._match(job, tag, evidence)
             if self.ai_matcher is not None and self.ai_progress_callback:
-                self._ai_progress_processed += 1
-                self._emit_ai_progress(
-                    "job",
-                    index=self._ai_progress_processed,
-                    total=total,
-                    job=job,
-                    verdict=verdict,
-                    provider=getattr(self.ai_matcher, "provider_name", "unknown"),
-                    model=self._active_ai_model(verdict),
-                )
+                self._emit_ai_progress("sending_ai", job=job)
+            verdict = await self._match(job, tag, evidence)
+            if self.ai_progress_callback:
+                if self.ai_matcher is None:
+                    self._job_progress_state = {"status": "AI SKIPPED", "score": evidence.score}
+                    self._emit_ai_progress(
+                        "skipped",
+                        job=job,
+                        rule_score=evidence.score,
+                    )
+                else:
+                    is_ai_error = verdict.ai_status == "failed"
+                    self._job_progress_state = {
+                        "status": "AI ERROR" if is_ai_error else (
+                            "MATCHED" if verdict.match else "NOT MATCHED"
+                        ),
+                        "score": verdict.match_score,
+                    }
+                    self._emit_ai_progress(
+                        "ai_error" if is_ai_error else "ai_response",
+                        job=job,
+                        verdict=verdict,
+                    )
         if not verdict.match:
             self.stats.jobs_below_match += 1
             logger.debug(
@@ -358,15 +395,6 @@ class Pipeline:
                 "explicit walk-in schedule/location provides an application action",
             )
         return quality
-
-    def _active_ai_model(self, verdict: MatchResult) -> str:
-        client = getattr(self.ai_matcher, "client", None)
-        return (
-            getattr(client, "last_model", None)
-            or verdict.ai_model
-            or getattr(self.ai_matcher, "model", None)
-            or "unknown"
-        )
 
     def _emit_ai_progress(self, event: str, **payload) -> None:
         try:

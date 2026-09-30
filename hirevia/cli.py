@@ -201,6 +201,9 @@ def scan(
     if not ai_matcher and not no_ai:
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
     notifier = _build_notifier(config, telegram_token, chat_id) if notify and not diagnostic else None
+    ai_progress_reporter = None if diagnostic else _make_ai_progress_reporter(
+        notifications_enabled=bool(notify and notifier)
+    )
 
     async def _run():
         try:
@@ -210,16 +213,20 @@ def scan(
                 ai_matcher,
                 notifier,
                 diagnostic_output=diagnostic,
-                ai_progress_callback=None if diagnostic else _make_ai_progress_reporter(),
+                ai_progress_callback=ai_progress_reporter,
             )
         finally:
             if notifier:
                 await notifier.close()
 
     stats = asyncio.run(_run())
-    _print_stats(stats)
-    if not diagnostic:
-        _print_final_results(stats, notifications_enabled=bool(notify and notifier))
+    _print_stats(stats, include_top_opportunities=diagnostic)
+    if ai_progress_reporter:
+        ai_progress_reporter(
+            "complete",
+            duration=stats.duration_seconds,
+            notifications_enabled=bool(notify and notifier),
+        )
 
 
 
@@ -569,7 +576,7 @@ def ai_test():
     console.print("[green]✓ AI provider is ready[/green]")
 
 
-def _print_stats(stats: ScanStats):
+def _print_stats(stats: ScanStats, include_top_opportunities: bool = True):
     noise_filtered = sum((
         stats.promotional_rejected,
         stats.educational_rejected,
@@ -590,7 +597,7 @@ def _print_stats(stats: ScanStats):
     summary.add_row("AI provider", stats.ai_provider or "disabled")
     console.print(Panel(summary, title="Hirevia Scan", border_style="cyan"))
 
-    if stats.top_opportunities:
+    if include_top_opportunities and stats.top_opportunities:
         console.print("\n[bold]TOP OPPORTUNITIES[/bold]")
         for index, item in enumerate(stats.top_opportunities, start=1):
             console.print(
@@ -614,77 +621,163 @@ def _print_stats(stats: ScanStats):
             console.print(f"  - {err}")
 
 
-def _print_final_results(stats: ScanStats, notifications_enabled: bool) -> None:
-    console.print("\n" + "=" * 60)
-    console.print("FINAL HIREVIA RESULTS")
-    console.print("=" * 60)
-    console.print(f"\nFinal eligible jobs: {stats.jobs_notification_eligible}")
+def _make_ai_progress_reporter(notifications_enabled: bool = False):
+    counts = {"processed": 0, "matched": 0, "not_matched": 0, "skipped": 0, "errors": 0}
 
-    if not stats.jobs_notification_eligible:
-        console.print("No eligible jobs found.")
-    else:
-        for index, item in enumerate(stats.top_opportunities, start=1):
-            console.print(
-                f"\n{index}. [bold]{item['title']}[/bold] — {item['company']}\n"
-                f"   Company: {item['company']}\n"
-                f"   Location: {item['location'] or 'Not specified'}\n"
-                f"   Match Score: {item['match_score']}\n"
-                f"   Priority: {item['priority']}\n"
-                f"   Application: {item['application_url'] or 'Not available'}"
-            )
+    def review_priority(score):
+        if score is None:
+            return "No Priority"
+        if score > 80:
+            return "P1"
+        if score > 50:
+            return "P2"
+        if score > 20:
+            return "P3"
+        return "No Priority"
 
-    if notifications_enabled:
-        console.print("\nTelegram notifications: ENABLED")
-    else:
-        console.print("\nTelegram notifications: DISABLED (--no-notify)")
-    console.print("=" * 60)
+    def normalized_work_mode(job):
+        raw_data = getattr(job, "raw_data", None) or {}
+        value = raw_data.get("work_mode", raw_data.get("workMode"))
+        if not value:
+            return "Unknown"
+        normalized = str(value).strip().casefold().replace("_", " ").replace("-", " ")
+        return {
+            "wfh": "WFH",
+            "work from home": "WFH",
+            "wfo": "WFO",
+            "work from office": "WFO",
+            "onsite": "WFO",
+            "on site": "WFO",
+            "hybrid": "Hybrid",
+            "remote": "Remote",
+        }.get(normalized, "Unknown")
 
+    def display_source(job):
+        raw_data = getattr(job, "raw_data", None) or {}
+        source = raw_data.get("source_channel") or raw_data.get("source_name") or getattr(job, "source", None)
+        if not source:
+            return "Unknown"
+        source = str(source).strip()
+        if raw_data.get("source_channel"):
+            return source
+        return {
+            "linkedin": "LinkedIn",
+            "company_careers": "Company Careers",
+        }.get(source.casefold(), source.replace("_", " ").title())
 
-def _make_ai_progress_reporter():
-    counts = {"processed": 0, "matched": 0, "not_matched": 0, "errors": 0}
+    def display_employment(job):
+        employment = getattr(job, "employment_type", None)
+        if employment is None:
+            return "Not specified"
+        value = getattr(employment, "value", employment)
+        return {
+            "full_time": "Full-time",
+            "part_time": "Part-time",
+            "contract": "Contract",
+            "internship": "Internship",
+            "temporary": "Temporary",
+        }.get(str(value).casefold(), str(value).replace("_", " ").title())
+
+    def build_card(index, total, job, status, score):
+        experience = getattr(job, "experience", None) or "Not specified"
+        experience = str(experience).replace("-", "–") if experience != "Not specified" else experience
+        location = getattr(job, "location", None) or "Not specified"
+        posted_at = getattr(job, "posted_at", None)
+        posted = posted_at.strftime("%d %b %Y") if posted_at else "Unknown"
+        application_url = getattr(job, "application_url", None)
+        company = getattr(job, "company", None) or "Not specified"
+        title = getattr(job, "title", None) or "Not specified"
+        priority = review_priority(score)
+        display_score = score if score is not None else "Not available"
+        return (
+            f"[{index}/{total}] {title} — {company}\n"
+            f"DONE\n\n"
+            f"Company     : {company}\n"
+            f"Experience  : {experience}\n"
+            f"Location    : {location}\n"
+            f"Work Mode   : {normalized_work_mode(job)}\n"
+            f"Employment  : {display_employment(job)}\n"
+            f"Posted      : {posted}\n"
+            f"Source      : {display_source(job)}\n\n"
+            f"Apply       : {application_url or 'Not available'}\n\n"
+            f"Status      : {status}\n"
+            f"Score       : {display_score}\n"
+            f"Priority    : {priority}\n"
+            f"{'=' * 60}"
+        )
 
     def report(event, **details):
         if event == "start":
             console.print("\n" + "=" * 60)
-            console.print("AI MATCHING")
+            console.print("HIREVIA JOB PROCESSING")
             console.print("=" * 60)
             return
 
-        if event == "job":
-            counts["processed"] += 1
+        if event == "processing":
             job = details["job"]
-            verdict = details["verdict"]
-            provider = str(details.get("provider") or "unknown").upper()
-            model = str(details.get("model") or "unknown")
             console.print(
                 f"\n[{details['index']}/{details['total']}] "
-                f"[bold]{job.title}[/bold] — {job.company}"
+                f"[bold]{job.title}[/bold] — {job.company}\n"
+                "    Processing..."
             )
-            console.print(f"        → {provider} | {model}")
+            return
 
-            if verdict.ai_status == "failed":
-                counts["errors"] += 1
-                error_text = str(verdict.ai_error or "").lower()
-                error_label = "timeout" if "timeout" in error_text or "timed out" in error_text else "request failed"
-                console.print(f"        → AI ERROR | {error_label}")
-            elif verdict.match:
-                counts["matched"] += 1
-                console.print(
-                    f"        → MATCHED | Score: {verdict.match_score} | {verdict.priority.value}"
-                )
+        if event == "sending_ai":
+            console.print("    → Sending job to AI matcher...")
+            return
+
+        if event == "ai_response":
+            console.print("    → AI response received")
+            return
+
+        if event == "ai_error":
+            error_text = str(details["verdict"].ai_error or "").lower()
+            if "timeout" in error_text or "timed out" in error_text:
+                error_category = "timeout"
+            elif "connect" in error_text or "network" in error_text:
+                error_category = "connection"
             else:
+                error_category = "provider failure"
+            console.print(f"    → AI ERROR | {error_category}")
+            return
+
+        if event == "skipped":
+            console.print("    → AI skipped by existing pipeline")
+            return
+
+        if event == "job_complete":
+            job = details["job"]
+            status = details["status"]
+            score = details["score"]
+            index = details["index"]
+            total = details["total"]
+            if status == "MATCHED":
+                counts["matched"] += 1
+            elif status == "NOT MATCHED":
                 counts["not_matched"] += 1
-                console.print(f"        → NOT MATCHED | Score: {verdict.match_score}")
+            elif status == "AI ERROR":
+                counts["errors"] += 1
+            else:
+                counts["skipped"] += 1
+            counts["processed"] += 1
+            console.print(build_card(index, total, job, status, score))
+            console.print("-" * 60)
             return
 
         if event == "complete":
             console.print("\n" + "=" * 60)
-            console.print("AI MATCHING COMPLETE")
+            console.print("HIREVIA SCAN COMPLETE")
             console.print("=" * 60)
-            console.print(f"Processed: {counts['processed']}")
-            console.print(f"Matched: {counts['matched']}")
-            console.print(f"Not matched: {counts['not_matched']}")
-            console.print(f"AI errors: {counts['errors']}")
+            console.print(f"Processed       : {counts['processed']}")
+            console.print(f"Matched         : {counts['matched']}")
+            console.print(f"Not Matched     : {counts['not_matched']}")
+            console.print(f"AI Skipped      : {counts['skipped']}")
+            console.print(f"AI Errors       : {counts['errors']}")
+            console.print(f"\nScan completed in: {details.get('duration', 0):.1f}s")
+            if details.get("notifications_enabled", notifications_enabled):
+                console.print("Telegram notifications: ENABLED")
+            else:
+                console.print("Telegram notifications: DISABLED (--no-notify)")
             console.print("=" * 60)
 
     return report

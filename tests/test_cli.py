@@ -19,7 +19,7 @@ from hirevia.ai.matcher import MATCH_RESPONSE_SCHEMA
 from hirevia import cli as cli_module
 from hirevia.cli import _build_notifier, _print_stats, _resolve_nvidia_key, cli
 from hirevia.config import Config
-from hirevia.core.models import ApplicationStatus, Job, ScanStats
+from hirevia.core.models import ApplicationStatus, EmploymentType, Job, ScanStats
 from hirevia.notifications.telegram import TelegramNotifier
 from hirevia.sources.telegram_config import TelegramChannel
 from hirevia.sources.telegram_extract import TgMessage
@@ -170,37 +170,61 @@ def test_scan_closes_the_notifier_it_created(monkeypatch, tmp_path):
     assert closed == [True]
 
 
-def test_scan_prints_live_ai_matching_progress(monkeypatch, tmp_path):
+def test_scan_prints_jobs_sequentially_after_processing(monkeypatch, tmp_path):
     async def fake_scan(
         config, repo, ai_matcher=None, notifier=None, diagnostic_output=False,
         ai_progress_callback=None,
     ):
         assert diagnostic_output is False
         assert ai_progress_callback is not None
-        ai_progress_callback("start", total=3)
-
-        outcomes = [
-            ("Software Engineer", "Amazon", "ok", True, 87, "P1", None),
-            ("Customer Support Executive", "ABC", "ok", False, 31, "P3", None),
-            ("Data Scientist", "XYZ", "failed", True, 62, "P2", "secret APITimeoutError: timeout"),
+        jobs = [
+            (SimpleNamespace(
+                title="Software Engineer", company="Amazon",
+                application_url="https://jobs.example.com/amazon",
+                experience="0-1 years", location="Pune, Maharashtra",
+                work_mode="ignored", employment_type=EmploymentType.FULL_TIME,
+                posted_at=datetime(2026, 9, 30),
+                raw_data={"source_channel": "Freshershunt", "work_mode": "Hybrid"},
+            ), "MATCHED", 87, "ai_response"),
+            (SimpleNamespace(
+                title="Customer Support Executive", company="ABC",
+                application_url="https://jobs.example.com/abc",
+                experience="Fresher", location="Pune", work_mode="WFO",
+                employment_type=EmploymentType.INTERNSHIP,
+                posted_at=datetime(2026, 9, 30), raw_data={},
+            ), "NOT MATCHED", 31, "ai_response"),
+            (SimpleNamespace(
+                title="Data Scientist", company="XYZ",
+                application_url="https://jobs.example.com/xyz",
+                experience=None, location=None, employment_type=None,
+                posted_at=None, raw_data={"source_name": "LinkedIn"},
+            ), "AI ERROR", 62, "ai_error"),
+            (SimpleNamespace(
+                source="telegram", title="Software Developer", company="XYZ",
+                application_url=None,
+                experience=None, location=None, employment_type=None,
+                posted_at=None, raw_data={},
+            ), "AI SKIPPED", 58, "skipped"),
         ]
-        for index, (title, company, status, match, score, priority, error) in enumerate(outcomes, 1):
+        ai_progress_callback("start", total=len(jobs))
+        for index, (job, status, score, outcome) in enumerate(jobs, 1):
+            ai_progress_callback("processing", index=index, total=len(jobs), job=job)
+            if outcome == "ai_error":
+                ai_progress_callback("sending_ai", job=job)
+                ai_progress_callback(
+                    "ai_error",
+                    job=job,
+                    verdict=SimpleNamespace(ai_error="secret APITimeoutError: timeout"),
+                )
+            elif outcome == "ai_response":
+                ai_progress_callback("sending_ai", job=job)
+                ai_progress_callback("ai_response", job=job)
+            else:
+                ai_progress_callback("skipped", job=job)
             ai_progress_callback(
-                "job",
-                index=index,
-                total=3,
-                job=SimpleNamespace(title=title, company=company),
-                verdict=SimpleNamespace(
-                    ai_status=status,
-                    ai_error=error,
-                    match=match,
-                    match_score=score,
-                    priority=SimpleNamespace(value=priority),
-                ),
-                provider="nvidia",
-                model="nvidia/test-model",
+                "job_complete", index=index, total=len(jobs), job=job,
+                status=status, score=score,
             )
-        ai_progress_callback("complete")
         return ScanStats()
 
     monkeypatch.setattr(cli_module, "run_single_scan", fake_scan)
@@ -211,24 +235,91 @@ def test_scan_prints_live_ai_matching_progress(monkeypatch, tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert "AI MATCHING" in result.output
-    assert "[1/3] Software Engineer — Amazon" in result.output
-    assert "→ NVIDIA | nvidia/test-model" in result.output
-    assert "→ MATCHED | Score: 87 | P1" in result.output
-    assert "[2/3] Customer Support Executive — ABC" in result.output
-    assert "→ NOT MATCHED | Score: 31" in result.output
-    assert "[3/3] Data Scientist — XYZ" in result.output
-    assert "→ AI ERROR | timeout" in result.output
+    output = result.output
+    first_processing = output.index("[1/4] Software Engineer — Amazon")
+    first_send = output.index("→ Sending job to AI matcher...")
+    first_response = output.index("→ AI response received")
+    first_result = output.index("Status      : MATCHED")
+    second_processing = output.index("[2/4] Customer Support Executive — ABC")
+    assert first_processing < first_send < first_response < first_result < second_processing
+    assert "→ AI ERROR | timeout" in output
+    assert "HIREVIA JOB PROCESSING" in output
+    assert "[2/4] Customer Support Executive — ABC" in output
+    assert "[3/4] Data Scientist — XYZ" in output
+    assert "[4/4] Software Developer — XYZ" in output
+    assert "DONE" in output
+    assert "Company     : Amazon" in result.output
+    assert "Experience  : 0–1 years" in result.output
+    assert "Location    : Pune, Maharashtra" in result.output
+    assert "Work Mode   : Hybrid" in result.output
+    assert "Employment  : Full-time" in result.output
+    assert "Posted      : 30 Sep 2026" in result.output
+    assert "Source      : Freshershunt" in result.output
+    assert "Apply       : https://jobs.example.com/amazon" in result.output
+    assert "Status      : MATCHED" in result.output
+    assert "Score       : 87" in result.output
+    assert "Priority    : P1" in result.output
+    assert "Status      : NOT MATCHED" in result.output
+    assert "Priority    : P3" in result.output
+    assert "Status      : AI ERROR" in result.output
+    assert "Source      : LinkedIn" in result.output
+    assert "Experience  : Not specified" in result.output
+    assert "Location    : Not specified" in result.output
+    assert "Work Mode   : Unknown" in result.output
+    assert "Employment  : Not specified" in result.output
+    assert "Posted      : Unknown" in result.output
+    assert "Source      : Telegram" in result.output
+    assert "Apply       : Not available" in result.output
+    assert "Status      : AI SKIPPED" in result.output
+    assert "Score       : 58" in result.output
+    assert "Priority    : P2" in result.output
     assert "secret" not in result.output
     assert "APITimeoutError" not in result.output
-    assert "AI MATCHING COMPLETE" in result.output
-    assert "Processed: 3" in result.output
-    assert "Matched: 1" in result.output
-    assert "Not matched: 1" in result.output
-    assert "AI errors: 1" in result.output
+    assert "nvidia/test-model" not in result.output
+    assert "NVIDIA" not in result.output
+    assert "HIREVIA SCAN COMPLETE" in result.output
+    assert "Processed       : 4" in result.output
+    assert "Matched         : 1" in result.output
+    assert "Not Matched     : 1" in result.output
+    assert "AI Skipped      : 1" in result.output
+    assert "AI Errors       : 1" in result.output
 
 
-def test_scan_prints_final_eligible_results_without_notifications(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("score", "expected"),
+    [(81, "P1"), (80, "P2"), (51, "P2"), (50, "P3"), (21, "P3"), (20, "No Priority")],
+)
+def test_ai_progress_priority_boundaries(capsys, score, expected):
+    from hirevia.cli import _make_ai_progress_reporter
+
+    report = _make_ai_progress_reporter()
+    report("start", total=1)
+    job = SimpleNamespace(title="Engineer", company="Example", application_url=None,
+                          experience=None, location=None, employment_type=None,
+                          posted_at=None, raw_data={}, source="test")
+    report("processing", index=1, total=1, job=job)
+    report(
+        "job_complete", index=1, total=1, job=job,
+        status="NOT MATCHED", score=score,
+    )
+    report("complete")
+
+    assert f"Priority    : {expected}" in capsys.readouterr().out
+
+
+def test_ai_review_empty_scan_prints_zero_summary(capsys):
+    from hirevia.cli import _make_ai_progress_reporter
+
+    report = _make_ai_progress_reporter()
+    report("start", total=0)
+    report("complete")
+
+    output = capsys.readouterr().out
+    assert "Processed       : 0" in output
+    assert "HIREVIA SCAN COMPLETE" in output
+
+
+def test_scan_prints_final_scan_summary_without_notifications(monkeypatch, tmp_path):
     seen = {}
 
     async def fake_scan(
@@ -258,12 +349,8 @@ def test_scan_prints_final_eligible_results_without_notifications(monkeypatch, t
 
     assert result.exit_code == 0, result.output
     assert seen == {"notifier": None, "diagnostic_output": False}
-    assert "FINAL HIREVIA RESULTS" in result.output
-    assert "Final eligible jobs: 1" in result.output
-    assert "Software Engineer — Amazon" in result.output
-    assert "Match Score: 87" in result.output
-    assert "Priority: P1" in result.output
-    assert "Application: https://jobs.example.com/amazon/123" in result.output
+    assert "HIREVIA SCAN COMPLETE" in result.output
+    assert "Processed       : 0" in result.output
     assert "Telegram notifications: DISABLED (--no-notify)" in result.output
 
 
@@ -282,8 +369,7 @@ def test_scan_prints_empty_final_results(monkeypatch, tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert "Final eligible jobs: 0" in result.output
-    assert "No eligible jobs found." in result.output
+    assert "Processed       : 0" in result.output
 
 
 def test_status_shows_freshness_and_link_verdict(monkeypatch, tmp_path):

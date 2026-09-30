@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from hirevia.config import Config
+from hirevia.core.matching import analyze
 from hirevia.core.models import AIResponse, ApplicationStatus, CandidateProfile, Job, MatchResult, Priority
 from hirevia.core.pipeline import Pipeline
 from hirevia.core.verification import UrlQuality
@@ -190,6 +191,60 @@ def test_missing_application_url_is_stored_but_never_matched_or_alerted(repo):
     stored = repo.get_by_source_id(job.source, job.source_job_id)
     assert stored is not None
     assert stored.raw_data["application_url_usable"] is False
+
+
+def test_deterministic_only_job_is_reported_as_ai_skipped(repo):
+    job = make_job(apply="https://jobs.lever.co/acme/backend")
+    pipeline = build_pipeline([FakeSource([job])], repo)
+    events = []
+    pipeline.ai_progress_callback = lambda event, **details: events.append((event, details))
+
+    stats = run(pipeline)
+
+    assert [event for event, _ in events] == ["start", "processing", "skipped", "job_complete"]
+    assert events[1][1]["job"] is job
+    assert events[2][1]["job"] is job
+    assert events[2][1]["rule_score"] == analyze(job, pipeline.profile).score
+    assert events[3][1]["status"] == "AI SKIPPED"
+    assert events[3][1]["score"] == events[2][1]["rule_score"]
+    assert stats.jobs_rule_scored == 1
+
+
+def test_ai_progress_is_printable_before_matcher_wait_and_completes_after_pipeline(repo):
+    events = []
+
+    class ObservedMatcher(FakeMatcher):
+        async def match(self, job, profile):
+            events.append(("matcher_started", job.title))
+            return self.default
+
+    job = make_job(apply="https://jobs.lever.co/acme/backend")
+    next_job = make_job(
+        title="Data Analyst", company="Beta Labs",
+        apply="https://jobs.lever.co/beta/analyst", message_id=2,
+    )
+    pipeline = build_pipeline([FakeSource([job, next_job])], repo, ObservedMatcher())
+    pipeline.ai_progress_callback = lambda event, **details: events.append((event, details))
+
+    run(pipeline)
+
+    event_names = [event for event, _ in events]
+    assert event_names.index("processing") < event_names.index("sending_ai")
+    assert event_names.index("sending_ai") < event_names.index("matcher_started")
+    assert event_names.index("matcher_started") < event_names.index("ai_response")
+    assert event_names.index("ai_response") < event_names.index("job_complete")
+    complete = events[event_names.index("job_complete")][1]
+    assert complete["status"] == "MATCHED"
+    assert complete["score"] > 0
+    first_complete = next(
+        index for index, (event, details) in enumerate(events)
+        if event == "job_complete" and details["index"] == 1
+    )
+    second_processing = next(
+        index for index, (event, details) in enumerate(events)
+        if event == "processing" and details["index"] == 2
+    )
+    assert first_complete < second_processing
 
 
 def test_hard_reject_and_clear_role_miss_never_reach_ai_but_ambiguous_does(repo):
