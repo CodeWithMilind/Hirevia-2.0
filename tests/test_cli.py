@@ -381,10 +381,11 @@ def test_monitor_uses_telegram_only_and_no_notify_still_starts(monkeypatch, tmp_
     class FakeTelegramSource:
         last_collection_failed = False
         has_more_backfill = False
+        retry_count = 0
 
         async def start_continuous_monitoring(self):
             source_calls.append("started")
-            return 36
+            return 7
 
         def enable_event_mode(self):
             source_calls.append("event_mode")
@@ -426,7 +427,189 @@ def test_monitor_uses_telegram_only_and_no_notify_still_starts(monkeypatch, tmp_
     assert source_calls == ["started", "event_mode", "stopped"]
     assert pipeline_configs[0].sources.get_enabled_sources() == ["telegram"]
     assert config.sources.get_enabled_sources() == ["greenhouse", "telegram"]
+    assert "✓ Telegram monitoring started" in result.output
+    assert "✓ Monitoring 7 channels" in result.output
+    assert "✓ Persistent message tracking enabled" in result.output
+    assert "Waiting for new opportunities..." in result.output
     assert "Telegram notifications: DISABLED (--no-notify)" in result.output
+
+
+def test_monitor_normal_output_is_concise_and_keeps_job_card(monkeypatch, tmp_path):
+    config = Config()
+    source_calls = []
+
+    class FakeTelegramSource:
+        last_collection_failed = False
+        has_more_backfill = False
+        retry_count = 0
+
+        async def start_continuous_monitoring(self):
+            return 7
+
+        def enable_event_mode(self):
+            source_calls.append("event_mode")
+
+        def retry_uncommitted_event(self):
+            self.retry_count += 1
+            return self.retry_count == 2
+
+        async def stop_continuous_monitoring(self):
+            source_calls.append("stopped")
+
+    source = FakeTelegramSource()
+    job = Job(
+        source="telegram",
+        source_job_id="job-1",
+        title="Python Developer Intern",
+        company="TestCompany",
+        location="Pune",
+        description="Internship for freshers",
+        url="https://t.me/jobs/101",
+        application_url="https://example.com/job",
+        experience="Freshers",
+        employment_type=EmploymentType.INTERNSHIP,
+    )
+
+    class FakePipeline:
+        def __init__(self, monitor_config, repo, ai_matcher, notifier, **kwargs):
+            self.registry = SimpleNamespace(get_source=lambda name: source)
+            self.report_progress = kwargs["ai_progress_callback"]
+            self.scan_calls = 0
+
+        async def run_scan(self):
+            self.scan_calls += 1
+            if self.scan_calls == 1:
+                return ScanStats()
+            if self.scan_calls == 2:
+                telegram_logger = logging.getLogger("hirevia.sources.telegram_source")
+                telegram_logger.info("[Telegram] New message: channel=jobs_alpha message_id=101")
+                telegram_logger.debug("[Telegram] [Filter] REJECTED promotional: course content")
+                telegram_logger.info("[Telegram] New message: channel=jobs_alpha message_id=102")
+                telegram_logger.debug("[Telegram] New message detected in jobs_alpha #102")
+                self.report_progress("processing", index=1, total=1, job=job)
+                self.report_progress("sending_ai")
+                self.report_progress("ai_response")
+                self.report_progress("job_complete", index=1, total=1, job=job, status="MATCHED", score=68)
+                telegram_logger.info("[Telegram] New message: channel=jobs_alpha message_id=103")
+                logging.getLogger("hirevia.core.pipeline").debug(
+                    "[Pipeline] Stage 3: duplicate of database-id - 'Python Developer Intern'"
+                )
+                telegram_logger.warning("[Telegram] Connection lost; reconnecting")
+                telegram_logger.info("[Telegram] Reconnected")
+                logging.getLogger("hirevia.core.pipeline").info(
+                    "[Pipeline] Stage 2 done: 3 message(s), 2 detected, 2 normalized, 2 to process"
+                )
+                logging.getLogger("hirevia.core.pipeline").info(
+                    "[Pipeline] Scan finished in 0.6s: found=2 new=1 dup=1 promo_rejected=1"
+                )
+                logging.getLogger("hirevia.ai.client").error(
+                    "provider response API_KEY-CANARY " + "provider details " * 100
+                )
+                return ScanStats(messages_checked=3, jobs_detected=2, jobs_duplicate=1)
+            if self.scan_calls == 3:
+                logging.getLogger("hirevia.core.pipeline").error(
+                    "provider error API_KEY-CANARY " + "stack trace details " * 100
+                )
+                return ScanStats(messages_checked=1, jobs_failed=1)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli_module, "Pipeline", FakePipeline)
+    monkeypatch.setattr(cli_module, "_build_ai_matcher", lambda *a, **k: None)
+
+    async def no_sleep(*_args):
+        return None
+
+    monkeypatch.setattr(cli_module.asyncio, "sleep", no_sleep)
+
+    result = CliRunner().invoke(
+        cli,
+        ["monitor", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "monitor.db")],
+    )
+
+    assert result.exit_code == 0, result.output
+    for event in (
+        "[Telegram] New message received",
+        "[Telegram] New message ignored — not a job",
+        "[Telegram] New job detected",
+        "[Telegram] Duplicate ignored",
+        "[Telegram] Processing failed — retrying",
+        "[Telegram] Connection lost — reconnecting",
+        "[Telegram] Reconnected",
+        "[Telegram] Processing completed",
+    ):
+        assert event in result.output
+    for card_line in (
+        "[1/1] Python Developer Intern — TestCompany",
+        "    Processing...",
+        "    → Sending job to AI matcher...",
+        "    → AI response received",
+        "Company     : TestCompany",
+        "Experience  : Freshers",
+        "Location    : Pune",
+        "Work Mode   : Unknown",
+        "Employment  : Internship",
+        "Apply       : https://example.com/job",
+        "Status      : MATCHED",
+        "Score       : 68",
+        "Priority    : P2",
+    ):
+        assert card_line in result.output
+    for internal in (
+        "message_id", "database-id", "Stage 2 done", "Scan finished",
+        "promo_rejected", "API_KEY-CANARY", "provider details", "stack trace details",
+    ):
+        assert internal not in result.output
+
+
+def test_monitor_verbose_keeps_pipeline_diagnostics(monkeypatch, tmp_path, caplog):
+    config = Config()
+
+    class FakeTelegramSource:
+        last_collection_failed = False
+        has_more_backfill = False
+
+        async def start_continuous_monitoring(self):
+            return 2
+
+        def enable_event_mode(self):
+            pass
+
+        def retry_uncommitted_event(self):
+            return False
+
+        async def stop_continuous_monitoring(self):
+            pass
+
+    source = FakeTelegramSource()
+
+    class FakePipeline:
+        def __init__(self, *args, **kwargs):
+            self.registry = SimpleNamespace(get_source=lambda name: source)
+            self.scan_calls = 0
+
+        async def run_scan(self):
+            self.scan_calls += 1
+            logging.getLogger("hirevia.core.pipeline").info(
+                "[Pipeline] Stage 2 done: 1 message(s), 0 detected, 0 normalized, 0 to process"
+            )
+            if self.scan_calls == 1:
+                return ScanStats()
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli_module, "Pipeline", FakePipeline)
+    monkeypatch.setattr(cli_module, "_build_ai_matcher", lambda *a, **k: None)
+    caplog.set_level(logging.INFO, logger="hirevia.core.pipeline")
+
+    result = CliRunner().invoke(
+        cli,
+        ["monitor", "--verbose", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "verbose.db")],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "[Pipeline] Stage 2 done: 1 message(s)" in caplog.text
+    assert "HIREVIA SCAN COMPLETE" in result.output
 
 
 def test_status_shows_freshness_and_link_verdict(monkeypatch, tmp_path):

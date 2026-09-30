@@ -568,6 +568,7 @@ class TelegramSource(JobSource):
         else:
             await client.catch_up()
         self._listener_client = client
+        logger.info("%s Reconnected", PREFIX)
 
     def _schedule_overflow_recovery(self) -> None:
         if self._overflow_channels and (

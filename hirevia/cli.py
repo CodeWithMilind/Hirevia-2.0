@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -52,6 +53,72 @@ def configure_logging(verbose: bool = False) -> None:
         root.addHandler(handler)
     for handler in root.handlers:
         handler.setLevel(level)
+
+
+class _MonitorLogFilter(logging.Filter):
+    """Translate selected internal monitor events into concise console lines."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return False
+
+        display = None
+        if record.name == "hirevia.sources.telegram_source":
+            if "New message: channel=" in message:
+                display = "[Telegram] New message received"
+            elif "[Filter] REJECTED" in message:
+                display = "[Telegram] New message ignored — not a job"
+            elif "New message detected in " in message:
+                display = "[Telegram] New job detected"
+            elif "Connection lost; reconnecting" in message:
+                display = "[Telegram] Connection lost — reconnecting"
+            elif "[Telegram] Reconnected" in message:
+                display = "[Telegram] Reconnected"
+        elif record.name == "hirevia.core.pipeline":
+            if "Stage 3: duplicate of " in message:
+                display = "[Telegram] Duplicate ignored"
+        elif record.name == "hirevia.cli":
+            if "Message processing incomplete; retrying" in message or "Startup catch-up incomplete; retrying" in message:
+                display = "[Telegram] Processing failed — retrying"
+
+        if display:
+            if not getattr(record, "_hirevia_monitor_rendered", False):
+                record._hirevia_monitor_rendered = True
+                console.print(display)
+        return False
+
+
+@contextmanager
+def _monitor_log_presentation(verbose: bool):
+    """Silence monitor internals in normal mode, restoring logging afterward."""
+    if verbose:
+        yield
+        return
+
+    root = logging.getLogger()
+    handlers = list(root.handlers)
+    handler_states = [(handler, handler.level) for handler in handlers]
+    monitor_loggers = [
+        logging.getLogger("hirevia.core.pipeline"),
+        logging.getLogger("hirevia.sources.telegram_source"),
+    ]
+    logger_states = [(item, item.level) for item in monitor_loggers]
+    output_filter = _MonitorLogFilter()
+    for handler in handlers:
+        handler.addFilter(output_filter)
+        handler.setLevel(logging.DEBUG)
+    for item in monitor_loggers:
+        item.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        for handler, level in handler_states:
+            handler.removeFilter(output_filter)
+            handler.setLevel(level)
+        for item, level in logger_states:
+            item.setLevel(level)
 
 
 def _resolve_nvidia_key() -> Optional[str]:
@@ -261,7 +328,8 @@ def monitor(
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
     notifier = _build_notifier(config, telegram_token, chat_id) if notify else None
     progress_reporter = _make_ai_progress_reporter(
-        notifications_enabled=bool(notify and notifier)
+        notifications_enabled=bool(notify and notifier),
+        normal_monitor=not verbose,
     )
     pipeline = Pipeline(
         monitor_config,
@@ -280,7 +348,16 @@ def monitor(
         started_at = asyncio.get_running_loop().time()
         retry_delay = 2
         try:
-            await source.start_continuous_monitoring()
+            console.print("╔══════════════════════════════════════════════════════════╗")
+            console.print("║                    HIREVIA 2.0                          ║")
+            console.print("║              Autonomous Job Discovery Agent             ║")
+            console.print("╚══════════════════════════════════════════════════════════╝")
+            channel_count = await source.start_continuous_monitoring()
+            console.print("✓ Telegram monitoring started")
+            console.print(f"✓ Monitoring {channel_count} channels")
+            console.print("✓ Persistent message tracking enabled")
+            if not notify or not notifier:
+                console.print("Telegram notifications: DISABLED (--no-notify)")
             while True:
                 stats = await pipeline.run_scan()
                 if source.last_collection_failed or stats.jobs_failed:
@@ -297,6 +374,7 @@ def monitor(
 
             source.enable_event_mode()
             retry_delay = 2
+            console.print("\nWaiting for new opportunities...")
             while True:
                 stats = await pipeline.run_scan()
                 if source.retry_uncommitted_event():
@@ -308,6 +386,11 @@ def monitor(
                     retry_delay = min(retry_delay * 2, 60)
                 else:
                     retry_delay = 2
+                    if (
+                        stats.jobs_detected > stats.jobs_duplicate
+                        and stats.jobs_failed == 0
+                    ):
+                        console.print("[Telegram] Processing completed")
         finally:
             await source.stop_continuous_monitoring()
             if notifier:
@@ -319,7 +402,8 @@ def monitor(
             )
 
     try:
-        asyncio.run(_run_monitor())
+        with _monitor_log_presentation(verbose):
+            asyncio.run(_run_monitor())
     except KeyboardInterrupt:
         console.print("\n[Telegram] Continuous monitoring stopped")
 
@@ -716,7 +800,10 @@ def _print_stats(stats: ScanStats, include_top_opportunities: bool = True):
             console.print(f"  - {err}")
 
 
-def _make_ai_progress_reporter(notifications_enabled: bool = False):
+def _make_ai_progress_reporter(
+    notifications_enabled: bool = False,
+    normal_monitor: bool = False,
+):
     counts = {"processed": 0, "matched": 0, "not_matched": 0, "skipped": 0, "errors": 0}
 
     def review_priority(score):
@@ -803,6 +890,8 @@ def _make_ai_progress_reporter(notifications_enabled: bool = False):
 
     def report(event, **details):
         if event == "start":
+            if normal_monitor:
+                return
             console.print("\n" + "=" * 60)
             console.print("HIREVIA JOB PROCESSING")
             console.print("=" * 60)
@@ -860,6 +949,8 @@ def _make_ai_progress_reporter(notifications_enabled: bool = False):
             return
 
         if event == "complete":
+            if normal_monitor:
+                return
             console.print("\n" + "=" * 60)
             console.print("HIREVIA SCAN COMPLETE")
             console.print("=" * 60)
