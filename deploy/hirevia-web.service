@@ -1,7 +1,7 @@
 [Unit]
-Description=Hirevia Telegram Job Discovery Agent
-After=network-online.target
-Wants=network-online.target
+Description=Hirevia Web Control Plane
+After=network-online.target hirevia-worker.service
+Wants=network-online.target hirevia-worker.service
 
 [Service]
 Type=simple
@@ -14,6 +14,7 @@ Environment=HIREVIA_PORT=8000
 Environment=HIREVIA_DB_PATH=/var/lib/hirevia/hirevia.db
 Environment=TELEGRAM_SESSION_DIR=/var/lib/hirevia/sessions
 Environment=HIREVIA_LOG_DIR=/var/log/hirevia
+Environment=HIREVIA_WORKER_MANAGED=1
 ExecStart=/opt/hirevia/.venv/bin/python -m hirevia
 Restart=always
 RestartSec=5

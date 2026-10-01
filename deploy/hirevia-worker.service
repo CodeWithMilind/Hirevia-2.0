@@ -1,0 +1,33 @@
+[Unit]
+Description=Hirevia Independent Telegram Monitor Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hirevia
+Group=hirevia
+WorkingDirectory=/etc/hirevia
+EnvironmentFile=-/etc/hirevia/hirevia.env
+Environment=HIREVIA_DB_PATH=/var/lib/hirevia/hirevia.db
+Environment=TELEGRAM_SESSION_DIR=/var/lib/hirevia/sessions
+Environment=HIREVIA_LOG_DIR=/var/log/hirevia
+Environment=HIREVIA_WORKER_MANAGED=1
+ExecStart=/opt/hirevia/.venv/bin/python -m hirevia worker
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=45
+UMask=0077
+StateDirectory=hirevia
+StateDirectoryMode=0700
+LogsDirectory=hirevia
+LogsDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/hirevia /var/lib/hirevia /var/log/hirevia
+
+[Install]
+WantedBy=multi-user.target

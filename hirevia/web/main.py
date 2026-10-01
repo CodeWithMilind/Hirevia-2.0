@@ -25,22 +25,39 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - startup and shutdown"""
-    # Startup
     logger.info("Starting Hirevia Web UI")
     state = get_web_state()
-    state.repo.recover_processing_queue()
-    cleanup_task = asyncio.create_task(state.cleanup_loop())
-    await state.restore_telegram_auth_for_startup()
-    await state.recover_monitoring_for_startup()
+    cleanup_task = None
+    watchdog_task = None
+    if state.external_worker:
+        from hirevia.worker_process import WorkerProcessController
+
+        try:
+            await WorkerProcessController(state.repo).ensure_running()
+        except Exception as error:
+            logger.error("Independent worker startup failed (%s)", type(error).__name__)
+        await state.restore_telegram_auth_for_startup()
+        watchdog_task = asyncio.create_task(state.worker_watchdog_loop())
+    else:
+        state.repo.recover_processing_queue()
+        cleanup_task = asyncio.create_task(state.cleanup_loop())
+        await state.restore_telegram_auth_for_startup()
+        await state.recover_monitoring_for_startup()
     try:
         yield
     finally:
         logger.info("Shutting down Hirevia Web UI")
-        cleanup_task.cancel()
-        await asyncio.gather(cleanup_task, return_exceptions=True)
-        if state.is_running:
+        for task in (cleanup_task, watchdog_task):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (cleanup_task, watchdog_task) if task is not None),
+            return_exceptions=True,
+        )
+        if not state.external_worker and state.is_running:
             await state.stop_scanner(persist_desired=False)
-        await state._close_telegram_clients()
+        if not state.external_worker:
+            await state._close_telegram_clients()
 
 
 app = FastAPI(

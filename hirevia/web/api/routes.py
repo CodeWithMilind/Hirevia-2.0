@@ -98,6 +98,13 @@ async def get_status():
         queue_processing=status["queue_processing"],
         queue_oldest_pending_at=status["queue_oldest_pending_at"],
         last_cleanup_at=status["last_cleanup_at"],
+        worker_pid=status["worker_pid"],
+        worker_alive=status["worker_alive"],
+        worker_status=status["worker_status"],
+        worker_started_at=status["worker_started_at"],
+        worker_heartbeat_at=status["worker_heartbeat_at"],
+        worker_last_error=status["worker_last_error"],
+        monitor_desired=status["monitor_desired"],
         sources=[SourceInfo(**s) for s in sources],
     )
 
@@ -160,6 +167,8 @@ async def delete_all_jobs():
 async def start_scanner():
     """Start the background scanner"""
     state = _state()
+    if getattr(state, "external_worker", False):
+        state._sync_external_worker_status()
     
     if state.is_running:
         return StartStopResponse(
@@ -185,6 +194,8 @@ async def start_scanner():
 async def stop_scanner():
     """Stop the background scanner"""
     state = _state()
+    if getattr(state, "external_worker", False):
+        state._sync_external_worker_status()
     
     if not state.is_running:
         state.add_activity("Monitor stop requested while already stopped", "warning")

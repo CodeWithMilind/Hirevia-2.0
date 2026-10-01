@@ -12,11 +12,17 @@ that make it useful afterwards:
 """
 
 import asyncio
+import ctypes
+import errno
+import os
 import sqlite3
 from datetime import datetime, timedelta
 
+import pytest
+
 from hirevia.core.models import AIResponse, Job, MatchResult, Priority
 from hirevia.notifications.base import Notifier
+from hirevia.storage import state as storage_state
 from hirevia.storage.state import JOB_COLUMNS, JobRepository
 
 
@@ -196,6 +202,141 @@ def test_delete_all_jobs_keeps_message_history(tmp_path):
             "SELECT COUNT(*) FROM telegram_message_history"
         ).fetchone()[0]
     assert history_count == 2
+
+
+def test_worker_lease_is_single_owner_across_repository_instances(tmp_path, monkeypatch):
+    database_path = tmp_path / "worker-lease.db"
+    first = JobRepository(database_path)
+    second = JobRepository(database_path)
+    monkeypatch.setattr(first, "_pid_is_alive", lambda pid: pid == 12345)
+    monkeypatch.setattr(second, "_pid_is_alive", lambda pid: pid == 12345)
+
+    assert first.claim_worker_lease(12345) is True
+    assert second.claim_worker_lease(67890) is False
+    assert second.get_worker_runtime()["pid"] == 12345
+    first.release_worker_lease(12345)
+    assert second.claim_worker_lease(67890) is True
+    assert second.get_worker_runtime()["pid"] == 67890
+
+
+def test_pid_is_alive_for_current_process():
+    assert JobRepository._pid_is_alive(os.getpid()) is True
+
+
+def test_pid_is_not_alive_for_nonexistent_process():
+    assert JobRepository._pid_is_alive(2**31 - 1) is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process probe")
+def test_linux_posix_probe_recognizes_current_process():
+    assert JobRepository._posix_pid_is_alive(os.getpid()) is True
+
+
+@pytest.mark.parametrize("pid", [None, 0, -1, True, 1.5, "not-a-pid", 10**100])
+def test_invalid_pids_are_not_alive(pid):
+    assert JobRepository._pid_is_alive(pid) is False
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ProcessLookupError(errno.ESRCH, "missing"), False),
+        (PermissionError(errno.EPERM, "inaccessible"), True),
+    ],
+)
+def test_posix_pid_detection_distinguishes_missing_and_inaccessible(
+    monkeypatch, error, expected
+):
+    calls = []
+
+    def fake_kill(pid, signal_number):
+        calls.append((pid, signal_number))
+        raise error
+
+    monkeypatch.setattr(storage_state.os, "kill", fake_kill)
+
+    assert JobRepository._posix_pid_is_alive(12345) is expected
+    assert calls == [(12345, 0)]
+
+
+def test_windows_pid_detection_treats_access_denied_as_alive(monkeypatch):
+    class FakeFunction:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    class FakeKernel32:
+        OpenProcess = FakeFunction(lambda *_: None)
+        GetExitCodeProcess = FakeFunction(lambda *_: 0)
+        CloseHandle = FakeFunction(lambda *_: 1)
+
+    monkeypatch.setattr(
+        ctypes, "WinDLL", lambda *_args, **_kwargs: FakeKernel32(), raising=False
+    )
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+
+    assert JobRepository._windows_pid_is_alive(12345) is True
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected_helper"),
+    [("nt", "windows"), ("posix", "posix")],
+)
+def test_pid_detection_dispatches_to_platform_helper(
+    monkeypatch, platform, expected_helper
+):
+    calls = []
+    monkeypatch.setattr(storage_state.os, "name", platform)
+    monkeypatch.setattr(
+        JobRepository,
+        "_windows_pid_is_alive",
+        staticmethod(lambda pid: calls.append(("windows", pid)) or True),
+    )
+    monkeypatch.setattr(
+        JobRepository,
+        "_posix_pid_is_alive",
+        staticmethod(lambda pid: calls.append(("posix", pid)) or True),
+    )
+
+    assert JobRepository._pid_is_alive(42) is True
+    assert calls == [(expected_helper, 42)]
+
+
+def test_worker_commands_are_durable_and_claimed_once(tmp_path):
+    database_path = tmp_path / "worker-commands.db"
+    first = JobRepository(database_path)
+    second = JobRepository(database_path)
+    command_id = first.enqueue_worker_command("SCAN_24H", {"source": "dashboard"})
+
+    claimed = second.claim_worker_commands()
+
+    assert claimed == [{
+        "id": command_id,
+        "command": "SCAN_24H",
+        "arguments": {"source": "dashboard"},
+    }]
+    assert first.claim_worker_commands() == []
+    second.complete_worker_command(command_id, result={"success": True})
+    assert first.get_worker_command(command_id) == {
+        "status": "COMPLETED", "result": {"success": True}, "error": None,
+    }
+
+
+def test_interrupted_worker_commands_recover_without_replaying_shutdown(tmp_path):
+    repo = JobRepository(tmp_path / "worker-command-recovery.db")
+    retry_id = repo.enqueue_worker_command("START", {"source": "dashboard"})
+    shutdown_id = repo.enqueue_worker_command("SHUTDOWN")
+    repo.claim_worker_commands(limit=2)
+
+    assert repo.recover_worker_commands() == 1
+    assert repo.get_worker_command(retry_id)["status"] == "PENDING"
+    assert repo.get_worker_command(shutdown_id) == {
+        "status": "ERROR",
+        "result": None,
+        "error": "Worker exited before shutdown completed",
+    }
 
 
 def test_veto_and_degraded_error_fields_survive_a_storage_round_trip(tmp_path):

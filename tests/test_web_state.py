@@ -86,6 +86,23 @@ def test_no_argument_cli_runs_service_launcher(monkeypatch):
     assert called == [True]
 
 
+def test_worker_cli_command_runs_independent_service(monkeypatch):
+    from hirevia import worker as worker_module
+
+    calls = []
+
+    async def fake_worker():
+        calls.append("worker")
+        return 0
+
+    monkeypatch.setattr(cli_module, "configure_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "run_worker", fake_worker)
+    result = CliRunner().invoke(cli_module.cli, ["worker"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["worker"]
+
+
 def test_port_owner_treats_connection_refused_as_available(monkeypatch):
     with cli_module.socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))

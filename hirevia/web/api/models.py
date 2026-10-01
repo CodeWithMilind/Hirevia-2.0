@@ -64,6 +64,13 @@ class SystemStatusResponse(BaseModel):
     queue_processing: int = 0
     queue_oldest_pending_at: Optional[str] = None
     last_cleanup_at: Optional[str] = None
+    worker_pid: Optional[int] = None
+    worker_alive: bool = False
+    worker_status: Optional[str] = None
+    worker_started_at: Optional[str] = None
+    worker_heartbeat_at: Optional[str] = None
+    worker_last_error: Optional[str] = None
+    monitor_desired: Optional[str] = None
     sources: List[SourceInfo]
 
 

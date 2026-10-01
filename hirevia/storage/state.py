@@ -1,13 +1,15 @@
 """SQLite-based job state storage"""
 
+import errno
 import json
+import os
 import sqlite3
-from urllib.parse import urlparse
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from hirevia.core.dedup import normalize_url
 from hirevia.core.models import Job, ApplicationStatus, ScanStats
@@ -122,6 +124,32 @@ CREATE TABLE IF NOT EXISTS processing_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_processing_queue_ready
     ON processing_queue(status, available_at, source_timestamp);
+
+CREATE TABLE IF NOT EXISTS worker_runtime (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    pid INTEGER,
+    status TEXT NOT NULL DEFAULT 'STOPPED',
+    monitor_status TEXT NOT NULL DEFAULT 'STOPPED',
+    heartbeat_at TEXT,
+    started_at TEXT,
+    last_error TEXT,
+    account_json TEXT,
+    validation_json TEXT,
+    last_scan_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS worker_commands (
+    id TEXT PRIMARY KEY,
+    command TEXT NOT NULL,
+    arguments_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    result_json TEXT,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_worker_commands_pending
+    ON worker_commands(status, created_at);
 """
 
 
@@ -159,6 +187,16 @@ class JobRepository:
         for column in JOB_COLUMNS:
             if column not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
+
+        runtime_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(worker_runtime)")
+        }
+        if "validation_json" not in runtime_columns:
+            conn.execute("ALTER TABLE worker_runtime ADD COLUMN validation_json TEXT")
+        if "monitor_status" not in runtime_columns:
+            conn.execute(
+                "ALTER TABLE worker_runtime ADD COLUMN monitor_status TEXT NOT NULL DEFAULT 'STOPPED'"
+            )
 
         conn.execute(
             "UPDATE jobs SET saved_at = COALESCE(first_seen, detected_at, created_at, datetime('now')) "
@@ -517,6 +555,279 @@ class JobRepository:
                 (source, key),
             ).fetchone()
             return row["value"] if row else default
+
+    @staticmethod
+    def _pid_is_alive(pid: Optional[int]) -> bool:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return False
+        if os.name == "nt":
+            return JobRepository._windows_pid_is_alive(pid)
+        return JobRepository._posix_pid_is_alive(pid)
+
+    @staticmethod
+    def _posix_pid_is_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OverflowError, ValueError):
+            return False
+        except OSError as error:
+            if isinstance(error, PermissionError) or error.errno == errno.EPERM:
+                return True
+            if isinstance(error, ProcessLookupError) or error.errno == errno.ESRCH:
+                return False
+            return False
+
+    @staticmethod
+    def _windows_pid_is_alive(pid: int) -> bool:
+        import ctypes
+        from ctypes import wintypes
+
+        if pid > 0xFFFFFFFF:
+            return False
+
+        process_query_limited_information = 0x1000
+        error_access_denied = 5
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(
+            process_query_limited_information, False, pid
+        )
+        if not handle:
+            return ctypes.get_last_error() == error_access_denied
+
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return ctypes.get_last_error() == error_access_denied
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def claim_worker_lease(self, pid: int) -> bool:
+        """Atomically acquire the singleton worker lease for this OS process."""
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT pid, heartbeat_at FROM worker_runtime WHERE singleton = 1"
+            ).fetchone()
+            if row and row["pid"] != pid and self._pid_is_alive(row["pid"]):
+                conn.rollback()
+                return False
+            conn.execute(
+                """
+                INSERT INTO worker_runtime
+                    (singleton, pid, status, monitor_status, heartbeat_at, started_at, last_error)
+                VALUES (1, ?, 'STARTING', 'STOPPED', datetime('now'), datetime('now'), NULL)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    pid = excluded.pid,
+                    status = 'STARTING',
+                    monitor_status = 'STOPPED',
+                    heartbeat_at = datetime('now'),
+                    started_at = datetime('now'),
+                    last_error = NULL
+                """,
+                (pid,),
+            )
+            conn.commit()
+        return True
+
+    def update_worker_runtime(
+        self,
+        pid: int,
+        status: str,
+        *,
+        last_error: Optional[str] = None,
+        monitor_status: Optional[str] = None,
+        account: Optional[Dict[str, Any]] = None,
+        validation: Optional[Dict[str, Any]] = None,
+        last_scan_at: Optional[datetime] = None,
+    ) -> bool:
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE worker_runtime
+                SET status = ?, monitor_status = COALESCE(?, monitor_status),
+                    heartbeat_at = datetime('now'), last_error = COALESCE(?, last_error),
+                    account_json = COALESCE(?, account_json),
+                    validation_json = COALESCE(?, validation_json),
+                    last_scan_at = COALESCE(?, last_scan_at)
+                WHERE singleton = 1 AND pid = ?
+                """,
+                (
+                    status,
+                    monitor_status,
+                    str(last_error)[:300] if last_error else None,
+                    json.dumps(account) if account is not None else None,
+                    json.dumps(validation) if validation is not None else None,
+                    last_scan_at.isoformat() if last_scan_at else None,
+                    pid,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def release_worker_lease(self, pid: int, status: str = "STOPPED") -> None:
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE worker_runtime
+                SET status = ?, monitor_status = 'STOPPED',
+                    heartbeat_at = datetime('now'), pid = NULL
+                WHERE singleton = 1 AND pid = ?
+                """,
+                (status, pid),
+            )
+            conn.commit()
+
+    def clear_worker_account(self, pid: int) -> None:
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE worker_runtime SET account_json = NULL, validation_json = NULL,
+                    monitor_status = 'STOPPED', heartbeat_at = datetime('now')
+                WHERE singleton = 1 AND pid = ?
+                """,
+                (pid,),
+            )
+            conn.commit()
+
+    def get_worker_runtime(self) -> Dict[str, Any]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM worker_runtime WHERE singleton = 1"
+            ).fetchone()
+        if row is None:
+            return {
+                "pid": None,
+                "status": "STOPPED",
+                "monitor_status": "STOPPED",
+                "alive": False,
+                "desired_monitoring": self.get_source_state(
+                    "system", "monitor_desired", "stopped"
+                ),
+            }
+        try:
+            account = json.loads(row["account_json"]) if row["account_json"] else None
+        except (ValueError, TypeError):
+            account = None
+        try:
+            validation = json.loads(row["validation_json"]) if row["validation_json"] else None
+        except (ValueError, TypeError):
+            validation = None
+        pid = row["pid"]
+        alive = self._pid_is_alive(pid)
+        status = row["status"]
+        if pid is not None and not alive and status in {"STARTING", "RUNNING", "STOPPING"}:
+            status = "ERROR"
+        return {
+            "pid": pid,
+            "alive": alive,
+            "status": status,
+            "monitor_status": row["monitor_status"] or "STOPPED",
+            "heartbeat_at": row["heartbeat_at"],
+            "started_at": row["started_at"],
+            "last_error": row["last_error"],
+            "account": account,
+            "validation": validation,
+            "last_scan_at": row["last_scan_at"],
+            "desired_monitoring": self.get_source_state(
+                "system", "monitor_desired", "stopped"
+            ),
+        }
+
+    def enqueue_worker_command(self, command: str, arguments: Optional[Dict[str, Any]] = None) -> str:
+        command_id = str(uuid4())
+        with self._get_conn() as conn:
+            conn.execute(
+                "INSERT INTO worker_commands (id, command, arguments_json) VALUES (?, ?, ?)",
+                (command_id, command, json.dumps(arguments or {})),
+            )
+            conn.commit()
+        return command_id
+
+    def claim_worker_commands(self, limit: int = 10) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT * FROM worker_commands WHERE status = 'PENDING' "
+                "ORDER BY created_at LIMIT ?",
+                (max(1, min(int(limit), 50)),),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                conn.execute(
+                    "UPDATE worker_commands SET status = 'RUNNING', updated_at = datetime('now') "
+                    "WHERE id = ? AND status = 'PENDING'",
+                    (row["id"],),
+                )
+                claimed.append({
+                    "id": row["id"],
+                    "command": row["command"],
+                    "arguments": json.loads(row["arguments_json"] or "{}"),
+                })
+            conn.commit()
+        return claimed
+
+    def recover_worker_commands(self) -> int:
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "UPDATE worker_commands SET status = 'PENDING', updated_at = datetime('now') "
+                "WHERE status = 'RUNNING' AND command != 'SHUTDOWN'"
+            )
+            conn.execute(
+                "UPDATE worker_commands SET status = 'ERROR', "
+                "updated_at = datetime('now'), error = 'Worker exited before shutdown completed' "
+                "WHERE status = 'RUNNING' AND command = 'SHUTDOWN'"
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    def complete_worker_command(
+        self, command_id: str, *, result: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE worker_commands SET status = ?, updated_at = datetime('now'),
+                    result_json = ?, error = ? WHERE id = ?
+                """,
+                (
+                    "ERROR" if error else "COMPLETED",
+                    json.dumps(result) if result is not None else None,
+                    str(error)[:300] if error else None,
+                    command_id,
+                ),
+            )
+            conn.commit()
+
+    def get_worker_command(self, command_id: str) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM worker_commands WHERE id = ?", (command_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            result = json.loads(row["result_json"]) if row["result_json"] else None
+        except (ValueError, TypeError):
+            result = None
+        return {"status": row["status"], "result": result, "error": row["error"]}
 
     def set_source_state(self, source: str, key: str, value: Any) -> None:
         """Persist a collector cursor/value (idempotent)."""

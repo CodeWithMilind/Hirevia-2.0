@@ -1,6 +1,6 @@
 # Ubuntu VPS Deployment
 
-Hirevia runs as one supervised application service. The FastAPI dashboard and monitor task share one process, but the monitor is an independent backend task: closing a browser never stops it. The desired monitor state is stored in SQLite. A first install starts STOPPED; after an explicit Start Monitor, a service restart attempts to restore monitoring after Telegram session and channel validation.
+Hirevia runs as two independently supervised services. The FastAPI dashboard sends durable commands through SQLite; `hirevia-worker.service` owns the Telethon client, collector, queue processing, AI matching, and job persistence. Restarting the web service does not stop the worker. The worker uses a database PID lease to reject duplicate processes, and desired monitor state remains in SQLite. A first install starts STOPPED; previously running monitoring resumes after reboot.
 
 ## Install
 
@@ -33,13 +33,15 @@ sudo chmod 600 /etc/hirevia/hirevia.env
 Install the service and start it:
 
 ```bash
-sudo install -o root -g root -m 644 /opt/hirevia/deploy/hirevia.service /etc/systemd/system/hirevia.service
+sudo install -o root -g root -m 644 /opt/hirevia/deploy/hirevia-worker.service /etc/systemd/system/hirevia-worker.service
+sudo install -o root -g root -m 644 /opt/hirevia/deploy/hirevia-web.service /etc/systemd/system/hirevia-web.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now hirevia
-sudo systemctl status hirevia
+sudo systemctl enable --now hirevia-worker.service
+sudo systemctl enable --now hirevia-web.service
+sudo systemctl status hirevia-worker.service hirevia-web.service
 ```
 
-The service binds to `127.0.0.1:8000`. Reach it through an SSH tunnel:
+The web service binds to `127.0.0.1:8000`. Reach it through an SSH tunnel:
 
 ```bash
 ssh -L 8000:127.0.0.1:8000 hirevia-vps
@@ -49,17 +51,18 @@ Then open `http://127.0.0.1:8000`. For public access, retain the loopback bind a
 
 ## Monitor controls and recovery
 
-On a new install the monitor is stopped. Log into Telegram in the dashboard, wait for channel validation to finish, then select **Start Monitor**. Select **Stop Monitor** to stop collection without logging out. The desired state is stored in the jobs database; `systemctl restart hirevia` or a VPS reboot resumes a previously running monitor, but leaves a manually stopped monitor stopped. Logout clears the desired running state and removes the dedicated Telethon session.
+On a new install the monitor is stopped. Log into Telegram in the dashboard, wait for channel validation to finish, then select **Start Monitor**. Select **Stop Monitor** to stop collection without logging out. The desired state is stored in the shared jobs database; restarting either service or rebooting the VPS resumes a previously running monitor, but leaves a manually stopped monitor stopped. Logout clears desired running state and removes the dedicated Telethon session.
 
 Use the dashboard Logs page to download the current or rotated application log. The log directory is `/var/log/hirevia`; database and Telegram session files remain under `/var/lib/hirevia` and are separate.
 
 Operational commands:
 
 ```bash
-sudo systemctl restart hirevia
-sudo systemctl stop hirevia
-sudo systemctl start hirevia
-sudo journalctl -u hirevia -n 100 --no-pager
+sudo systemctl restart hirevia-web.service
+sudo systemctl restart hirevia-worker.service
+sudo systemctl stop hirevia-worker.service
+sudo systemctl start hirevia-worker.service
+sudo journalctl -u hirevia-worker.service -n 100 --no-pager
 ```
 
 The journal contains concise service output. Rotating application logs are managed by Hirevia and downloadable from the authorized Logs API.
@@ -71,7 +74,7 @@ Back up the database and configuration before replacing application code. Keep `
 ```bash
 sudo -u hirevia /opt/hirevia/.venv/bin/pip install -r /opt/hirevia/requirements.txt
 sudo -u hirevia /opt/hirevia/.venv/bin/pip install -e /opt/hirevia
-sudo systemctl restart hirevia
+sudo systemctl restart hirevia-worker.service hirevia-web.service
 ```
 
-The current worker runs in the supervised application process rather than a separate OS service. A service crash interrupts in-flight work; pending queue records are recovered from SQLite on restart, and source cursors replay updates that were not durably committed.
+The worker checkpoints its durable queue before shutdown. A worker crash returns in-flight queue claims to QUEUED on restart; Telegram cursors replay updates that were not committed.

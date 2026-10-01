@@ -265,6 +265,7 @@ def _run_web_service(host: Optional[str] = None, port: Optional[int] = None) -> 
     repo = JobRepository(Path(os.getenv("HIREVIA_DB_PATH", "hirevia.db")))
     matcher = _build_ai_matcher(config)
     state = initialize_web_state(config, repo, matcher)
+    state.external_worker = True
     from hirevia.web.main import app
 
     app.state.auto_start_monitoring = False
@@ -287,6 +288,20 @@ def _run_web_service(host: Optional[str] = None, port: Optional[int] = None) -> 
 def web(host: Optional[str], port: Optional[int]) -> None:
     """Run the web interface for administration or debugging."""
     run_service(host, port)
+
+
+@cli.command("worker")
+def worker_service() -> None:
+    """Run the independently supervised Telegram monitor worker."""
+    configure_logging()
+    from hirevia.worker import run_worker
+
+    exit_code = asyncio.run(run_worker())
+    if exit_code == 2:
+        click.echo("A Hirevia worker is already running", err=True)
+        raise click.exceptions.Exit(2)
+    if exit_code:
+        raise click.ClickException(f"Worker exited with status {exit_code}")
 
 
 @cli.command()
