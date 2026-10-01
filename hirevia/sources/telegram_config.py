@@ -11,7 +11,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -112,6 +112,7 @@ class TelegramSettings(BaseModel):
 
     enabled: bool = True
     channels: List[TelegramChannel] = Field(default_factory=list)
+    community_destinations: Dict[str, str] = Field(default_factory=dict)
 
     def get_enabled_channels(self) -> List[TelegramChannel]:
         return [c for c in self.channels if c.enabled]
@@ -160,4 +161,9 @@ def load_telegram_settings(path: Optional[Path] = None) -> TelegramSettings:
     return TelegramSettings(
         enabled=bool(section.get("enabled", True)),
         channels=channels,
+        community_destinations={
+            str(priority).upper(): str(destination)
+            for priority, destination in (section.get("community_destinations") or {}).items()
+            if destination
+        },
     )

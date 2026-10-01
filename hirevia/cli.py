@@ -1,9 +1,12 @@
 """CLI for Hirevia"""
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
+import re
+import socket
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -25,11 +28,39 @@ from hirevia.core.models import CandidateProfile, Job, ScanStats
 from hirevia.core.pipeline import Pipeline, run_single_scan
 from hirevia.core.verification import classify_application_url
 from hirevia.core.freshness import freshness_label
-from hirevia.notifications.telegram import TelegramNotifier
+from hirevia.notifications.telegram import PriorityTelegramNotifier, TelegramNotifier
 from hirevia.storage.state import JobRepository
+from hirevia.web.state import initialize_web_state
 
 console = Console()
 logger = logging.getLogger(__name__)
+LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s | %(message)s"
+
+
+def _redact_log_text(message: str) -> str:
+    """Remove configured secret values and secret-shaped assignments."""
+    secret_markers = ("API_KEY", "API_HASH", "BOT_TOKEN", "ADMIN_TOKEN", "PASSWORD", "OTP", "SECRET", "SESSION")
+    secret_values = sorted(
+        {
+            value
+            for name, value in os.environ.items()
+            if any(marker in name.upper() for marker in secret_markers) and value
+        },
+        key=len,
+        reverse=True,
+    )
+    for secret in secret_values:
+        message = message.replace(secret, "[REDACTED]")
+    return re.sub(
+        r"(?i)\b(api[_-]?key|api[_-]?hash|bot[_-]?token|admin[_-]?token|password|otp|secret|session)(\s*[:=]\s*)([^\s,;]+)",
+        r"\1\2[REDACTED]",
+        message,
+    )
+
+
+class _SecretRedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return _redact_log_text(super().format(record))
 
 
 def configure_logging(verbose: bool = False) -> None:
@@ -48,14 +79,18 @@ def configure_logging(verbose: bool = False) -> None:
         logging.getLogger(logger_name).setLevel(
             logging.DEBUG if level <= logging.DEBUG else logging.WARNING
         )
-    if not root.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        ))
-        root.addHandler(handler)
+    stream_handlers = [
+        handler for handler in root.handlers
+        if isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, logging.FileHandler)
+    ]
+    if not stream_handlers:
+        stream_handlers = [logging.StreamHandler()]
+        root.addHandler(stream_handlers[0])
     for handler in root.handlers:
         handler.setLevel(level)
+    for handler in stream_handlers:
+        handler.setFormatter(_SecretRedactingFormatter(LOG_FORMAT))
 
 
 class _MonitorLogFilter(logging.Filter):
@@ -146,24 +181,35 @@ def _build_notifier(config: Config, token: Optional[str], chat_id: Optional[str]
     """
     token = (token or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (chat_id or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    from hirevia.sources.telegram_config import load_telegram_settings
 
-    if not token:
+    destinations = load_telegram_settings().community_destinations
+
+    if not token and not destinations:
         try:
             token = (get_telegram_token() or "").strip()
         except (EOFError, KeyboardInterrupt):
             token = ""
-    if not chat_id:
+    if not chat_id and not destinations:
         try:
             chat_id = (click.prompt("Telegram chat ID", default=os.getenv("TELEGRAM_CHAT_ID", "")) or "").strip()
         except (EOFError, KeyboardInterrupt):
             chat_id = ""
 
-    if not token or not chat_id:
+    if not token or not (chat_id or destinations):
         console.print(
             "[yellow]Notifications skipped - provide a bot token and chat id via "
             "--telegram-token/--chat-id or TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID[/yellow]"
         )
         return None
+
+    if destinations:
+        return PriorityTelegramNotifier(
+            token,
+            destinations,
+            retry_attempts=config.notification_retry_attempts,
+            retry_delay=config.notification_retry_delay_seconds,
+        )
 
     return TelegramNotifier(
         token,
@@ -174,11 +220,105 @@ def _build_notifier(config: Config, token: Optional[str], chat_id: Optional[str]
 
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(version="2.0.0", prog_name="hirevia")
-def cli():
+@click.pass_context
+def cli(ctx):
     """Hirevia 2.0 - Autonomous Job Discovery Agent"""
-    pass
+    if ctx.invoked_subcommand is None:
+        run_service()
+
+
+def _port_owner(host: str, port: int) -> Optional[str]:
+    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            probe.bind((probe_host, port))
+            return None
+        except OSError:
+            pass
+    try:
+        request = Request(f"http://{probe_host}:{port}/health")
+        with urlopen(request, timeout=1) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload.get("service", "unknown")
+    except (OSError, ValueError, HTTPError, URLError):
+        return "unknown"
+
+
+def run_service(host: Optional[str] = None, port: Optional[int] = None) -> None:
+    """Start the shared core and web UI in one process."""
+    import uvicorn
+
+    configure_logging()
+    logger.info("Hirevia command center startup requested")
+    try:
+        _run_web_service(host, port)
+    except click.ClickException as error:
+        logger.error("Hirevia startup refused: %s", error)
+        raise
+    except Exception:
+        logger.exception("Hirevia startup or web server failed")
+        raise
+    finally:
+        logger.info("Hirevia launcher stopped")
+
+
+def _run_web_service(host: Optional[str] = None, port: Optional[int] = None) -> None:
+    import uvicorn
+
+    config = load_config()
+    host = host or os.getenv("HIREVIA_HOST", "127.0.0.1")
+    port = port or int(os.getenv("HIREVIA_PORT", "8000"))
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.casefold() == "localhost"
+    if not loopback and not os.getenv("HIREVIA_ADMIN_TOKEN", "").strip():
+        raise click.ClickException(
+            "Non-local web binding requires HIREVIA_ADMIN_TOKEN; use a TLS reverse proxy for remote access"
+        )
+    owner = _port_owner(host, port)
+    if owner:
+        if owner == "hirevia-web":
+            display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+            console.print(f"Hirevia is already running at http://{display_host}:{port}")
+            return
+        raise click.ClickException(
+            f"Port {port} is already occupied; set HIREVIA_PORT to another port"
+        )
+
+    repo = JobRepository(Path(os.getenv("HIREVIA_DB_PATH", "hirevia.db")))
+    matcher = _build_ai_matcher(config)
+    state = initialize_web_state(config, repo, matcher)
+    state.service_notifier_configured = bool(
+        os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")
+    )
+
+    from hirevia.web.main import app
+
+    app.state.auto_start_monitoring = False
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    console.print(Panel("[bold]HIREVIA[/bold]\nAI Opportunity Discovery Agent", width=44))
+    console.print("● Core       READY")
+    console.print(f"● Web        http://{display_host}:{port}")
+    telegram = "ENABLED" if config.sources.sources.get("telegram") and config.sources.sources["telegram"].enabled else "DISABLED"
+    console.print(f"● Telegram   {telegram}")
+    console.print(f"● AI         {config.ai.primary}")
+    console.print("● Agent      STOPPED")
+    console.print(f"\nHirevia is running.\nOpen: http://{display_host}:{port}\n\nPress Ctrl+C to stop.")
+    logger.info("Starting web server at http://%s:%d", display_host, port)
+    uvicorn.run(app, host=host, port=port, log_level="info", log_config=None)
+
+
+@cli.command()
+@click.option("--host", default=None, help="Bind address (or HIREVIA_HOST)")
+@click.option("--port", type=int, default=None, help="Web port (or HIREVIA_PORT)")
+def web(host: Optional[str], port: Optional[int]) -> None:
+    """Run the web interface for administration or debugging."""
+    run_service(host, port)
 
 
 @cli.command()

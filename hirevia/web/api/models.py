@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from enum import Enum
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, SecretStr
 
 
 class SystemStatus(str, Enum):
@@ -50,6 +50,7 @@ class SystemStatusResponse(BaseModel):
     scan_duration: Optional[float] = None
     scan_interval_minutes: int
     is_scanning: bool
+    is_running: bool
     sources: List[SourceInfo]
 
 
@@ -59,10 +60,26 @@ class ScanStatsResponse(BaseModel):
     jobs_new: int
     jobs_duplicate: int
     jobs_filtered: int
+    jobs_hard_filter_passed: int = 0
+    jobs_link_rejected: int = 0
+    jobs_matching_attempted: int = 0
+    jobs_ai_rejected: int = 0
     jobs_ai_matched: int
+    ai_failures: int = 0
+    jobs_matched: int = 0
+    jobs_below_match: int = 0
     jobs_verified: int
+    jobs_verification_attempted: int = 0
+    jobs_unverified: int = 0
+    jobs_closed: int = 0
+    jobs_notification_eligible: int = 0
     jobs_notified: int
+    jobs_skipped_notification: int = 0
+    jobs_failed: int = 0
     jobs_expired: int
+    priority_distribution: Dict[str, int] = Field(
+        default_factory=lambda: {"P1": 0, "P2": 0, "P3": 0}
+    )
     duration_seconds: float
     errors: List[str] = []
 
@@ -94,6 +111,7 @@ class JobResponse(BaseModel):
     experience: Optional[str] = None
     skills: List[str] = []
     application_status: JobStatus
+    saved: bool = False
     fingerprint: Optional[str] = None
     first_seen: Optional[str] = None
     last_seen: Optional[str] = None
@@ -151,3 +169,40 @@ class ConfigResponse(BaseModel):
     scan_interval_minutes: int
     enabled_sources: List[str]
     filters: Dict[str, Any]
+
+
+class SaveJobRequest(BaseModel):
+    saved: bool = True
+
+
+class ConfigFileRequest(BaseModel):
+    content: str
+
+
+class AISettingsRequest(BaseModel):
+    primary: str
+    model: str
+    base_url: Optional[str] = None
+    fallback: List[str] = Field(default_factory=list)
+    timeout_seconds: int = Field(default=20, ge=1, le=300)
+    api_key: Optional[SecretStr] = None
+
+
+class TelegramPhoneRequest(BaseModel):
+    phone_number: str = Field(min_length=7, max_length=24)
+
+
+class TelegramOTPRequest(BaseModel):
+    code: SecretStr
+
+
+class Telegram2FARequest(BaseModel):
+    password: SecretStr
+
+
+class CommunityDestinationsRequest(BaseModel):
+    destinations: Dict[str, str]
+
+
+class TelegramSourceUpdate(BaseModel):
+    enabled: bool

@@ -21,11 +21,11 @@ JOB_COLUMNS = [
     "deadline", "employment_type", "experience", "skills", "raw_data",
     "application_status", "fingerprint", "first_seen", "last_seen",
     "expires_at", "notified_at", "notification_channel", "ai_decision",
-    "match_result",
+    "match_result", "saved", "deleted_at",
 ]
 
 # Columns never overwritten on the UPDATE path (identity + lifecycle anchors).
-UPSERT_IMMUTABLE_COLUMNS = {"id", "source", "source_job_id", "first_seen"}
+UPSERT_IMMUTABLE_COLUMNS = {"id", "source", "source_job_id", "first_seen", "saved", "deleted_at"}
 
 
 def _load_json(raw, expect: type):
@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     notification_channel TEXT,
     ai_decision TEXT,
     match_result TEXT,
+    saved INTEGER NOT NULL DEFAULT 0,
+    deleted_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -172,6 +174,8 @@ class JobRepository:
             expires_at=datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None,
             notified_at=datetime.fromisoformat(row["notified_at"]) if row["notified_at"] else None,
             notification_channel=row["notification_channel"],
+            saved=bool(row["saved"]) if "saved" in row.keys() else False,
+            deleted_at=datetime.fromisoformat(row["deleted_at"]) if "deleted_at" in row.keys() and row["deleted_at"] else None,
             ai_decision=json_col("ai_decision", dict),
             match_result=json_col("match_result", dict),
         )
@@ -204,6 +208,8 @@ class JobRepository:
             "expires_at": job.expires_at.isoformat() if job.expires_at else None,
             "notified_at": job.notified_at.isoformat() if job.notified_at else None,
             "notification_channel": job.notification_channel,
+            "saved": int(job.saved),
+            "deleted_at": job.deleted_at.isoformat() if job.deleted_at else None,
             "ai_decision": json.dumps(job.ai_decision) if job.ai_decision else None,
             # Phase 7: the canonical hybrid verdict (see MatchResult).
             "match_result": json.dumps(job.match_result) if job.match_result else None,
@@ -344,6 +350,24 @@ class JobRepository:
             )
             conn.commit()
 
+    def set_saved(self, job_id: str, saved: bool = True) -> bool:
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET saved = ? WHERE id = ? AND deleted_at IS NULL",
+                (int(saved), job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def soft_delete_job(self, job_id: str) -> bool:
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+                (datetime.utcnow().isoformat(), job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
     def expire_jobs(self) -> int:
         """Mark jobs past expires_at as expired. Returns count."""
         with self._get_conn() as conn:
@@ -352,24 +376,36 @@ class JobRepository:
                 UPDATE jobs
                 SET application_status = ?
                 WHERE expires_at IS NOT NULL
-                AND expires_at < datetime('now')
-                AND application_status = ?
+                AND julianday(expires_at) < julianday('now')
+                AND application_status IN (?, ?)
                 """,
-                (ApplicationStatus.EXPIRED.value, ApplicationStatus.OPEN.value),
+                (
+                    ApplicationStatus.EXPIRED.value,
+                    ApplicationStatus.OPEN.value,
+                    ApplicationStatus.UNKNOWN.value,
+                ),
             )
             conn.commit()
             return cursor.rowcount
 
-    def get_active_jobs(self, limit: int = 100) -> List[Job]:
+    def get_active_jobs(self, limit: int = 100, hours: Optional[int] = None) -> List[Job]:
+        age_clause = ""
+        params: Tuple[Any, ...] = ()
+        if hours is not None:
+            age_clause = "AND julianday(detected_at) >= julianday('now', ?)"
+            params = (f"-{hours} hours",)
         with self._get_conn() as conn:
             cursor = conn.execute(
-                """
+                f"""
                 SELECT * FROM jobs
                 WHERE application_status IN ('open', 'unknown')
+                AND deleted_at IS NULL
+                AND (expires_at IS NULL OR julianday(expires_at) >= julianday('now'))
+                {age_clause}
                 ORDER BY detected_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (*params, limit),
             )
             return [self._row_to_job(row) for row in cursor.fetchall()]
 

@@ -1,6 +1,6 @@
 # Hirevia 2.0
 
-A CLI-first autonomous job discovery agent that finds fresh, relevant job opportunities and delivers them to you via messaging channels.
+A web-first job discovery agent. The browser, CLI and background services use the same Hirevia pipeline, SQLite repository, configuration and Telegram integrations.
 
 ## Architecture
 
@@ -10,10 +10,10 @@ Discover → Extract → Normalize → Deduplicate → Freshness → Filter → 
 
 ## Features
 
-- **CLI-first** - No web dashboard, everything runs from terminal
+- **Web command center** - Browse and manage active opportunities, monitoring, AI providers and Telegram from a local browser
 - **YAML-based filtering** - User-editable filters for roles, locations, skills, experience
 - **Multi-source** - Company careers, ATS (Greenhouse, Lever, Ashby), job boards
-- **AI-powered relevance** - NVIDIA-hosted LLM for semantic job matching
+- **AI-powered relevance** - llama.cpp is the default primary provider; NVIDIA, Groq, Ollama and other configured OpenAI-compatible providers remain available
 - **Deduplication** - Multi-signal fingerprinting across sources
 - **24-hour active window** - Jobs auto-expire after 24 hours
 - **SQLite state** - Lightweight local storage
@@ -115,13 +115,13 @@ preferred_locations:
 
 ## Running
 
-### Start the agent
+### Start the command center
 
 ```bash
-python -m hirevia start
+python -m hirevia
 ```
 
-You'll be prompted for your NVIDIA API key (never stored, only in memory).
+Open `http://127.0.0.1:8000`. Monitoring starts stopped; start it from the Web UI. The compatible `python -m hirevia web` command is also available.
 
 ### Run a single scan
 
@@ -150,15 +150,18 @@ python -m hirevia status
 | `stats` | Show database statistics |
 | `status` | Show recent jobs and their status |
 | `sources` | List configured sources |
+| `monitor` | Continuously process Telegram channel messages |
+| `web` | Run the Web UI for administration or debugging |
+| `ai status`, `ai test`, `ai set-primary` | Inspect and manage AI providers |
 | `test` | Run self-tests |
 | `version` | Show version |
 
 ## Security
 
-- **NVIDIA API key**: Prompted at runtime, never written to disk
-- **Telegram token**: Prompted at runtime, never written to disk
-- **No secrets in logs**: API keys and tokens are redacted
-- **Local-only**: SQLite database stays on your machine
+- The web server binds to localhost by default. Non-local binding requires `HIREVIA_ADMIN_TOKEN`; API calls use bearer authentication and the browser prompts for the token.
+- Put the token in the server's `.env` file, keep it private, and put remote access behind a TLS reverse proxy. Do not expose an unauthenticated administrative interface directly to the internet.
+- API keys and Telegram API/session credentials are not returned by the web API. Keep `.env` and `sessions/` private and out of source control.
+- Set `HIREVIA_HOST` and `HIREVIA_PORT` to configure the bind address and port. For example, a reverse proxy may connect to a loopback-bound Hirevia server on the VPS.
 
 ## Project Structure
 

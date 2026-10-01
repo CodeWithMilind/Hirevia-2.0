@@ -1,10 +1,10 @@
 ai:
   enabled: true
-  primary: nvidia
+  primary: llamacpp
   fallback:
+    - nvidia
     - groq
     - ollama
-    - llamacpp
   timeout_seconds: 20
   max_retries: 1
   cooldown_seconds: 120

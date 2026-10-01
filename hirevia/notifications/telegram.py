@@ -87,6 +87,30 @@ class TelegramNotifier(Notifier):
         await self.client.aclose()
 
 
+class PriorityTelegramNotifier(Notifier):
+    """Route scored alerts to the configured Telegram community destination."""
+
+    name = "telegram"
+
+    def __init__(self, bot_token: str, destinations: dict[str, str], **options):
+        self.notifiers = {
+            priority: TelegramNotifier(bot_token, chat_id, **options)
+            for priority, chat_id in destinations.items()
+            if priority in {"P1", "P2", "P3"} and chat_id
+        }
+
+    async def send(self, job: Job, decision: NotificationDecision) -> bool:
+        priority = job.verdict().get("priority")
+        if not priority:
+            priority = getattr(decision, "priority", "")
+        priority = getattr(priority, "value", priority).upper()
+        notifier = self.notifiers.get(priority)
+        return await notifier.send(job, decision) if notifier else False
+
+    async def close(self):
+        await asyncio.gather(*(notifier.close() for notifier in self.notifiers.values()))
+
+
 def _retry_after(response) -> float:
     """Seconds Telegram asks us to wait, capped so a scan cannot stall."""
     try:

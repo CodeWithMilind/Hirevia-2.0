@@ -6,6 +6,7 @@ fake Telethon client to verify cursor + lookback behaviour.
 """
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -209,6 +210,20 @@ def test_channel_failure_isolated():
     })
     jobs = asyncio.run(src.collect())
     assert [j.raw_data["source_channel"] for j in jobs] == ["jobs_alpha"]
+
+
+def test_channel_collection_exception_is_logged_with_traceback(caplog):
+    two_channel_yaml()
+    src = make_source({
+        "jobs_alpha": RuntimeError("mock channel failure"),
+        "jobs_beta": [],
+    })
+
+    with caplog.at_level(logging.ERROR, logger="hirevia.sources.telegram_source"):
+        asyncio.run(src.collect())
+
+    failure = next(record for record in caplog.records if "Channel jobs_alpha failed" in record.message)
+    assert failure.exc_info is not None
 
 
 def test_flood_wait_does_not_crash_scan():

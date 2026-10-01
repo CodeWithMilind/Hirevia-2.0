@@ -282,7 +282,7 @@ class TelegramSource(JobSource):
             return []
         except Exception as e:
             self._last_collection_failed = True
-            logger.error("%s Connection failed: %s", PREFIX, _safe_err(e))
+            logger.error("%s Connection failed: %s", PREFIX, _safe_err(e), exc_info=True)
             return []
 
         jobs: List[Job] = []
@@ -319,7 +319,10 @@ class TelegramSource(JobSource):
                 continue
             except Exception as e:
                 self._last_collection_failed = True
-                logger.error("%s Channel %s failed: %s - continuing", PREFIX, channel.username, _safe_err(e))
+                logger.error(
+                    "%s Channel %s failed: %s - continuing",
+                    PREFIX, channel.username, _safe_err(e), exc_info=True,
+                )
                 continue
 
             messages_checked += len(messages)

@@ -740,7 +740,7 @@ def test_ai_status_reports_configuration_without_secrets(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "Hirevia AI Providers" in result.output
-    assert "NVIDIA (primary)" in result.output
+    assert "LLAMACPP (primary)" in result.output
     assert "GROQ" in result.output and "configured" in result.output
     assert "groq-CANARY-do-not-print" not in result.output
 

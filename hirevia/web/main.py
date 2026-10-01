@@ -1,11 +1,13 @@
 """FastAPI application for Hirevia Web Control Panel"""
 
 import logging
+import hmac
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from hirevia.web.api.routes import router as api_router
@@ -25,11 +27,15 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting Hirevia Web UI")
     state = get_web_state()
+    await state.reset_telegram_auth_for_startup()
+    if getattr(app.state, "auto_start_monitoring", False):
+        await state.start_scanner()
     yield
     # Shutdown
     logger.info("Shutting down Hirevia Web UI")
     if state.is_running:
         await state.stop_scanner()
+    await state._close_telegram_clients()
 
 
 app = FastAPI(
@@ -38,6 +44,22 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def require_admin_token(request, call_next):
+    expected = (os.getenv("HIREVIA_ADMIN_TOKEN") or "").strip()
+    if expected and request.url.path.startswith("/api/"):
+        authorization = request.headers.get("authorization", "")
+        scheme, _, supplied = authorization.partition(" ")
+        if scheme.casefold() != "bearer" or not hmac.compare_digest(supplied, expected):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "A valid Hirevia admin token is required"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return await call_next(request)
+
 
 # Include API routes
 app.include_router(api_router, prefix="/api")

@@ -54,6 +54,8 @@ class Job(BaseModel):
     expires_at: Optional[datetime] = None
     notified_at: Optional[datetime] = None
     notification_channel: Optional[str] = None
+    saved: bool = False
+    deleted_at: Optional[datetime] = None
     ai_decision: Optional[Dict[str, Any]] = None
     # Phase 7: the combined deterministic+AI match verdict (see MatchResult).
     # Stored as a plain dict so the schema stays a single JSON column.
@@ -505,5 +507,8 @@ class ScanStats(BaseModel):
     jobs_skipped_notification: int = 0
     jobs_expired: int = 0
     jobs_failed: int = 0
+    priority_distribution: Dict[str, int] = Field(
+        default_factory=lambda: {"P1": 0, "P2": 0, "P3": 0}
+    )
     errors: List[str] = Field(default_factory=list)
     duration_seconds: float = 0.0

@@ -7,6 +7,7 @@ network access happens.
 """
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -178,6 +179,58 @@ def test_scan_alerts_only_the_apply_ready_job(repo):
     assert alerted.raw_data["freshness_label"]
     assert str(alerted.url).startswith("https://t.me/")
     assert str(alerted.application_url).startswith("https://boards.greenhouse.io/")
+
+
+def test_scan_logs_collection_matching_priorities_and_notification(repo, caplog):
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/1")
+    source = FakeSource([job], counters={"messages_checked": 4, "jobs_detected": 1})
+    notifier = FakeNotifier()
+    pipeline = build_pipeline([source], repo, FakeMatcher(), notifier)
+
+    with caplog.at_level(logging.INFO, logger="hirevia.core.pipeline"):
+        stats = run(pipeline)
+
+    assert stats.jobs_matched == 1
+    assert stats.jobs_notified == 1
+    assert "Source collection started: 1 source(s): telegram" in caplog.text
+    assert "Source telegram collection started" in caplog.text
+    assert "Source telegram collected 1 job(s)" in caplog.text
+    assert "AI request started for 'Backend Developer'" in caplog.text
+    assert "Matching completed for 'Backend Developer'" in caplog.text
+    assert "Priority distribution: P1=0 P2=1 P3=0" in caplog.text
+    assert stats.priority_distribution == {"P1": 0, "P2": 1, "P3": 0}
+    assert "Stage 7: alerted 'Backend Developer'" in caplog.text
+    assert "Scan finished" in caplog.text
+
+
+def test_scan_logs_collector_failures_with_tracebacks(repo, caplog):
+    source = FakeSource(error=RuntimeError("collector unavailable"))
+    pipeline = build_pipeline([source], repo)
+
+    with caplog.at_level(logging.INFO, logger="hirevia.core.pipeline"):
+        stats = run(pipeline)
+
+    failure = next(record for record in caplog.records if "Source telegram failed" in record.message)
+    assert stats.jobs_failed == 0
+    assert failure.exc_info is not None
+
+
+def test_ai_provider_failures_are_visible_in_scan_logs(repo, caplog):
+    class FailedMatcher:
+        provider_name = "mock-provider"
+        model = "mock-model"
+
+        async def match(self, job, profile):
+            return AIResponse.failure("mock provider timeout")
+
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/1")
+    pipeline = build_pipeline([FakeSource([job])], repo, FailedMatcher())
+
+    with caplog.at_level(logging.WARNING, logger="hirevia.core.pipeline"):
+        stats = run(pipeline)
+
+    assert stats.ai_failures == 1
+    assert "AI provider failed for 'Backend Developer' (mock provider timeout)" in caplog.text
 
 
 def test_missing_application_url_is_stored_but_never_matched_or_alerted(repo):

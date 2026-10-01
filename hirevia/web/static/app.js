@@ -1,759 +1,698 @@
-/* ============================================================
-   Hirevia 2.0 — Web Control Panel
-   Phase 3+4: API integration + Jobs search / filters / pagination /
-   job details modal (vanilla JS, no framework)
-
-   All data comes from the FastAPI API (hirevia/web/api/routes.py).
-   GET /api/jobs supports search / source / status / min_match /
-   location / limit / offset — filtering runs server-side, the client
-   only builds the query string.
-
-   NOT wired yet (later phases):
-     - Start / Stop / Scan Now buttons  -> Phase 5
-     - Telegram controls -> Phase 6
-   ============================================================ */
 "use strict";
 
-/* ---------------- Application state ---------------- */
-const state = {
-  status: null, // payload of GET /api/status
-  stats: null, // payload of GET /api/stats
-  sources: [], // payload of GET /api/sources
-  jobs: [], // payload of GET /api/jobs -> jobs[]
-  jobsTotal: 0,
-  activity: [], // payload of GET /api/activity
-  backendOnline: null, // null = not tried yet, then true/false
-};
-
-const ACTIVITY_LIMIT = 50;
-const JOBS_PAGE_SIZE = 20;
-
-/* Jobs list view state — drives the GET /api/jobs query string.
-   Row order comes from the backend: detected_at DESC (newest first). */
-const jobView = {
-  search: "",
-  source: "",
-  status: "",
-  minMatch: "",
-  location: "",
-  page: 0,
-  limit: JOBS_PAGE_SIZE,
-};
-
-let jobsRequestSeq = 0; // guards against stale responses after a view change
-let searchDebounceTimer = null;
-const knownLocations = new Set(); // accumulates location filter options
-let sourceOptionsSig = "";
-let locationOptionsSig = "";
-
-/* ---------------- Small DOM helpers ---------------- */
 const $ = (id) => document.getElementById(id);
+const state = { priority: "", search: "", page: 0, limit: 25, total: 0, jobs: [], status: null, configFile: null, ai: null, telegram: null, telegramMembership: null };
+let searchTimer;
+let toastTimer;
+let adminTokenPrompt;
+let telegramResendTimer;
 
-function el(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined && text !== null) node.textContent = String(text);
-  return node;
+function node(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined && text !== null) element.textContent = String(text);
+  return element;
 }
 
-function setText(id, value) {
-  const node = $(id);
-  if (node) node.textContent = String(value);
-}
-
-function emptyState(icon, message) {
-  const box = el("div", "empty-state");
-  box.appendChild(el("div", "empty-icon", icon));
-  box.appendChild(el("div", null, message));
-  return box;
-}
-
-/* ---------------- Formatting helpers ----------------
-   The backend emits naive UTC ISO strings (datetime.utcnow().isoformat()),
-   so append "Z" when no timezone suffix is present. */
-
-function parseServerDate(iso) {
-  if (!iso) return null;
-  const hasTz = /Z|[+-]\d{2}:?\d{2}$/i.test(iso);
-  const d = new Date(hasTz ? iso : iso + "Z");
-  return isNaN(d.getTime()) ? null : d;
-}
-
-function fmtClock(iso) {
-  const d = parseServerDate(iso);
-  if (!d) return "—";
-  return d.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
+async function api(path, options = {}, promptForToken = true) {
+  const token = sessionStorage.getItem("hireviaAdminToken");
+  const response = await fetch(path, {
+    ...options,
+    headers: { Accept: "application/json", ...(options.body ? { "Content-Type": "application/json" } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.headers || {}) },
   });
-}
-
-function fmtRelative(iso) {
-  const d = parseServerDate(iso);
-  if (!d) return null;
-  const delta = Math.round((Date.now() - d.getTime()) / 1000); // + = past
-  const abs = Math.abs(delta);
-  let label;
-  if (abs < 10) return "now";
-  if (abs < 60) label = abs + "s";
-  else if (abs < 3600) label = Math.floor(abs / 60) + "m";
-  else if (abs < 86400) label = Math.floor(abs / 3600) + "h";
-  else label = Math.floor(abs / 86400) + "d";
-  return delta > 0 ? label + " ago" : "in " + label;
-}
-
-function fmtDuration(seconds) {
-  if (seconds === null || seconds === undefined) return "—";
-  const s = Math.max(0, Math.round(Number(seconds) || 0));
-  if (s < 60) return s + "s";
-  return Math.floor(s / 60) + "m " + (s % 60) + "s";
-}
-
-function capitalize(str) {
-  if (!str) return str;
-  return str.charAt(0) + str.slice(1).toLowerCase();
-}
-
-function fmtDateTime(iso) {
-  const d = parseServerDate(iso);
-  if (!d) return null;
-  return d.toLocaleString([], {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-/* Decode HTML entities / strip markup from untrusted job descriptions.
-   A <textarea> only parses text + entities (never executes markup),
-   so this is injection-safe. */
-function stripHtml(html) {
-  if (!html) return "";
-  const t = document.createElement("textarea");
-  t.innerHTML = String(html);
-  return t.value
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/* ---------------- API client ---------------- */
-
-async function apiRequest(path, timeoutMs = 8000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(path, {
-      headers: { Accept: "application/json" },
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      let detail = "HTTP " + res.status;
-      try {
-        const body = await res.json();
-        if (body && body.detail) detail = String(body.detail);
-      } catch (_) {
-        /* body was not JSON — keep the status text */
-      }
-      throw new Error(detail);
+  if (response.status === 401 && promptForToken) {
+    sessionStorage.removeItem("hireviaAdminToken");
+    adminTokenPrompt ||= Promise.resolve(window.prompt("Hirevia admin token"));
+    const entered = await adminTokenPrompt;
+    adminTokenPrompt = null;
+    if (entered) {
+      sessionStorage.setItem("hireviaAdminToken", entered);
+      return api(path, options, false);
     }
-    return await res.json();
-  } catch (err) {
-    if (err && err.name === "AbortError") throw new Error("Request timed out");
-    if (err instanceof TypeError) {
-      // fetch() rejects with TypeError on network-level failure
-      throw new Error("Unable to connect to Hirevia backend");
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
   }
+  let payload = null;
+  try { payload = await response.json(); } catch (_) { /* retain status text */ }
+  if (!response.ok) throw new Error(payload?.detail || `HTTP ${response.status}`);
+  return payload;
 }
 
-const api = {
-  getStatus: () => apiRequest("/api/status"),
-  getStats: () => apiRequest("/api/stats"),
-  getSources: () => apiRequest("/api/sources"),
-  getJobs: () => apiRequest("/api/jobs?" + buildJobsQuery()),
-  getJob: (jobId) => apiRequest("/api/jobs/" + encodeURIComponent(jobId)),
-  getActivity: (limit = ACTIVITY_LIMIT) =>
-    apiRequest("/api/activity?limit=" + limit),
-};
-
-/* ---------------- Renderers ---------------- */
-
-function renderStatusBadge() {
-  const badge = $("statusBadge");
-  if (!badge) return;
-  if (state.backendOnline === false) {
-    badge.textContent = "● OFFLINE";
-    badge.className = "status-badge status-error";
-    return;
-  }
-  const status = state.status ? state.status.status : null;
-  if (!status) {
-    badge.textContent = "● CONNECTING";
-    badge.className = "status-badge";
-    return;
-  }
-  badge.textContent = "● " + status;
-  badge.className = "status-badge status-" + status.toLowerCase();
+function notify(message) {
+  const toast = $("toast");
+  toast.textContent = message;
+  toast.classList.add("visible");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove("visible"), 3200);
 }
 
-function renderStatusPanel() {
-  const s = state.status;
-  if (!s) return;
-  setText("sysStatus", capitalize(s.status));
-  setText("sysOperation", s.current_operation || "—");
-
-  const last = s.last_scan
-    ? fmtClock(s.last_scan) +
-      (fmtRelative(s.last_scan) ? " · " + fmtRelative(s.last_scan) : "")
-    : "Never";
-  setText("sysLastScan", last);
-
-  const next = s.next_scan
-    ? fmtClock(s.next_scan) +
-      (fmtRelative(s.next_scan) ? " · " + fmtRelative(s.next_scan) : "")
-    : "—";
-  setText("sysNextScan", next);
-
-  setText("sysScanDuration", fmtDuration(s.scan_duration));
-  setText("sysInterval", (s.scan_interval_minutes ?? "—") + " min");
+function relativeTime(value) {
+  if (!value) return "Unknown";
+  const date = new Date(/Z|[+-]\d{2}:?\d{2}$/i.test(value) ? value : `${value}Z`);
+  if (Number.isNaN(date.getTime())) return "Unknown";
+  const minutes = Math.max(0, Math.floor((Date.now() - date.getTime()) / 60000));
+  if (minutes < 1) return "Just now";
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  return `${Math.floor(hours / 24)} days ago`;
 }
 
-function renderStats() {
-  const st = state.stats;
-  if (!st) return;
-  setText("statJobsFound", st.jobs_found ?? 0);
-  setText("statNewJobs", st.jobs_new ?? 0);
-  setText("statAIMatches", st.jobs_ai_matched ?? 0);
-  setText("statNotified", st.jobs_notified ?? 0);
-  setText("statExpired", st.jobs_expired ?? 0);
-  setText("statDuration", fmtDuration(st.duration_seconds));
+function expiresLabel(value) {
+  if (!value) return "";
+  const date = new Date(/Z|[+-]\d{2}:?\d{2}$/i.test(value) ? value : `${value}Z`);
+  const minutes = Math.max(0, Math.floor((date.getTime() - Date.now()) / 60000));
+  if (!Number.isFinite(minutes)) return "";
+  return minutes >= 60 ? `Expires in ${Math.floor(minutes / 60)}h ${minutes % 60}m` : `Expires in ${minutes}m`;
 }
 
-function sourceStatusClass(source) {
-  if (source.enabled === false) return "disabled";
-  const map = {
-    active: "active",
-    warning: "warning",
-    error: "error",
-    failed: "error",
-  };
-  // scanning / unknown / anything new -> neutral (no color modifier)
-  return map[String(source.status || "").toLowerCase()] || "";
-}
-
-function renderSources() {
-  const list = $("sourceList");
-  if (!list) return;
-  list.replaceChildren();
-  if (!state.sources.length) {
-    list.appendChild(emptyState("🔌", "No sources enabled"));
-    return;
-  }
-  for (const source of state.sources) {
-    const item = el("div", "source-item");
-    if (source.last_error) item.title = String(source.last_error);
-
-    const left = el("div");
-    left.appendChild(el("div", "source-name", source.name));
-    left.appendChild(
-      el(
-        "div",
-        "source-stats",
-        (source.jobs_collected ?? 0) +
-          " jobs" +
-          (source.last_error ? " · last error — hover" : "")
-      )
-    );
-    item.appendChild(left);
-
-    const label =
-      source.enabled === false
-        ? "disabled"
-        : source.status
-        ? String(source.status).toLowerCase()
-        : "unknown";
-    item.appendChild(
-      el("span", "source-status " + sourceStatusClass(source), label)
-    );
-    list.appendChild(item);
-  }
-}
-
-function matchBadgeClass(score) {
-  if (score >= 70) return "match-high";
-  if (score >= 40) return "match-medium";
-  return "match-low";
-}
-
-function jobFreshnessLabel(job) {
-  if (job.freshness_minutes !== null && job.freshness_minutes !== undefined) {
-    const m = job.freshness_minutes;
-    if (m < 1) return "just now";
-    if (m < 60) return m + "m ago";
-    if (m < 1440) return Math.floor(m / 60) + "h ago";
-    return Math.floor(m / 1440) + "d ago";
-  }
-  const rel = fmtRelative(job.detected_at);
-  return rel && rel !== "now" ? rel : null;
+function setActiveView(name, refresh = true) {
+  document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === `view-${name}`));
+  document.querySelectorAll(".nav-item[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === name && (name !== "telegram" || button.classList.contains("sub-item"))));
+  const titles = { jobs: "Jobs", telegram: "Telegram", ai: "AI & Models", config: "Configuration", logs: "Logs", system: "System" };
+  $("pageTitle").textContent = titles[name] || "Jobs";
+  $("shell").classList.remove("mobile-open");
+  if (name === "telegram" && refresh) loadTelegram();
+  if (name === "ai") loadAI();
+  if (name === "config") loadConfigFiles();
+  if (name === "logs") loadActivity();
+  if (name === "system") loadStatus();
 }
 
 function jobCard(job) {
-  const card = el("div", "job-card");
-  card.dataset.jobId = job.id || "";
-  card.title = "View details";
-  card.addEventListener("click", () => openJobModal(job.id));
-
-  const header = el("div", "job-card-header");
-  const heading = el("div");
-  heading.appendChild(el("div", "job-title", job.title || "Untitled"));
-  heading.appendChild(
-    el("div", "job-company", job.company || "Unknown company")
-  );
-  header.appendChild(heading);
-
-  const right = el("div");
-  right.style.cssText =
-    "display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0;";
-  if (typeof job.match_score === "number") {
-    right.appendChild(
-      el(
-        "span",
-        "match-badge " + matchBadgeClass(job.match_score),
-        job.match_score + "%"
-      )
-    );
+  const card = node("article", "job-card");
+  const priority = String(job.match_priority || "").toUpperCase();
+  const marker = node("span", `priority-mark ${priority.toLowerCase()}`, priority || "—");
+  card.append(marker);
+  const details = node("div", "job-main");
+  details.append(node("div", "job-title", job.title || "Untitled role"));
+  details.append(node("div", "job-company", [job.company, job.location].filter(Boolean).join(" · ") || "Company not listed"));
+  const meta = node("div", "job-meta");
+  [job.experience, job.employment_type?.replaceAll("_", " "), job.source, relativeTime(job.detected_at), expiresLabel(job.expires_at)].filter(Boolean).forEach((text) => meta.append(node("span", "", text)));
+  details.append(meta);
+  const skills = Array.isArray(job.matched_skills) && job.matched_skills.length ? job.matched_skills : job.skills;
+  if (Array.isArray(skills) && skills.length) {
+    const tags = node("div", "job-skills");
+    skills.slice(0, 5).forEach((skill) => tags.append(node("span", "skill-tag", skill)));
+    details.append(tags);
   }
-  const status = String(job.application_status || "unknown").toLowerCase();
-  const statusClass = ["open", "closed", "expired", "unknown"].includes(status)
-    ? status
-    : "unknown";
-  right.appendChild(el("span", "job-status-badge " + statusClass, statusClass));
-  header.appendChild(right);
-  card.appendChild(header);
+  card.append(details);
 
-  const meta = el("div", "job-meta");
-  const addMeta = (text) => {
-    if (text) meta.appendChild(el("span", "job-meta-item", text));
-  };
-  addMeta(job.source ? "🌐 " + String(job.source).toUpperCase() : null);
-  addMeta(job.location ? "📍 " + job.location : null);
-  addMeta(job.employment_type ? "💼 " + job.employment_type : null);
-  addMeta(job.experience ? "⏳ " + job.experience : null);
-  const freshness = jobFreshnessLabel(job);
-  addMeta(freshness ? "🕒 " + freshness : null);
-  if (meta.childNodes.length) card.appendChild(meta);
-
-  const skills = Array.isArray(job.skills) ? job.skills.slice(0, 5) : [];
-  if (skills.length) {
-    const row = el("div", "job-skills");
-    for (const skill of skills) row.appendChild(el("span", "skill-tag", skill));
-    card.appendChild(row);
-  }
-
+  const side = node("div", "job-side");
+  side.append(node("span", "match-score", typeof job.match_score === "number" ? `${job.match_score}% match` : "Not scored"));
+  side.append(node("span", "application-state", job.application_status || "unknown"));
+  const actions = node("div", "job-actions");
+  const view = node("button", "text-action", "View");
+  view.type = "button";
+  view.addEventListener("click", () => showJob(job));
+  const apply = node("a", "text-action", "Apply ↗");
+  apply.href = job.application_url || job.url || "#";
+  apply.target = "_blank";
+  apply.rel = "noopener";
+  apply.addEventListener("click", (event) => event.stopPropagation());
+  const save = node("button", "text-action", job.saved ? "Saved" : "Save");
+  save.type = "button";
+  save.addEventListener("click", () => saveJob(job.id, !job.saved));
+  const remove = node("button", "text-action delete", "Delete");
+  remove.type = "button";
+  remove.addEventListener("click", () => deleteJob(job.id));
+  actions.append(view, apply, save, remove);
+  side.append(actions);
+  card.append(side);
   return card;
 }
 
-function jobsFiltersActive() {
-  return Boolean(
-    jobView.search ||
-      jobView.source ||
-      jobView.status ||
-      jobView.minMatch ||
-      jobView.location
+async function loadJobs() {
+  const params = new URLSearchParams({ limit: String(state.limit), offset: String(state.page * state.limit) });
+  if (state.priority) params.set("priority", state.priority);
+  if (state.search) params.set("search", state.search);
+  const results = await api(`/api/jobs?${params}`);
+  state.jobs = results.jobs || [];
+  state.total = results.total || 0;
+  const feed = $("jobsList");
+  feed.replaceChildren();
+  if (!state.jobs.length) feed.append(node("div", "empty-state", state.search ? "No matching active opportunities." : "No active opportunities yet. Start monitoring or run a scan."));
+  else state.jobs.forEach((job) => feed.append(jobCard(job)));
+  $("feedCount").textContent = `${state.total} active opportunit${state.total === 1 ? "y" : "ies"}`;
+  const pages = Math.max(1, Math.ceil(state.total / state.limit));
+  $("pageInfo").textContent = `Page ${state.page + 1} of ${pages}`;
+  $("prevPage").disabled = state.page <= 0;
+  $("nextPage").disabled = state.page >= pages - 1;
+}
+
+async function loadCounts() {
+  const counts = await api("/api/job-counts");
+  $("countAll").textContent = counts.ALL || 0;
+  $("countP1").textContent = counts.P1 || 0;
+  $("countP2").textContent = counts.P2 || 0;
+  $("countP3").textContent = counts.P3 || 0;
+}
+
+async function loadStatus() {
+  const status = await api("/api/status");
+  state.status = status;
+  const badge = $("statusBadge");
+  badge.textContent = status.is_running ? "MONITORING" : "STOPPED";
+  badge.className = `topbar-status ${status.is_running ? "running" : "stopped"}`;
+  $("railStatus").textContent = status.status === "RUNNING" || status.status === "SCANNING" ? "Monitoring" : "Stopped";
+  $("railDot").classList.toggle("online", status.status === "RUNNING" || status.status === "SCANNING");
+  const telegramRequired = state.telegram?.telegram_enabled !== false;
+  const telegramReady = !telegramRequired || (
+    state.telegram?.connected && state.telegram?.validation_complete
   );
+  $("startButton").disabled = status.is_running || !telegramReady;
+  $("stopButton").disabled = !status.is_running;
+  $("systemAgent").textContent = status.is_running ? "Monitoring" : "Stopped";
+  $("systemOperation").textContent = status.current_operation || "Idle";
+  $("systemLastScan").textContent = status.last_scan ? relativeTime(status.last_scan) : "Never";
+  $("systemNextScan").textContent = status.next_scan ? relativeTime(status.next_scan) : "—";
+  $("systemInterval").textContent = `${status.scan_interval_minutes} minutes`;
+  $("systemSources").textContent = (status.sources || []).filter((source) => source.enabled).map((source) => source.name).join(", ") || "None enabled";
 }
 
-function renderJobs() {
-  const list = $("jobsList");
-  if (!list) return;
-  list.replaceChildren();
-  if (!state.jobs.length) {
-    list.appendChild(
-      emptyState(
-        "🔍",
-        jobsFiltersActive()
-          ? "No jobs match your search or filters."
-          : "No jobs found yet — start the scanner to collect jobs."
-      )
-    );
-  } else {
-    for (const job of state.jobs) list.appendChild(jobCard(job));
-  }
-  renderPagination();
-  updateFilterOptions();
-}
-
-function renderPagination() {
-  const pages = Math.max(1, Math.ceil(state.jobsTotal / jobView.limit));
-  if (jobView.page > pages - 1) jobView.page = pages - 1; // clamp after filtering
-  setText(
-    "pageInfo",
-    "Page " + (jobView.page + 1) + " of " + pages + " · " + state.jobsTotal + " jobs"
-  );
-  const prev = $("btnPrev");
-  const next = $("btnNext");
-  if (prev) prev.disabled = jobView.page <= 0;
-  if (next) next.disabled = jobView.page >= pages - 1;
-}
-
-/* Populate Source / Location dropdowns from data we already have:
-   sources come from /api/sources (+ job rows seen), locations accumulate
-   from every loaded page (no distinct-locations endpoint exists). */
-function setSelectOptions(select, values, allLabel) {
-  if (!select) return;
-  const current = select.value;
-  select.replaceChildren();
-  const all = el("option", null, allLabel);
-  all.value = "";
-  select.appendChild(all);
-  for (const v of values) {
-    const opt = el("option", null, v);
-    opt.value = v;
-    select.appendChild(opt);
-  }
-  select.value = [...select.options].some((o) => o.value === current)
-    ? current
-    : "";
-}
-
-function updateFilterOptions() {
-  const names = new Set((state.sources || []).map((s) => s.name));
-  for (const job of state.jobs) {
-    if (job.source) names.add(job.source);
-    if (job.location) knownLocations.add(job.location);
-  }
-
-  const srcSig = [...names].sort().join("|");
-  if (srcSig !== sourceOptionsSig) {
-    sourceOptionsSig = srcSig;
-    setSelectOptions($("filterSource"), [...names].sort(), "All Sources");
-  }
-  const locSig = [...knownLocations].sort().join("|");
-  if (locSig !== locationOptionsSig) {
-    locationOptionsSig = locSig;
-    setSelectOptions($("filterLocation"), [...knownLocations].sort(), "All Locations");
-  }
-}
-
-function activityLevelClass(level) {
-  const lv = String(level || "info").toLowerCase();
-  return ["info", "warning", "error"].includes(lv) ? "log-" + lv : "log-info";
-}
-
-function renderActivity() {
+async function loadActivity() {
+  const entries = await api("/api/activity?limit=100");
   const list = $("activityList");
-  if (!list) return;
   list.replaceChildren();
-  if (!state.activity.length) {
-    list.appendChild(emptyState("📋", "No activity yet"));
-    return;
-  }
-  for (const entry of state.activity) {
-    const item = el("div", "activity-item " + activityLevelClass(entry.level));
-    item.appendChild(el("span", "activity-time", fmtClock(entry.timestamp)));
-    item.appendChild(el("span", "activity-message", entry.message || ""));
-    list.appendChild(item);
-  }
-}
-
-/* ---------------- Error handling ---------------- */
-
-const SECTION_CONTAINER = {
-  jobs: "jobsList",
-  sources: "sourceList",
-  activity: "activityList",
-};
-
-function sectionHasData(name) {
-  if (name === "jobs") return state.jobs.length > 0;
-  if (name === "sources") return state.sources.length > 0;
-  if (name === "activity") return state.activity.length > 0;
-  return false;
-}
-
-function showSectionError(name, message) {
-  const container = $(SECTION_CONTAINER[name]);
-  if (!container) return;
-  const friendly = /connect|timed out|network/i.test(message)
-    ? "⚠ Unable to connect to Hirevia backend"
-    : "⚠ Could not load " + name + ": " + message;
-  container.replaceChildren(emptyState("⚠", friendly));
-}
-
-function handleSectionError(name, err) {
-  console.warn("[hirevia] " + name + " fetch failed:", err.message);
-  if (name === "status") {
-    state.backendOnline = false;
-    renderStatusBadge();
-  } else if (!sectionHasData(name)) {
-    // Only replace the section when there is nothing to preserve.
-    showSectionError(name, err.message || "unknown error");
-  }
-}
-
-/* ---------------- Polling (single interval, no overlap) ----------------
-   One master 5s tick decides which sections are due:
-     status   every 5s     stats    every 10s
-     sources  every 10s    activity every 10s
-     jobs     every 20s
-   A per-section in-flight flag guarantees a new request never starts
-   before the previous one for that section has completed. */
-
-const POLL_INTERVALS = {
-  status: 5000,
-  stats: 10000,
-  sources: 10000,
-  activity: 10000,
-  jobs: 20000,
-};
-const TICK_MS = 5000;
-
-const inFlight = new Set();
-const lastFetchedAt = {};
-let pollTimer = null;
-
-const TASKS = {
-  status: async () => {
-    state.status = await api.getStatus();
-    state.backendOnline = true;
-    renderStatusBadge();
-    renderStatusPanel();
-  },
-  stats: async () => {
-    state.stats = await api.getStats();
-    renderStats();
-  },
-  sources: async () => {
-    state.sources = (await api.getSources()) || [];
-    renderSources();
-  },
-  jobs: async () => {
-    const seq = jobsRequestSeq;
-    const data = await api.getJobs();
-    if (seq !== jobsRequestSeq) return; // view changed while this fetch ran
-    state.jobs = (data && data.jobs) || [];
-    state.jobsTotal = (data && data.total) || 0;
-    renderJobs();
-  },
-  activity: async () => {
-    state.activity = (await api.getActivity()) || [];
-    renderActivity();
-  },
-};
-
-async function runTask(name) {
-  if (inFlight.has(name)) return; // never overlap with itself
-  inFlight.add(name);
-  lastFetchedAt[name] = Date.now();
-  try {
-    await TASKS[name]();
-  } catch (err) {
-    handleSectionError(name, err);
-  } finally {
-    inFlight.delete(name);
-  }
-}
-
-function autoRefreshEnabled() {
-  const box = $("autoRefresh");
-  return box ? box.checked : true;
-}
-
-async function tick() {
-  if (!autoRefreshEnabled()) return;
-  const due = Object.keys(POLL_INTERVALS).filter(
-    (name) =>
-      !inFlight.has(name) &&
-      (!lastFetchedAt[name] ||
-        Date.now() - lastFetchedAt[name] >= POLL_INTERVALS[name])
-  );
-  await Promise.all(due.map(runTask));
-}
-
-/* ---------------- Init ---------------- */
-
-function init() {
-  renderStatusBadge(); // shows "CONNECTING" while the first fetch runs
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeModal();
+  if (!entries.length) list.append(node("div", "empty-state", "No recent activity."));
+  entries.slice().reverse().forEach((entry) => {
+    const row = node("div", "log-row");
+    row.append(node("time", "log-time", relativeTime(entry.timestamp)));
+    row.append(node("span", `log-level ${entry.level || "info"}`, entry.level || "info"));
+    row.append(node("span", "", entry.message || ""));
+    list.append(row);
   });
-  pollTimer = setInterval(tick, TICK_MS);
-  tick(); // immediate first wave, then every TICK_MS
 }
 
-document.addEventListener("DOMContentLoaded", init);
-
-/* ---------------- Placeholders for later phases ----------------
-   The Phase-2 markup references these via inline onclick/oninput.
-   Only the Start / Stop / Scan controls remain stubs (Phase 5);
-   the jobs handlers below are fully functional. */
-
-function startScanner() {
-  console.info("startScanner: will be connected in Phase 5");
-}
-function stopScanner() {
-  console.info("stopScanner: will be connected in Phase 5");
-}
-function triggerScan() {
-  console.info("triggerScan: will be connected in Phase 5");
+async function poll() {
+  const tasks = [loadStatus(), loadJobs(), loadCounts()];
+  if ($("view-logs").classList.contains("active")) tasks.push(loadActivity());
+  try { await Promise.all(tasks); } catch (error) { $("railStatus").textContent = error.message; }
 }
 
-/* ---------------- Jobs search / filters / pagination (Phase 4) ---------------- */
-
-function buildJobsQuery() {
-  const p = new URLSearchParams();
-  if (jobView.search) p.set("search", jobView.search);
-  if (jobView.source) p.set("source", jobView.source);
-  if (jobView.status) p.set("status", jobView.status);
-  if (jobView.minMatch) p.set("min_match", jobView.minMatch);
-  if (jobView.location) p.set("location", jobView.location);
-  p.set("limit", jobView.limit);
-  p.set("offset", jobView.page * jobView.limit);
-  return p.toString();
+async function control(path, successMessage) {
+  try {
+    const result = await api(path, { method: "POST", body: "{}" });
+    notify(result.message || successMessage);
+    await poll();
+  } catch (error) { notify(error.message); }
 }
 
-/* Immediate reload after a user action. Reuses the Phase-3 jobs task
-   (same in-flight guard and polling loop — no second interval). */
-function refreshJobsNow() {
-  jobsRequestSeq += 1; // invalidate any response already in flight
-  lastFetchedAt.jobs = 0;
-  if (inFlight.has("jobs")) {
-    setTimeout(refreshJobsNow, 600); // retry once the running poll ends
-    return;
+async function saveJob(id, saved) {
+  try {
+    await api(`/api/jobs/${encodeURIComponent(id)}/save`, { method: "POST", body: JSON.stringify({ saved }) });
+    await loadJobs();
+    notify(saved ? "Job saved" : "Removed from saved jobs");
+  } catch (error) { notify(error.message); }
+}
+
+async function deleteJob(id) {
+  if (!window.confirm("Remove this opportunity from the active feed?")) return;
+  try {
+    await api(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
+    await Promise.all([loadJobs(), loadCounts()]);
+    notify("Opportunity removed from active feed");
+  } catch (error) { notify(error.message); }
+}
+
+function showJob(job) {
+  $("dialogTitle").textContent = job.title || "Job details";
+  const body = $("dialogBody");
+  body.replaceChildren();
+  const facts = [
+    ["Company", job.company], ["Location", job.location], ["Experience", job.experience],
+    ["Priority", job.match_priority], ["Match score", typeof job.match_score === "number" ? `${job.match_score}%` : "Not scored"],
+    ["Application status", job.application_status], ["Source", job.source], ["Detected", relativeTime(job.detected_at)],
+    ["Freshness", relativeTime(job.detected_at)], ["Expires", expiresLabel(job.expires_at)],
+  ];
+  const verdict = job.match_result || {};
+  for (const [key, label] of [["experience_match", "Experience fit"], ["location_match", "Location fit"], ["role_match", "Role fit"], ["education_match", "Education fit"], ["employment_match", "Employment fit"]]) {
+    if (typeof verdict[key] === "boolean") facts.push([label, verdict[key] ? "Matches" : "Does not match"]);
   }
-  runTask("jobs");
-}
-
-function debounceSearch() {
-  clearTimeout(searchDebounceTimer);
-  searchDebounceTimer = setTimeout(() => {
-    const input = $("searchInput");
-    const value = input ? input.value.trim() : "";
-    if (value === jobView.search) return;
-    jobView.search = value;
-    jobView.page = 0;
-    refreshJobsNow();
-  }, 350);
-}
-
-function applyFilters() {
-  jobView.source = ($("filterSource") || {}).value || "";
-  jobView.status = ($("filterStatus") || {}).value || "";
-  jobView.minMatch = ($("filterMatch") || {}).value || "";
-  jobView.location = ($("filterLocation") || {}).value || "";
-  jobView.page = 0;
-  refreshJobsNow();
-}
-
-function prevPage() {
-  if (jobView.page <= 0) return;
-  jobView.page -= 1;
-  refreshJobsNow();
-}
-
-function nextPage() {
-  const pages = Math.max(1, Math.ceil(state.jobsTotal / jobView.limit));
-  if (jobView.page >= pages - 1) return;
-  jobView.page += 1;
-  refreshJobsNow();
-}
-function closeModal(event) {
-  const modal = $("jobModal");
-  if (modal) modal.classList.remove("active", "show", "open");
-}
-
-/* ---------------- Job detail modal (Phase 4) ---------------- */
-
-function openJobModal(jobId) {
-  const modal = $("jobModal");
-  if (!modal) return;
-  modal.classList.add("active");
-  const job = state.jobs.find((j) => j.id === jobId);
-  if (job) {
-    fillJobModal(job);
-    return;
+  const grid = node("div", "system-grid");
+  facts.forEach(([label, value]) => {
+    const row = node("div", "system-row");
+    row.append(node("span", "", label), node("strong", "", value || "—"));
+    grid.append(row);
+  });
+  body.append(grid);
+  if (job.match_reason) {
+    body.append(node("h3", "", "Match details"));
+    body.append(node("p", "", job.match_reason));
   }
-  // Rare case (e.g. after a filter change): fetch the full record.
-  const body = $("modalBody");
-  if (body) body.replaceChildren(el("div", "loading", "Loading..."));
-  setText("modalTitle", "Job Details");
-  api
-    .getJob(jobId)
-    .then(fillJobModal)
-    .catch((err) => {
-      if (body) {
-        body.replaceChildren(
-          emptyState("⚠", "Could not load job: " + err.message)
-        );
-      }
+  const scores = [
+    ["Deterministic score", verdict.deterministic_score],
+    ["AI score", verdict.ai_score],
+    ["AI assessment", verdict.ai_status],
+  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
+  if (scores.length) {
+    body.append(node("h3", "", "Scoring evidence"));
+    const scoreGrid = node("div", "system-grid");
+    scores.forEach(([label, value]) => {
+      const row = node("div", "system-row");
+      row.append(node("span", "", label), node("strong", "", typeof value === "number" && label !== "AI assessment" ? `${value}%` : value));
+      scoreGrid.append(row);
     });
+    body.append(scoreGrid);
+  }
+  for (const [label, url] of [["Original posting", job.url], ["Application link", job.application_url]]) {
+    if (!url) continue;
+    body.append(node("h3", "", label));
+    const link = node("a", "detail-link", url);
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    body.append(link);
+  }
+  if (job.description) {
+    body.append(node("h3", "", "Description"));
+    body.append(node("p", "job-description", job.description));
+  }
+  const skills = [...new Set([...(job.matched_skills || []), ...(job.skills || [])])].slice(0, 12);
+  if (skills.length) {
+    body.append(node("h3", "", "Skills"));
+    const tags = node("div", "job-skills");
+    skills.forEach((skill) => tags.append(node("span", "skill-tag", skill)));
+    body.append(tags);
+  }
+  $("dialogApply").href = job.application_url || job.url || "#";
+  $("dialogSave").textContent = job.saved ? "Unsave" : "Save";
+  $("dialogSave").onclick = () => saveJob(job.id, !job.saved);
+  $("jobDialog").showModal();
 }
 
-function fillJobModal(job) {
-  setText("modalTitle", job.title || "Job Details");
-  const body = $("modalBody");
-  if (body) {
-    body.replaceChildren();
-
-    const grid = el("div", "detail-grid");
-    const row = (label, value) => {
-      grid.appendChild(el("div", "detail-label", label));
-      grid.appendChild(
-        el(
-          "div",
-          "detail-value",
-          value === null || value === undefined || value === ""
-            ? "—"
-            : String(value)
-        )
+async function loadTelegram() {
+  try {
+    const data = await api("/api/telegram/config");
+    state.telegram = data;
+    const sourceValidation = new Map((data.source_validation || []).map((source) => [source.username.toLowerCase(), source]));
+    const loginState = data.connected ? "connected" : data.login_state || "disconnected";
+    const otpPending = ["code_sent", "code_invalid", "code_expired"].includes(loginState);
+    const phoneMasked = data.phone_number ? ` · ${data.phone_number}` : "";
+    $("telegramAccount").textContent = data.connected
+      ? `CONNECTED · ${data.account?.name || "Telegram user"}${data.account?.username ? ` · @${data.account.username}` : ""}${phoneMasked}`
+      : loginState === "code_sent" ? `OTP SENT${phoneMasked}` : "DISCONNECTED";
+    $("telegramAuthStatus").textContent = data.connected
+      ? data.validation_complete ? "Channel validation complete" : "Channel validation needs attention"
+      : loginState.replaceAll("_", " ").toUpperCase();
+    $("telegramPhoneStep").hidden = data.connected || otpPending || loginState === "password_required";
+    $("telegramOtpStep").hidden = data.connected || !otpPending;
+    $("telegramPasswordStep").hidden = data.connected || loginState !== "password_required";
+    $("telegramLogout").hidden = !data.connected;
+    $("telegramAuthError").textContent = data.auth_error || "";
+    if (otpPending) setTelegramResendCooldown(data.resend_after_seconds || 0);
+    else clearTelegramResendCooldown();
+    $("joinSources").disabled = !data.connected;
+    $("refreshSources").disabled = !data.connected;
+    $("sourceSummary").textContent = data.validation_complete
+      ? `${(data.sources || []).length} configured source(s) · channel access checked`
+      : `${(data.sources || []).length} configured source(s) · validation required`;
+    const list = $("telegramSources");
+    list.replaceChildren();
+    if (!data.sources?.length) list.append(node("div", "empty-state", "No Telegram sources configured."));
+    (data.sources || []).forEach((source) => {
+      const row = node("div", "source-row");
+      const identity = node("div", "source-identity");
+      const checked = sourceValidation.get(source.username.toLowerCase());
+      const membership = checked?.membership || (source.enabled ? "unchecked" : "disabled");
+      const access = checked?.access || (source.enabled ? "unchecked" : "disabled");
+      identity.append(
+        node("span", "source-name", `@${source.username}`),
+        node("span", "source-state", `${source.enabled ? "Collection on" : "Collection off"} · ${membership.replaceAll("_", " ")} · ${access.replaceAll("_", " ")}`),
       );
-    };
-    row("Company", job.company);
-    row("Location", job.location);
-    row("Source", job.source ? String(job.source).toUpperCase() : null);
-    row("Status", job.application_status);
-    row("Employment", job.employment_type);
-    row("Experience", job.experience);
-    row("Match", typeof job.match_score === "number" ? job.match_score + "%" : null);
-    row("Priority", job.match_priority);
-    const detected = job.detected_at
-      ? (fmtDateTime(job.detected_at) || "") +
-        (fmtRelative(job.detected_at) ? " · " + fmtRelative(job.detected_at) : "")
-      : null;
-    row("Detected", detected);
-    row("Posted", fmtDateTime(job.posted_at));
-    row("Deadline", fmtDateTime(job.deadline));
-    row("Expires", fmtDateTime(job.expires_at));
-    body.appendChild(grid);
-
-    const skills = Array.isArray(job.skills) ? job.skills : [];
-    if (skills.length) {
-      body.appendChild(el("h4", null, "Skills"));
-      const tags = el("div", "job-skills");
-      for (const s of skills) tags.appendChild(el("span", "skill-tag", s));
-      body.appendChild(tags);
+      const controls = node("div", "inline-actions");
+      const toggle = node("button", "button quiet", source.enabled ? "Disable" : "Enable");
+      toggle.type = "button";
+      toggle.addEventListener("click", () => updateTelegramSource(source, !source.enabled));
+      controls.append(toggle);
+      if (data.connected && checked?.membership === "joined") {
+        const leave = node("button", "button quiet", "Leave");
+        leave.type = "button";
+        leave.addEventListener("click", () => changeTelegramMembership(source.username, true));
+        controls.append(leave);
+      } else if (data.connected && checked?.can_join) {
+        const join = node("button", "button quiet", "Join");
+        join.type = "button";
+        join.addEventListener("click", () => changeTelegramMembership(source.username, false));
+        controls.append(join);
+      }
+      row.append(identity, controls);
+      list.append(row);
+    });
+    const destinations = data.community_destinations || {};
+    for (const [priority, element] of [["P1", $("destP1")], ["P2", $("destP2")], ["P3", $("destP3")]]) {
+      const configured = destinations[priority] || "";
+      if (configured && ![...element.options].some((option) => option.value === configured)) {
+        element.append(node("option", "", `${configured} · configured`));
+        element.lastElementChild.value = configured;
+      }
+      element.value = configured;
     }
-
-    const fullDesc = stripHtml(job.description);
-    if (fullDesc) {
-      body.appendChild(el("h4", null, "Description"));
-      body.appendChild(
-        el("p", null, fullDesc.slice(0, 600) + (fullDesc.length > 600 ? " …" : ""))
-      );
+    if (data.connected) {
+      $("telegramOtp").value = "";
+      $("telegramPassword").value = "";
     }
-  }
+    const monitorReady = !data.telegram_enabled || (data.connected && data.validation_complete);
+    $("startButton").disabled = Boolean(state.status?.is_running) || !monitorReady;
+  } catch (error) { $("telegramAccount").textContent = error.message; }
+}
 
-  const apply = $("modalApply");
-  if (apply) {
-    const url = job.application_url || job.url || "";
-    apply.href = url || "#";
-    apply.style.display = url ? "" : "none";
+async function initializeTelegramStartup() {
+  setActiveView("telegram", false);
+  await loadTelegram();
+}
+
+function clearTelegramResendCooldown() {
+  if (telegramResendTimer) clearInterval(telegramResendTimer);
+  telegramResendTimer = null;
+  $("resendTelegramOtp").disabled = true;
+  $("telegramResendStatus").textContent = "";
+}
+
+function setTelegramResendCooldown(seconds) {
+  if (telegramResendTimer) clearInterval(telegramResendTimer);
+  let remaining = Math.max(0, Number(seconds) || 0);
+  const update = () => {
+    $("resendTelegramOtp").disabled = remaining > 0;
+    $("telegramResendStatus").textContent = remaining > 0 ? `Resend available in ${remaining}s` : "You can request another code";
+    if (remaining <= 0) {
+      clearInterval(telegramResendTimer);
+      telegramResendTimer = null;
+    }
+    remaining = Math.max(0, remaining - 1);
+  };
+  update();
+  if (remaining > 0) telegramResendTimer = setInterval(update, 1000);
+}
+
+async function sendTelegramOtp() {
+  const button = $("sendTelegramOtp");
+  button.disabled = true;
+  try {
+    const result = await api("/api/telegram/login/phone", {
+      method: "POST", body: JSON.stringify({ phone_number: $("telegramPhone").value.trim() }),
+    });
+    $("telegramAuthError").textContent = result.success ? result.message : result.message;
+    await loadTelegram();
+  } catch (error) {
+    $("telegramAuthError").textContent = error.message;
+  } finally {
+    button.disabled = false;
   }
 }
+
+async function verifyTelegramOtp() {
+  const button = $("verifyTelegramOtp");
+  button.disabled = true;
+  try {
+    const result = await api("/api/telegram/login/otp", {
+      method: "POST", body: JSON.stringify({ code: $("telegramOtp").value }),
+    });
+    $("telegramAuthError").textContent = result.success ? "" : result.message;
+    await loadTelegram();
+  } catch (error) {
+    $("telegramAuthError").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function resendTelegramOtp() {
+  const button = $("resendTelegramOtp");
+  button.disabled = true;
+  try {
+    const result = await api("/api/telegram/login/resend", { method: "POST", body: "{}" });
+    $("telegramAuthError").textContent = result.success ? "" : result.message;
+    if (result.success) $("telegramOtp").value = "";
+    await loadTelegram();
+  } catch (error) {
+    $("telegramAuthError").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function verifyTelegramPassword() {
+  const button = $("verifyTelegramPassword");
+  button.disabled = true;
+  try {
+    const result = await api("/api/telegram/login/password", {
+      method: "POST", body: JSON.stringify({ password: $("telegramPassword").value }),
+    });
+    $("telegramPassword").value = "";
+    $("telegramAuthError").textContent = result.success ? "" : result.message;
+    await loadTelegram();
+  } catch (error) {
+    $("telegramPassword").value = "";
+    $("telegramAuthError").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function logoutTelegram() {
+  if (!window.confirm("Disconnect this Telegram account and stop monitoring?")) return;
+  try {
+    await api("/api/telegram/logout", { method: "POST", body: "{}" });
+    state.telegramMembership = null;
+    await loadTelegram();
+    await loadStatus();
+    notify("Telegram disconnected");
+  } catch (error) { $("telegramAuthError").textContent = error.message; }
+}
+
+async function refreshTelegramValidation() {
+  try {
+    const result = await api("/api/telegram/sources/validate", { method: "POST", body: "{}" });
+    await loadTelegram();
+    $("telegramMessage").textContent = result.validation_complete
+      ? "Telegram channel validation complete"
+      : result.authenticated ? "Some channel checks need retry" : "Connect a Telegram account first";
+  } catch (error) { $("telegramMessage").textContent = error.message; }
+}
+
+async function updateTelegramSource(source, enabled) {
+  try {
+    await api(`/api/telegram/sources/${encodeURIComponent(source.username)}`, { method: "PUT", body: JSON.stringify({ enabled }) });
+    await loadTelegram();
+    notify(`Collection ${enabled ? "enabled" : "disabled"} for @${source.username}`);
+  } catch (error) { $("telegramMessage").textContent = error.message; }
+}
+
+async function changeTelegramMembership(username, currentlyJoined) {
+  const action = currentlyJoined ? "leave" : "join";
+  if (!window.confirm(`${currentlyJoined ? "Leave" : "Join"} the public channel @${username}?`)) return;
+  try {
+    const result = await api(`/api/telegram/sources/${encodeURIComponent(username)}/${action}`, { method: "POST", body: "{}" });
+    $("telegramMessage").textContent = result.message;
+    await loadTelegram();
+  } catch (error) { $("telegramMessage").textContent = error.message; }
+}
+
+async function loadAI() {
+  try {
+    const data = await api("/api/ai/config");
+    state.ai = data;
+    const primary = $("aiPrimary");
+    primary.replaceChildren();
+    data.providers.forEach((provider) => {
+      const option = node("option", "", provider.name);
+      option.value = provider.name;
+      option.selected = provider.name === data.primary;
+      primary.append(option);
+    });
+    updateAIPrimaryFields();
+    $("aiTimeout").value = data.timeout_seconds;
+    renderProviders(data.providers, data.fallback);
+  } catch (error) { $("aiMessage").textContent = error.message; }
+}
+
+function updateAIPrimaryFields() {
+  const provider = state.ai?.providers.find((item) => item.name === $("aiPrimary").value);
+  if (!provider) return;
+  $("aiModel").value = provider.model || "";
+  $("aiBaseUrl").value = provider.base_url || "";
+}
+
+function renderProviders(providers, fallbacks) {
+  const list = $("providerList");
+  list.replaceChildren();
+  providers.forEach((provider) => {
+    const row = node("label", "provider-row");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = provider.name;
+    checkbox.checked = fallbacks.includes(provider.name);
+    checkbox.dataset.fallback = "true";
+    checkbox.disabled = provider.name === $("aiPrimary").value;
+    const info = node("span", "provider-info");
+    info.append(node("span", "provider-name", provider.name), node("span", "provider-detail", `${provider.model || "model not set"} · ${provider.base_url || "no endpoint"}`));
+    row.append(checkbox, info, node("span", "provider-state", provider.configured ? "Configured" : provider.api_key_configured ? "Key present" : "Not configured"));
+    list.append(row);
+  });
+}
+
+async function loadConfigFiles() {
+  try {
+    const data = await api("/api/config/files");
+    const list = $("configFiles");
+    list.replaceChildren();
+    if (!data.files.length) list.append(node("div", "empty-state", "No supported YAML files found."));
+    data.files.forEach((name) => {
+      const button = node("button", `config-file ${name === state.configFile ? "active" : ""}`, name);
+      button.type = "button";
+      button.addEventListener("click", () => openConfigFile(name));
+      list.append(button);
+    });
+    if (!state.configFile && data.files.length) await openConfigFile(data.files[0]);
+  } catch (error) { $("configMessage").textContent = error.message; }
+}
+
+async function openConfigFile(name) {
+  try {
+    const data = await api(`/api/config/files/${encodeURIComponent(name)}`);
+    state.configFile = name;
+    $("editorFilename").textContent = name;
+    $("yamlEditor").value = data.content;
+    $("validateYaml").disabled = false;
+    $("saveYaml").disabled = false;
+    $("configMessage").textContent = "";
+    document.querySelectorAll(".config-file").forEach((button) => button.classList.toggle("active", button.textContent === name));
+  } catch (error) { $("configMessage").textContent = error.message; }
+}
+
+async function validateYaml() {
+  if (!state.configFile) return;
+  try {
+    const result = await api(`/api/config/files/${encodeURIComponent(state.configFile)}/validate`, { method: "POST", body: JSON.stringify({ content: $("yamlEditor").value }) });
+    $("configMessage").textContent = result.warnings?.length ? `Valid with notes: ${result.warnings.join("; ")}` : "Valid YAML";
+  } catch (error) { $("configMessage").textContent = error.message; }
+}
+
+async function saveYaml() {
+  if (!state.configFile) return;
+  try {
+    await api(`/api/config/files/${encodeURIComponent(state.configFile)}`, { method: "PUT", body: JSON.stringify({ content: $("yamlEditor").value }) });
+    $("configMessage").textContent = "Saved and reloaded";
+    notify(`${state.configFile} saved`);
+    await Promise.all([loadStatus(), loadJobs(), loadCounts()]);
+  } catch (error) { $("configMessage").textContent = error.message; }
+}
+
+async function saveAI() {
+  const fallback = [...document.querySelectorAll("[data-fallback]:checked")].map((item) => item.value);
+  const payload = {
+    primary: $("aiPrimary").value,
+    model: $("aiModel").value.trim(),
+    base_url: $("aiBaseUrl").value.trim(),
+    fallback,
+    timeout_seconds: Number($("aiTimeout").value),
+  };
+  if ($("aiApiKey").value) payload.api_key = $("aiApiKey").value;
+  try {
+    await api("/api/ai/config", { method: "PUT", body: JSON.stringify(payload) });
+    $("aiApiKey").value = "";
+    $("aiMessage").textContent = "Saved to .env";
+    notify("AI settings updated");
+    await loadAI();
+  } catch (error) { $("aiMessage").textContent = error.message; }
+}
+
+async function saveDestinations() {
+  const destinations = { P1: $("destP1").value.trim(), P2: $("destP2").value.trim(), P3: $("destP3").value.trim() };
+  try {
+    await api("/api/telegram/community", { method: "PUT", body: JSON.stringify({ destinations }) });
+    $("telegramMessage").textContent = "Saved to telegram.yaml";
+    notify("Telegram destinations saved");
+  } catch (error) { $("telegramMessage").textContent = error.message; }
+}
+
+async function loadTelegramDialogs() {
+  try {
+    const result = await api("/api/telegram/dialogs");
+    if (result.error) throw new Error(result.error);
+    state.telegramMembership = new Set((result.dialogs || []).map((dialog) => dialog.username?.toLowerCase()).filter(Boolean));
+    for (const element of [$("destP1"), $("destP2"), $("destP3")]) {
+      const selected = element.value;
+      element.replaceChildren(node("option", "", "Choose group or channel"));
+      element.firstElementChild.value = "";
+      (result.dialogs || []).forEach((dialog) => {
+        const label = `${dialog.title}${dialog.username ? ` · @${dialog.username}` : ""} · ${dialog.type}`;
+        const option = node("option", "", label);
+        option.value = dialog.id;
+        element.append(option);
+      });
+      element.value = selected;
+    }
+    $("telegramMessage").textContent = `${result.dialogs.length} groups and channels available`;
+    await loadTelegram();
+  } catch (error) { $("telegramMessage").textContent = error.message; }
+}
+
+async function testDestination(priority) {
+  try {
+    const result = await api(`/api/telegram/community/test/${priority}`, { method: "POST", body: "{}" });
+    $("telegramMessage").textContent = result.message;
+  } catch (error) { $("telegramMessage").textContent = error.message; }
+}
+
+async function joinConfiguredSources() {
+  if (!window.confirm("Join all enabled public Telegram sources listed in telegram.yaml?")) return;
+  try {
+    const result = await api("/api/telegram/sources/join", { method: "POST", body: "{}" });
+    const joined = (result.sources || []).filter((item) => item.status === "joined" || item.status === "already_joined").length;
+    $("telegramMessage").textContent = `Joined ${joined} source(s); folder ${result.folder || "not available"}`;
+    await refreshTelegramValidation();
+  } catch (error) { $("telegramMessage").textContent = error.message; }
+}
+
+function bind() {
+  document.querySelectorAll(".nav-item[data-view]").forEach((button) => button.addEventListener("click", () => setActiveView(button.dataset.view)));
+  document.querySelectorAll(".priority-tab").forEach((button) => button.addEventListener("click", async () => {
+    document.querySelectorAll(".priority-tab").forEach((tab) => tab.classList.toggle("active", tab === button));
+    state.priority = button.dataset.priority;
+    state.page = 0;
+    try { await loadJobs(); } catch (error) { notify(error.message); }
+  }));
+  $("railToggle").addEventListener("click", () => $("shell").classList.toggle("collapsed"));
+  $("mobileRailToggle").addEventListener("click", () => $("shell").classList.toggle("mobile-open"));
+  $("jobSearch").addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(async () => {
+      state.search = $("jobSearch").value.trim();
+      state.page = 0;
+      try { await loadJobs(); } catch (error) { notify(error.message); }
+    }, 250);
+  });
+  $("prevPage").addEventListener("click", async () => { state.page = Math.max(0, state.page - 1); await loadJobs(); });
+  $("nextPage").addEventListener("click", async () => { if ((state.page + 1) * state.limit < state.total) state.page += 1; await loadJobs(); });
+  $("startButton").addEventListener("click", () => control("/api/start", "Monitor started"));
+  $("stopButton").addEventListener("click", () => control("/api/stop", "Monitor stopped"));
+  $("scanButton").addEventListener("click", () => control("/api/scan", "Scan complete"));
+  $("closeDialog").addEventListener("click", () => $("jobDialog").close());
+  $("jobDialog").addEventListener("click", (event) => { if (event.target === $("jobDialog")) $("jobDialog").close(); });
+  $("sendTelegramOtp").addEventListener("click", sendTelegramOtp);
+  $("verifyTelegramOtp").addEventListener("click", verifyTelegramOtp);
+  $("resendTelegramOtp").addEventListener("click", resendTelegramOtp);
+  $("verifyTelegramPassword").addEventListener("click", verifyTelegramPassword);
+  $("telegramLogout").addEventListener("click", logoutTelegram);
+  $("joinSources").addEventListener("click", joinConfiguredSources);
+  $("refreshSources").addEventListener("click", refreshTelegramValidation);
+  $("manageSources").addEventListener("click", async () => { setActiveView("config"); await loadConfigFiles(); if ([...document.querySelectorAll(".config-file")].some((item) => item.textContent === "telegram.yaml")) await openConfigFile("telegram.yaml"); });
+  $("saveDestinations").addEventListener("click", saveDestinations);
+  $("loadDialogs").addEventListener("click", loadTelegramDialogs);
+  document.querySelectorAll("[data-test-priority]").forEach((button) => button.addEventListener("click", () => testDestination(button.dataset.testPriority)));
+  $("aiPrimary").addEventListener("change", () => { updateAIPrimaryFields(); renderProviders(state.ai.providers, state.ai.fallback); });
+  $("saveAi").addEventListener("click", saveAI);
+  $("testAi").addEventListener("click", async () => {
+    try { const result = await api("/api/ai/test", { method: "POST", body: "{}" }); $("aiMessage").textContent = result.message; }
+    catch (error) { $("aiMessage").textContent = error.message; }
+  });
+  $("validateYaml").addEventListener("click", validateYaml);
+  $("saveYaml").addEventListener("click", saveYaml);
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  bind();
+  poll();
+  setInterval(poll, 7000);
+  initializeTelegramStartup();
+});

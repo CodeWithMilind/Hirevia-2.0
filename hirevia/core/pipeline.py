@@ -19,6 +19,7 @@ deterministic half still scores every job (see hirevia.core.matching).
 
 import inspect
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable, List, Optional
 
@@ -86,6 +87,7 @@ class Pipeline:
         self.stats = ScanStats()
         self.stats.ai_provider = getattr(ai_matcher, "provider_name", "disabled") if ai_matcher else "disabled"
         self._matcher_takes_evidence = _accepts_evidence(ai_matcher)
+        self._priority_counts = {priority.value: 0 for priority in Priority}
         for warning in validate_profile(self.profile):
             logger.warning("%s profile: %s", PREFIX, warning)
         logger.debug(
@@ -104,10 +106,16 @@ class Pipeline:
             ai_provider=getattr(self.ai_matcher, "provider_name", "disabled")
             if self.ai_matcher else "disabled"
         )
+        self._priority_counts = {priority.value: 0 for priority in Priority}
+        logger.info("%s Scan started", PREFIX)
 
         try:
+            expiry_started = time.perf_counter()
             self.stats.jobs_expired = self.repo.expire_jobs()
-            logger.debug("%s Stage 1: expired %d stale job(s)", PREFIX, self.stats.jobs_expired)
+            logger.info(
+                "%s Stage 1 expiry completed: %d job(s) in %.3fs",
+                PREFIX, self.stats.jobs_expired, time.perf_counter() - expiry_started,
+            )
 
             sources = self.registry.get_enabled_sources()
             if self.diagnostic_output:
@@ -115,19 +123,21 @@ class Pipeline:
                     if source.name == "telegram":
                         source.diagnostic_output = True
             self.stats.sources_scanned = len(sources)
-            logger.debug(
-                "%s Stage 2: scanning %d enabled source(s): %s",
+            logger.info(
+                "%s Source collection started: %d source(s): %s",
                 PREFIX, len(sources), ", ".join(s.name for s in sources) or "none",
             )
 
+            collection_started = time.perf_counter()
             all_jobs: List[Job] = []
             for source in sources:
                 all_jobs.extend(await self._collect(source))
 
             all_jobs = sort_by_freshness(all_jobs)
             logger.info(
-                "%s Stage 2 done: %d message(s), %d detected, %d normalized, %d to process",
-                PREFIX, self.stats.messages_checked, self.stats.jobs_detected,
+                "%s Source collection completed in %.3fs: %d message(s), %d detected, %d normalized, %d to process",
+                PREFIX, time.perf_counter() - collection_started,
+                self.stats.messages_checked, self.stats.jobs_detected,
                 self.stats.jobs_normalized, len(all_jobs),
             )
 
@@ -137,7 +147,12 @@ class Pipeline:
                     self._emit_ai_progress("start", total=total)
                     self._progress_started = True
             for index, job in enumerate(all_jobs, start=1):
+                job_started = time.perf_counter()
                 self._job_progress_state = {"status": "AI SKIPPED", "score": None}
+                logger.info(
+                    "%s [%d/%d] Processing job %r from %s",
+                    PREFIX, index, total, job.title, job.source,
+                )
                 if self.ai_progress_callback:
                     self._emit_ai_progress(
                         "processing", index=index, total=total, job=job
@@ -152,6 +167,10 @@ class Pipeline:
                         PREFIX, index, total, job.title, job.source, e, exc_info=True,
                     )
                 finally:
+                    logger.info(
+                        "%s [%d/%d] Job processing finished in %.3fs",
+                        PREFIX, index, total, time.perf_counter() - job_started,
+                    )
                     if self.ai_progress_callback:
                         self._emit_ai_progress(
                             "job_complete",
@@ -178,13 +197,19 @@ class Pipeline:
             self._record_error(f"Pipeline: {type(e).__name__}: {e}")
 
         self.stats.duration_seconds = (datetime.utcnow() - start_time).total_seconds()
+        self.stats.priority_distribution = self._priority_counts.copy()
         logger.info("%s Scan finished in %.1fs: %s", PREFIX, self.stats.duration_seconds, self._summary_line())
+        logger.info(
+            "%s Priority distribution: P1=%d P2=%d P3=%d",
+            PREFIX, self._priority_counts["P1"], self._priority_counts["P2"],
+            self._priority_counts["P3"],
+        )
         return self.stats
 
     def _summary_line(self) -> str:
         s = self.stats
         return (
-            f"found={s.jobs_found} new={s.jobs_new} dup={s.jobs_duplicate} "
+            f"found={s.jobs_found} new={s.jobs_new} dup={s.jobs_duplicate} expired={s.jobs_expired} "
             f"promo_rejected={s.promotional_rejected} education_rejected={s.educational_rejected} "
             f"info_rejected={s.informational_rejected} spam_rejected={s.spam_rejected} "
             f"selection_rejected={s.selection_rejected} aggregator_rejected={s.aggregator_rejected} "
@@ -210,6 +235,7 @@ class Pipeline:
 
     async def _collect(self, source) -> List[Job]:
         """Collect from one source; a failure here costs only that source."""
+        collection_started = time.perf_counter()
         binder = getattr(source, "bind_state", None)
         if callable(binder):
             try:
@@ -218,9 +244,14 @@ class Pipeline:
                 logger.debug("%s %s: state store not bound (%s)", PREFIX, source.name, e)
 
         try:
+            logger.info("%s Source %s collection started", PREFIX, source.name)
             jobs = await source.collect()
         except Exception as e:  # noqa: BLE001
-            logger.error("%s Source %s failed: %s", PREFIX, source.name, e)
+            logger.error(
+                "%s Source %s failed after %.3fs: %s",
+                PREFIX, source.name, time.perf_counter() - collection_started, e,
+                exc_info=True,
+            )
             self._record_error(f"{source.name}: {type(e).__name__}: {e}")
             return []
 
@@ -235,7 +266,10 @@ class Pipeline:
         self.stats.jobs_detected += int(counters.get("jobs_detected", 0) or 0)
         self.stats.jobs_normalized += int(counters.get("jobs_normalized", 0) or 0)
         self.stats.telegram_channels_scanned += int(counters.get("channels_scanned", 0) or 0)
-        logger.debug("%s Source %s collected %d job(s)", PREFIX, source.name, len(jobs))
+        logger.info(
+            "%s Source %s collected %d job(s) in %.3fs",
+            PREFIX, source.name, len(jobs), time.perf_counter() - collection_started,
+        )
         return jobs
 
     # -- one job, stage by stage -------------------------------------------
@@ -245,6 +279,7 @@ class Pipeline:
 
         # Stage 3: dedup. Fingerprint catches the same posting reached through
         # another source; source id catches a Telegram repost under a new title.
+        dedup_started = time.perf_counter()
         job.fingerprint = compute_fingerprint(job)
         existing = (
             self.repo.get_by_fingerprint(job.fingerprint)
@@ -263,27 +298,33 @@ class Pipeline:
                     "status": "AI SKIPPED",
                     "score": existing_verdict.match_score,
                 }
-            logger.debug("%s Stage 3: duplicate of %s - %r", PREFIX, existing.id, job.title)
+            logger.info(
+                "%s %s Stage 3 dedup skipped %r: existing job %s (%.3fs)",
+                PREFIX, tag, job.title, existing.id, time.perf_counter() - dedup_started,
+            )
             # A repost proves the opening is still live: if an earlier alert
             # never got out (Telegram was down), this is our retry.
             await self._retry_failed_alert(existing)
             return
+        logger.info("%s %s Stage 3 dedup passed (%.3fs)", PREFIX, tag, time.perf_counter() - dedup_started)
 
         # Stage 4: deterministic filters (filters.yaml)
+        filter_started = time.perf_counter()
         filters = apply_filters(job, self.config.filters, self.profile)
         if not filters.passed:
             self.stats.jobs_filtered += 1
-            logger.debug(
-                "%s [HARD FILTER] %s | %s | %s",
-                PREFIX, filters.status, job.title, filters.reason,
+            logger.info(
+                "%s %s Stage 4 filtered %r: %s (%s; %.3fs)",
+                PREFIX, tag, job.title, filters.reason, filters.status,
+                time.perf_counter() - filter_started,
             )
             return
         self.stats.jobs_hard_filter_passed += 1
         if filters.status == "UNKNOWN":
             self.stats.jobs_hard_filter_unknown += 1
-        logger.debug(
-            "%s [HARD FILTER] %s | %s | %s",
-            PREFIX, filters.status, job.title, filters.reason,
+        logger.info(
+            "%s %s Stage 4 filter passed %r (%s; %.3fs)",
+            PREFIX, tag, job.title, filters.status, time.perf_counter() - filter_started,
         )
 
         evidence = analyze(job, self.profile)
@@ -292,9 +333,9 @@ class Pipeline:
         self.stats.jobs_rule_strong += int(evidence.score >= self.config.match_min_score)
         if evidence.hard_reject:
             self.stats.jobs_filtered += 1
-            logger.debug(
-                "%s [HARD FILTER] REJECT | %s | %s",
-                PREFIX, job.title, evidence.reject_reasons[0],
+            logger.info(
+                "%s %s Stage 4 profile eligibility rejected %r: %s",
+                PREFIX, tag, job.title, evidence.reject_reasons[0],
             )
             return
 
@@ -310,9 +351,9 @@ class Pipeline:
                 job.application_url = None
             if self.repo.upsert_job(job):
                 self.stats.jobs_new += 1
-            logger.debug(
-                "%s Stage 5: %r has no usable apply link (%s) - stored, never alerted",
-                PREFIX, job.title, quality.reason,
+            logger.info(
+                "%s %s Stage 5 pre-LLM skipped %r: unusable application link (%s); stored=%s",
+                PREFIX, tag, job.title, quality.reason, job.id,
             )
             return
 
@@ -322,6 +363,10 @@ class Pipeline:
         if self.ai_matcher is not None and not _should_call_ai(evidence, self.config):
             self.stats.jobs_ai_skipped += 1
             verdict = combine(evidence, self.config)
+            logger.info(
+                "%s %s AI request skipped for %r: deterministic evidence below call threshold (score=%d)",
+                PREFIX, tag, job.title, evidence.score,
+            )
             self._job_progress_state = {"status": "AI SKIPPED", "score": evidence.score}
             job.match_result = verdict.model_dump(mode="json")
             job.raw_data["deterministic_score"] = verdict.deterministic_score
@@ -337,9 +382,24 @@ class Pipeline:
                 return
         else:
             self.stats.jobs_matching_attempted += 1
+            ai_started = time.perf_counter()
+            if self.ai_matcher is not None:
+                logger.info(
+                    "%s %s AI request started for %r (provider=%s, model=%s)",
+                    PREFIX, tag, job.title,
+                    getattr(self.ai_matcher, "provider_name", "unknown"),
+                    getattr(self.ai_matcher, "model", "unknown"),
+                )
+            else:
+                logger.info("%s %s Deterministic matching started for %r", PREFIX, tag, job.title)
             if self.ai_matcher is not None and self.ai_progress_callback:
                 self._emit_ai_progress("sending_ai", job=job)
             verdict = await self._match(job, tag, evidence)
+            logger.info(
+                "%s %s Matching completed for %r in %.3fs: matched=%s score=%d priority=%s ai_status=%s",
+                PREFIX, tag, job.title, time.perf_counter() - ai_started,
+                verdict.match, verdict.match_score, verdict.priority.value, verdict.ai_status,
+            )
             if self.ai_progress_callback:
                 if self.ai_matcher is None:
                     self._job_progress_state = {"status": "AI SKIPPED", "score": evidence.score}
@@ -370,10 +430,18 @@ class Pipeline:
             )
             return
         self.stats.jobs_matched += 1
+        self._priority_counts[verdict.priority.value] += 1
 
         # Stage 6: light-touch availability check on the application page
         self.stats.jobs_verification_attempted += 1
+        verification_started = time.perf_counter()
+        logger.info("%s %s Stage 6 application verification started for %r", PREFIX, tag, job.title)
         status, quality = await self._verify(job, tag)
+        logger.info(
+            "%s %s Stage 6 application verification completed for %r in %.3fs: status=%s quality=%s",
+            PREFIX, tag, job.title, time.perf_counter() - verification_started,
+            status.value, quality.quality,
+        )
         self._stamp(job, quality)
         job.application_status = status
         if status is ApplicationStatus.OPEN:
@@ -387,6 +455,10 @@ class Pipeline:
         is_new = self.repo.upsert_job(job)
         if is_new:
             self.stats.jobs_new += 1
+        logger.info(
+            "%s %s Stage 7 persistence completed for %r: inserted=%s application_status=%s",
+            PREFIX, tag, job.title, is_new, job.application_status.value,
+        )
 
         blocked = self._alert_block(job, verdict, quality, is_new)
         if blocked:
@@ -500,9 +572,9 @@ class Pipeline:
             if decision.degraded:
                 self.stats.ai_failures += 1
                 self._record_error(f"AI degraded ({job.source}/{job.source_job_id}): {decision.error}")
-                logger.debug(
-                    "%s Stage 5: AI unavailable for %r (%s) - scored on evidence alone",
-                    PREFIX, job.title, decision.error,
+                logger.warning(
+                    "%s AI provider failed for %r (%s); continuing with profile evidence",
+                    PREFIX, job.title, decision.error or "unknown error",
                 )
             elif decision.relevant:
                 self.stats.jobs_ai_matched += 1
@@ -514,7 +586,8 @@ class Pipeline:
         # Mirrors for the dashboard's existing flat readers.
         job.raw_data["deterministic_score"] = verdict.deterministic_score
         job.raw_data["ai_status"] = verdict.ai_status
-        logger.debug(
+        score_log = logger.info if verdict.match else logger.debug
+        score_log(
             "%s Stage 5: %r -> %d%% (%s) = deterministic %d%% + ai %s | %s",
             PREFIX, job.title, verdict.match_score, verdict.priority.value,
             verdict.deterministic_score,
@@ -605,7 +678,7 @@ class Pipeline:
         try:
             sent = await self.notifier.send(job, verdict)
         except Exception as e:  # noqa: BLE001
-            logger.error("%s Stage 7: notification crashed for %r: %s", PREFIX, job.title, e)
+            logger.error("%s Stage 7: notification crashed for %r: %s", PREFIX, job.title, e, exc_info=True)
             self._record_error(f"notify {job.source_job_id}: {type(e).__name__}: {e}")
             return
 

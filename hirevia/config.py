@@ -103,7 +103,7 @@ def _default_ai_providers() -> Dict[str, AIProviderConfig]:
 
 class AIConfig(BaseModel):
     enabled: bool = True
-    primary: str = "nvidia"
+    primary: str = "llamacpp"
     fallback: List[str] = Field(default_factory=lambda: ["nvidia", "groq", "ollama", "llamacpp"])
     timeout_seconds: int = Field(default=20, ge=1, le=300)
     max_retries: int = Field(default=1, ge=0, le=3)
@@ -231,7 +231,14 @@ def load_config(
     nvidia = provider_data["nvidia"]
     nvidia["base_url"] = os.getenv("NVIDIA_BASE_URL", nvidia["base_url"])
     nvidia["model"] = os.getenv("NVIDIA_MODEL", nvidia["model"])
-    ai_data["primary"] = os.getenv("AI_PRIMARY_PROVIDER", ai_data.get("primary", "nvidia"))
+    ai_data["primary"] = os.getenv("AI_PRIMARY_PROVIDER", ai_data.get("primary", "llamacpp"))
+    fallback_env = os.getenv("AI_FALLBACK_PROVIDERS")
+    if fallback_env is not None:
+        ai_data["fallback"] = [
+            name.strip().lower()
+            for name in fallback_env.split(",")
+            if name.strip()
+        ]
     ai_data["providers"] = provider_data
     if os.getenv("AI_TIMEOUT_SECONDS"):
         ai_data["timeout_seconds"] = _env_int("AI_TIMEOUT_SECONDS", 20)

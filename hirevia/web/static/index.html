@@ -3,174 +3,102 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hirevia 2.0 - Web Control Panel</title>
+    <title>Hirevia</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="app">
-        <!-- Header -->
-        <header class="header">
-            <div class="header-left">
-                <h1>🤖 Hirevia 2.0</h1>
-            </div>
-            <div class="header-center">
-                <span class="status-badge" id="statusBadge">● STOPPED</span>
-            </div>
-            <div class="header-right">
-                <button class="btn btn-primary" id="btnStart" onclick="startScanner()">▶ Start</button>
-                <button class="btn btn-danger" id="btnStop" onclick="stopScanner()" disabled>■ Stop</button>
-                <button class="btn btn-secondary" id="btnScanNow" onclick="triggerScan()" disabled>🔄 Scan Now</button>
-            </div>
+<div class="shell" id="shell">
+    <aside class="rail" id="rail">
+        <div class="brand-row"><span class="brand-mark">H</span><span class="brand-name">HIREVIA</span><button class="icon-button rail-toggle" id="railToggle" title="Collapse sidebar" aria-label="Collapse sidebar">‹</button></div>
+        <nav class="navigation" aria-label="Main navigation">
+            <button class="nav-item active" data-view="jobs"><span class="nav-icon">▤</span><span>Jobs</span></button>
+            <div class="nav-subgroup"><button class="nav-item sub-item" data-view="telegram"><span class="nav-icon">◉</span><span>Telegram</span></button><button class="nav-item nested" data-view="telegram">Sources</button><button class="nav-item nested" data-view="telegram">Community</button></div>
+            <button class="nav-item" data-view="ai"><span class="nav-icon">⌘</span><span>AI &amp; Models</span></button>
+            <button class="nav-item" data-view="config"><span class="nav-icon">⚙</span><span>Configuration</span></button>
+            <button class="nav-item" data-view="logs"><span class="nav-icon">≡</span><span>Logs</span></button>
+            <button class="nav-item" data-view="system"><span class="nav-icon">◌</span><span>System</span></button>
+        </nav>
+        <div class="rail-footer"><span class="live-dot" id="railDot"></span><span id="railStatus">Connecting</span><span class="rail-version">2.0</span></div>
+    </aside>
+
+    <div class="workspace">
+        <header class="topbar">
+            <div class="topbar-title"><button class="icon-button mobile-rail-toggle" id="mobileRailToggle" title="Open sidebar" aria-label="Open sidebar">☰</button><span id="pageTitle">Jobs</span><span class="topbar-status" id="statusBadge">CONNECTING</span></div>
+            <div class="topbar-actions"><button class="button quiet" id="scanButton" title="Run a scan now">↻ <span>Scan 24h</span></button><button class="button quiet" id="startButton">Start Monitor</button><button class="button stop" id="stopButton" disabled>Stop Monitor</button></div>
         </header>
 
-        <!-- Stats Cards -->
-        <section class="stats-grid" id="statsGrid">
-            <div class="stat-card">
-                <div class="stat-value" id="statJobsFound">0</div>
-                <div class="stat-label">Jobs Found</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statNewJobs">0</div>
-                <div class="stat-label">New Jobs</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statAIMatches">0</div>
-                <div class="stat-label">AI Matches</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statNotified">0</div>
-                <div class="stat-label">Notified</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statExpired">0</div>
-                <div class="stat-label">Expired</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statDuration">0s</div>
-                <div class="stat-label">Last Scan</div>
-            </div>
-        </section>
-
-        <!-- Main Content -->
-        <main class="main-content">
-            <!-- Left Panel: Status & Sources -->
-            <aside class="sidebar">
-                <!-- System Status -->
-                <section class="panel">
-                    <h2>📊 System Status</h2>
-                    <div class="status-grid">
-                        <div class="status-row">
-                            <span class="status-key">Status</span>
-                            <span class="status-value" id="sysStatus">Stopped</span>
-                        </div>
-                        <div class="status-row">
-                            <span class="status-key">Operation</span>
-                            <span class="status-value" id="sysOperation">Idle</span>
-                        </div>
-                        <div class="status-row">
-                            <span class="status-key">Last Scan</span>
-                            <span class="status-value" id="sysLastScan">—</span>
-                        </div>
-                        <div class="status-row">
-                            <span class="status-key">Next Scan</span>
-                            <span class="status-value" id="sysNextScan">—</span>
-                        </div>
-                        <div class="status-row">
-                            <span class="status-key">Scan Duration</span>
-                            <span class="status-value" id="sysScanDuration">—</span>
-                        </div>
-                        <div class="status-row">
-                            <span class="status-key">Interval</span>
-                            <span class="status-value" id="sysInterval">30 min</span>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- Sources -->
-                <section class="panel">
-                    <h2>🔗 Sources</h2>
-                    <div class="source-list" id="sourceList">
-                        <div class="loading">Loading sources...</div>
-                    </div>
-                </section>
-            </aside>
-
-            <!-- Right Panel: Jobs -->
-            <section class="jobs-panel">
-                <!-- Jobs Header with Search & Filters -->
-                <div class="jobs-header">
-                    <h2>💼 Jobs</h2>
-                    <div class="jobs-toolbar">
-                        <input type="text" class="search-input" id="searchInput" placeholder="Search jobs..." oninput="debounceSearch()">
-                        <div class="filter-group">
-                            <select id="filterSource" onchange="applyFilters()">
-                                <option value="">All Sources</option>
-                            </select>
-                            <select id="filterStatus" onchange="applyFilters()">
-                                <option value="">All Status</option>
-                                <option value="open">Open</option>
-                                <option value="closed">Closed</option>
-                                <option value="unknown">Unknown</option>
-                                <option value="expired">Expired</option>
-                            </select>
-                            <select id="filterMatch" onchange="applyFilters()">
-                                <option value="">All Match</option>
-                                <option value="90">90%+</option>
-                                <option value="70">70%+</option>
-                                <option value="50">50%+</option>
-                            </select>
-                            <select id="filterLocation" onchange="applyFilters()">
-                                <option value="">All Locations</option>
-                            </select>
-                        </div>
-                    </div>
+        <main class="content">
+            <section class="view active" id="view-jobs">
+                <div class="view-heading"><div><div class="eyebrow">OPPORTUNITY FEED</div><h1>Jobs</h1></div><div class="feed-tools"><label class="search-box"><span>⌕</span><input id="jobSearch" type="search" placeholder="Search opportunities" autocomplete="off"></label></div></div>
+                <div class="priority-tabs" role="tablist" aria-label="Filter by priority">
+                    <button class="priority-tab active" data-priority="">ALL <span id="countAll">0</span></button>
+                    <button class="priority-tab" data-priority="P1">P1 <span id="countP1">0</span></button>
+                    <button class="priority-tab" data-priority="P2">P2 <span id="countP2">0</span></button>
+                    <button class="priority-tab" data-priority="P3">P3 <span id="countP3">0</span></button>
                 </div>
+                <div class="feed-meta"><span id="feedCount">Loading active opportunities</span><span>Active window · 24 hours</span></div>
+                <div class="job-feed" id="jobsList"><div class="empty-state">Loading opportunities…</div></div>
+                <div class="pagination"><button class="button quiet" id="prevPage" disabled>← Newer</button><span id="pageInfo">Page 1</span><button class="button quiet" id="nextPage" disabled>Older →</button></div>
+            </section>
 
-                <!-- Jobs List -->
-                <div class="jobs-list" id="jobsList">
-                    <div class="loading">Loading jobs...</div>
+            <section class="view" id="view-telegram">
+                <div class="view-heading"><div><div class="eyebrow">COLLECTION &amp; DELIVERY</div><h1>Telegram</h1></div><button class="button quiet" id="telegramLogout" hidden>Logout / Disconnect</button></div>
+                <div class="settings-section">
+                    <div class="section-heading"><div><h2>Account</h2><p id="telegramAccount">DISCONNECTED</p></div><span class="form-message" id="telegramAuthStatus" role="status"></span></div>
+                    <div class="auth-step" id="telegramPhoneStep"><label class="field"><span>Phone number with country code</span><input id="telegramPhone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+12025550123"></label><button class="button primary" id="sendTelegramOtp">Send OTP</button></div>
+                    <div class="auth-step" id="telegramOtpStep" hidden><label class="field"><span>Telegram verification code</span><input id="telegramOtp" inputmode="numeric" autocomplete="one-time-code"></label><div class="inline-actions"><button class="button primary" id="verifyTelegramOtp">Verify OTP</button><button class="button quiet" id="resendTelegramOtp" disabled>Resend code</button><span class="form-message" id="telegramResendStatus" role="status"></span></div></div>
+                    <div class="auth-step" id="telegramPasswordStep" hidden><label class="field"><span>Two-step verification password</span><input id="telegramPassword" type="password" autocomplete="current-password"></label><button class="button primary" id="verifyTelegramPassword">Verify password</button></div>
+                    <p class="form-message" id="telegramAuthError" role="alert"></p>
                 </div>
-
-                <!-- Pagination -->
-                <div class="pagination" id="pagination">
-                    <button class="btn btn-sm" id="btnPrev" onclick="prevPage()" disabled>← Prev</button>
-                    <span id="pageInfo">Page 1</span>
-                    <button class="btn btn-sm" id="btnNext" onclick="nextPage()" disabled>Next →</button>
+                <div class="settings-section"><div class="section-heading"><div><h2>Job sources</h2><p id="sourceSummary">Configured public channels from telegram.yaml</p></div><div class="inline-actions"><button class="button quiet" id="refreshSources">Refresh</button><button class="button quiet" id="manageSources">Manage Sources</button><button class="button primary" id="joinSources">Join all configured</button></div></div><div class="source-list" id="telegramSources"><div class="empty-state">Loading sources…</div></div></div>
+                <div class="settings-section">
+                    <div class="section-heading"><div><h2>Community delivery</h2><p>Bot destinations are read from telegram.yaml.</p></div><button class="button primary" id="saveDestinations">Save destinations</button></div>
+                    <div class="destination-grid">
+                        <label class="field"><span>P1 destination</span><select id="destP1"><option value="">Choose group or channel</option></select></label>
+                        <label class="field"><span>P2 destination</span><select id="destP2"><option value="">Choose group or channel</option></select></label>
+                        <label class="field"><span>P3 destination</span><select id="destP3"><option value="">Choose group or channel</option></select></label>
+                    </div>
+                    <div class="test-destinations"><button class="button quiet" id="loadDialogs">Load my groups and channels</button><button class="button quiet" data-test-priority="P1">Test P1</button><button class="button quiet" data-test-priority="P2">Test P2</button><button class="button quiet" data-test-priority="P3">Test P3</button><span class="form-message" id="telegramMessage" role="status"></span></div>
                 </div>
             </section>
+
+            <section class="view" id="view-ai">
+                <div class="view-heading"><div><div class="eyebrow">INFERENCE CONFIGURATION</div><h1>AI &amp; Models</h1></div></div>
+                <div class="settings-section">
+                    <div class="provider-grid">
+                        <label class="field"><span>Primary provider</span><select id="aiPrimary"></select></label>
+                        <label class="field"><span>Primary model</span><input id="aiModel" autocomplete="off"></label>
+                        <label class="field"><span>Base URL</span><input id="aiBaseUrl" type="url" autocomplete="url"></label>
+                        <label class="field"><span>API key <small>(leave blank to keep current)</small></span><input id="aiApiKey" type="password" autocomplete="new-password" placeholder="Configured key is hidden"></label>
+                        <label class="field"><span>Timeout (seconds)</span><input id="aiTimeout" type="number" min="1" max="300"></label>
+                    </div>
+                    <div class="section-heading fallback-heading"><div><h2>Fallback providers</h2><p>Used by the existing provider router.</p></div></div>
+                    <div class="provider-list" id="providerList"></div>
+                    <div class="form-actions"><button class="button primary" id="saveAi">Save AI settings</button><button class="button quiet" id="testAi">Test connection</button><span class="form-message" id="aiMessage" role="status"></span></div>
+                </div>
+            </section>
+
+            <section class="view" id="view-config">
+                <div class="view-heading"><div><div class="eyebrow">SOURCE FILES</div><h1>Configuration</h1></div></div>
+                <div class="config-layout"><nav class="config-files" id="configFiles" aria-label="Configuration files"><div class="empty-state">Loading files…</div></nav><div class="editor-pane"><div class="editor-heading"><strong id="editorFilename">Select a configuration file</strong><span class="form-message" id="configMessage" role="status"></span></div><textarea id="yamlEditor" spellcheck="false" aria-label="YAML configuration"></textarea><div class="form-actions"><button class="button quiet" id="validateYaml" disabled>Validate</button><button class="button primary" id="saveYaml" disabled>Save</button></div></div></div>
+            </section>
+
+            <section class="view" id="view-logs">
+                <div class="view-heading"><div><div class="eyebrow">RECENT EVENTS</div><h1>Logs</h1></div></div><div class="log-list" id="activityList"><div class="empty-state">Loading activity…</div></div>
+            </section>
+
+            <section class="view" id="view-system">
+                <div class="view-heading"><div><div class="eyebrow">RUNTIME</div><h1>System</h1></div></div><div class="system-grid"><div class="system-row"><span>Agent</span><strong id="systemAgent">—</strong></div><div class="system-row"><span>Operation</span><strong id="systemOperation">—</strong></div><div class="system-row"><span>Last scan</span><strong id="systemLastScan">—</strong></div><div class="system-row"><span>Next scan</span><strong id="systemNextScan">—</strong></div><div class="system-row"><span>Scan interval</span><strong id="systemInterval">—</strong></div><div class="system-row"><span>Sources</span><strong id="systemSources">—</strong></div></div>
+            </section>
         </main>
-
-        <!-- Activity Panel -->
-        <footer class="activity-panel">
-            <div class="activity-header">
-                <h3>📋 Activity Log</h3>
-                <label class="auto-refresh">
-                    <input type="checkbox" id="autoRefresh" checked> Auto-refresh
-                </label>
-            </div>
-            <div class="activity-list" id="activityList">
-                <div class="loading">Loading activity...</div>
-            </div>
-        </footer>
     </div>
+</div>
 
-    <!-- Job Detail Modal -->
-    <div class="modal-overlay" id="jobModal" onclick="closeModal(event)">
-        <div class="modal" onclick="event.stopPropagation()">
-            <div class="modal-header">
-                <h3 id="modalTitle">Job Details</h3>
-                <button class="modal-close" onclick="closeModal()">×</button>
-            </div>
-            <div class="modal-body" id="modalBody">
-                <div class="loading">Loading...</div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="closeModal()">Close</button>
-                <a class="btn btn-primary" id="modalApply" href="#" target="_blank">Apply Now</a>
-            </div>
-        </div>
-    </div>
-
-    <script src="/static/app.js"></script>
+<dialog id="jobDialog" class="job-dialog"><div class="dialog-head"><div><div class="eyebrow">OPPORTUNITY</div><h2 id="dialogTitle">Job details</h2></div><button class="icon-button" id="closeDialog" aria-label="Close">×</button></div><div class="dialog-body" id="dialogBody"></div><div class="dialog-actions"><button class="button quiet" id="dialogSave">Save</button><a class="button primary" id="dialogApply" target="_blank" rel="noopener">Apply</a></div></dialog>
+<div class="toast" id="toast" role="status"></div>
+<script src="/static/app.js"></script>
 </body>
 </html>
