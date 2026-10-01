@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
@@ -611,16 +612,16 @@ def test_logging_configuration_is_idempotent_and_verbose_is_debug(monkeypatch):
     try:
         monkeypatch.delenv("HIREVIA_LOG_LEVEL", raising=False)
         cli_module.configure_logging()
-        assert telethon_logger.level == logging.WARNING
-        assert httpx_logger.level == logging.WARNING
+        assert telethon_logger.level == original_telethon_level
+        assert httpx_logger.level == original_httpx_level
         first_count = len(root.handlers)
         cli_module.configure_logging()
         assert first_count == len(root.handlers) == 2
         cli_module.configure_logging(verbose=True)
         assert root.level == logging.DEBUG
         assert root.handlers[0].level == logging.DEBUG
-        assert telethon_logger.level == logging.DEBUG
-        assert httpx_logger.level == logging.DEBUG
+        assert telethon_logger.getEffectiveLevel() == logging.DEBUG
+        assert httpx_logger.getEffectiveLevel() == logging.DEBUG
         monkeypatch.setenv("HIREVIA_LOG_LEVEL", "DEBUG")
         cli_module.configure_logging()
         assert root.level == logging.DEBUG
@@ -678,16 +679,74 @@ def test_ai_status_reports_configuration_without_secrets(monkeypatch):
 def test_httpx2_logging_is_quiet_at_info_and_visible_at_debug():
     logger = logging.getLogger("httpx2")
     previous_level = logger.level
+    root = logging.getLogger()
+    previous_root_level = root.level
     try:
         cli_module.configure_logging(verbose=False)
-        assert logger.level == logging.WARNING
-        assert not logger.isEnabledFor(logging.INFO)
+        assert logger.getEffectiveLevel() == logging.INFO
+        assert logger.isEnabledFor(logging.INFO)
+        console_handler = next(
+            handler for handler in root.handlers
+            if getattr(handler, "_hirevia_console_handler", False)
+        )
+        assert console_handler.stream is sys.stdout
+        assert not console_handler.filters[0].filter(
+            logging.LogRecord("httpx2", logging.INFO, __file__, 1, "request", (), None)
+        )
 
         cli_module.configure_logging(verbose=True)
-        assert logger.level == logging.DEBUG
+        assert logger.getEffectiveLevel() == logging.DEBUG
         assert logger.isEnabledFor(logging.INFO)
     finally:
         logger.setLevel(previous_level)
+        root.setLevel(previous_root_level)
+
+
+def test_terminal_logging_is_concise_and_file_keeps_diagnostics(monkeypatch, tmp_path, capsys):
+    root = logging.getLogger()
+    original_handlers = root.handlers
+    original_level = root.level
+    monkeypatch.setenv("HIREVIA_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("HIREVIA_LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("TELEGRAM_API_ID", "api-id-canary")
+    monkeypatch.setenv("TELEGRAM_PHONE", "+15551234567")
+    try:
+        root.handlers = []
+        cli_module.configure_logging()
+        cli_module.configure_logging()
+        logging.getLogger("hirevia.core.pipeline").info("per-job internal details")
+        logging.getLogger("hirevia.core.pipeline").debug("debug diagnostic detail")
+        logging.getLogger("httpx").info("third-party request detail")
+        logging.getLogger("hirevia.worker_runtime").info(
+            "Scan complete | Found: 4 | New: 2 | Matched: 1"
+        )
+        logging.getLogger("hirevia.core.pipeline").warning(
+            "api_id=api-id-canary phone=+15551234567 otp=123456"
+        )
+        logging.getLogger("hirevia.ai.client").error("Provider response API_KEY-CANARY")
+        for handler in root.handlers:
+            handler.flush()
+
+        terminal = capsys.readouterr().out
+        log_path = tmp_path / "logs" / "hirevia.log"
+        contents = log_path.read_text(encoding="utf-8")
+        assert terminal.count("Scan complete | Found: 4 | New: 2 | Matched: 1") == 1
+        assert "per-job internal details" not in terminal
+        assert "third-party request detail" not in terminal
+        assert "api-id-canary" not in terminal
+        assert "api-id-canary" not in contents
+        assert "API_KEY-CANARY" not in contents
+        assert "+15551234567" not in contents
+        assert "123456" not in contents
+        assert "per-job internal details" in contents
+        assert "debug diagnostic detail" in contents
+        assert "third-party request detail" in contents
+    finally:
+        for handler in root.handlers:
+            if handler not in original_handlers:
+                handler.close()
+        root.handlers = original_handlers
+        root.setLevel(original_level)
 
 
 def test_ai_set_primary_persists_configured_provider(monkeypatch, tmp_path):

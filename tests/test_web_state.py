@@ -445,7 +445,9 @@ def test_web_feed_filters_active_24h_jobs_by_stored_priority_and_preserves_actio
             connection.commit()
 
         state = web_state.initialize_web_state(config, repo)
-        assert state.get_job_counts() == {"ALL": 3, "P1": 1, "P2": 1, "P3": 1}
+        assert state.get_job_counts() == {
+            "ALL": 3, "P1": 1, "P2": 1, "P3": 1, "UNMATCHED": 0,
+        }
         assert state.get_jobs(priority="P2")["jobs"][0]["match_priority"] == "P2"
 
         assert state.save_job(p1.id) is True
@@ -453,6 +455,62 @@ def test_web_feed_filters_active_24h_jobs_by_stored_priority_and_preserves_actio
         assert state.delete_job(p1.id) is True
         assert state.get_job(p1.id) is None
         assert state.get_job_counts()["ALL"] == 2
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
+
+
+def test_unmatched_p3_below_match_threshold_is_visible_in_jobs_and_filter(tmp_path, monkeypatch):
+    config = Config()
+    repo = JobRepository(tmp_path / "unmatched-feed.db")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    job = Job(
+        source="telegram",
+        source_job_id="jobs_alpha-below-threshold",
+        title="Python Developer",
+        company="Example",
+        location="Remote",
+        description="Python role",
+        url="https://t.me/jobs_alpha/42",
+        ai_decision={
+            "matched": False,
+            "priority": "P3",
+            "match_score": 46,
+        },
+        match_result={
+            "matched": False,
+            "match_score": 46,
+            "priority": "P3",
+            "reason": "Below the configured match threshold",
+            "ai_status": "ok",
+            "ai_score": 46,
+        },
+    )
+    repo.upsert_job(job)
+
+    try:
+        state = web_state.initialize_web_state(config, repo)
+        all_jobs = state.get_jobs()
+        p3_jobs = state.get_jobs(priority="P3")
+        unmatched_jobs = state.get_jobs(match_status="unmatched")
+
+        assert all_jobs["total"] == 1
+        assert all_jobs["jobs"][0]["match_status"] == "unmatched"
+        assert p3_jobs["jobs"][0]["match_score"] == 46
+        assert unmatched_jobs["jobs"][0]["match_priority"] == "P3"
+        assert unmatched_jobs["jobs"][0]["match_status"] == "unmatched"
+        monkeypatch.setattr(routes, "_state", lambda: state)
+        api_response = asyncio.run(routes.get_jobs(
+            search=None, source=None, status=None, priority="P3", min_match=None,
+            match_status="unmatched", location=None, limit=50, offset=0,
+        ))
+        assert api_response.total == 1
+        assert api_response.jobs[0].match_status == "unmatched"
+        assert api_response.jobs[0].match_score == 46
+        assert state.get_job_counts() == {
+            "ALL": 1, "P1": 0, "P2": 0, "P3": 1, "UNMATCHED": 1,
+        }
     finally:
         web_state._web_state = None
         web_state.WebUIState._instance = None
@@ -477,6 +535,65 @@ def test_valid_yaml_is_atomically_persisted_and_reloaded(monkeypatch, tmp_path):
     assert response == {"success": True, "name": "filters.yaml"}
     assert filters_path.read_text(encoding="utf-8") == content
     assert state.config.filters.roles == ["Backend Developer"]
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+
+
+def test_yaml_save_waits_for_running_worker_configuration_ack(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "filters.yaml").write_text("roles: []\n", encoding="utf-8")
+    state = web_state.initialize_web_state(
+        Config(), JobRepository(tmp_path / "worker-config.db")
+    )
+    state.external_worker = True
+    state.is_running = True
+    commands = []
+
+    async def send_worker_command(command, arguments=None, *, timeout=20.0):
+        commands.append((command, arguments, timeout))
+        return {"reloaded": True}
+
+    state._send_worker_command = send_worker_command
+    monkeypatch.setattr(routes, "_state", lambda: state)
+
+    response = asyncio.run(routes.save_config_file(
+        "filters.yaml", ConfigFileRequest(content="roles:\n  - Updated Role\n")
+    ))
+
+    assert response == {"success": True, "name": "filters.yaml"}
+    assert commands == [
+        ("RELOAD_CONFIGURATION", {"env_keys": []}, 45.0)
+    ]
+    assert state.config.filters.roles == ["Updated Role"]
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+
+
+def test_config_save_reports_worker_reload_failure_without_leaking_error(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "filters.yaml").write_text("roles: []\n", encoding="utf-8")
+    state = web_state.initialize_web_state(
+        Config(), JobRepository(tmp_path / "worker-config-failure.db")
+    )
+    state.external_worker = True
+
+    async def fail_worker_command(command, arguments=None, *, timeout=20.0):
+        raise TimeoutError("private-key-canary")
+
+    state._send_worker_command = fail_worker_command
+    monkeypatch.setattr(routes, "_state", lambda: state)
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(routes.save_config_file(
+            "filters.yaml", ConfigFileRequest(content="roles:\n  - Updated Role\n")
+        ))
+
+    assert error.value.status_code == 503
+    assert "private-key-canary" not in error.value.detail
+    assert "worker did not apply" in error.value.detail
+    assert "private-key-canary" not in repr(state.get_activity())
     web_state._web_state = None
     web_state.WebUIState._instance = None
 
@@ -522,6 +639,48 @@ def test_ai_web_settings_update_the_shared_configuration_without_returning_keys(
     assert public_config["matching"] == {
         "p1_threshold": 90, "p2_threshold": 70, "p3_threshold": 45
     }
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+
+
+def test_ai_config_reload_sends_only_environment_key_names(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hirevia.config._ensure_dotenv", lambda: None)
+    monkeypatch.setenv("NVIDIA_API_KEY", "api-key-command-canary")
+    state = web_state.initialize_web_state(
+        Config(), JobRepository(tmp_path / "worker-ai-config.db")
+    )
+    state.external_worker = True
+    commands = []
+
+    async def send_worker_command(command, arguments=None, *, timeout=20.0):
+        commands.append((command, arguments, timeout))
+        return {"reloaded": True}
+
+    state._send_worker_command = send_worker_command
+    monkeypatch.setattr(routes, "_state", lambda: state)
+
+    result = asyncio.run(routes.update_ai_config(AISettingsRequest(
+        primary="llamacpp",
+        model="worker-selected-model",
+        base_url="http://127.0.0.1:8080/v1",
+        timeout_seconds=60,
+        p1_threshold=90,
+        p2_threshold=70,
+        p3_threshold=45,
+        api_key="api-key-command-canary",
+    )))
+
+    command, arguments, timeout = commands[0]
+    assert result["success"] is True
+    assert command == "RELOAD_CONFIGURATION"
+    assert set(arguments["env_keys"]) == {
+        "AI_PRIMARY_PROVIDER", "LLAMACPP_MODEL", "AI_TIMEOUT_SECONDS",
+        "MATCHING_P1_THRESHOLD", "MATCHING_P2_THRESHOLD",
+        "MATCHING_P3_THRESHOLD", "LLAMACPP_BASE_URL", "LLAMACPP_API_KEY",
+    }
+    assert timeout == 45.0
+    assert "api-key-command-canary" not in repr(arguments)
     web_state._web_state = None
     web_state.WebUIState._instance = None
 
@@ -1357,6 +1516,9 @@ def test_web_monitor_scan_and_job_actions_write_backend_logs(monkeypatch, tmp_pa
 
     monkeypatch.setattr(web_state, "Pipeline", FakePipeline)
     monkeypatch.setattr(web_state, "provider_status", lambda config: [])
+    monkeypatch.setattr("hirevia.worker_runtime.load_telegram_credentials", lambda: None)
+    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_API_HASH", raising=False)
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
     config = Config()

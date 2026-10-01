@@ -155,7 +155,7 @@ def test_scan_alerts_only_the_apply_ready_job(repo):
     assert notifier.sent == ["Backend Developer"]
     assert stats.jobs_found == 3
     assert (stats.messages_checked, stats.jobs_detected, stats.jobs_normalized) == (40, 12, 3)
-    assert stats.jobs_new == 2  # alerted job + stored-but-unusable one
+    assert stats.jobs_new == 3  # alerted, unusable-link, and unmatched jobs
     assert stats.jobs_ai_matched == 1
     assert stats.jobs_ai_rejected == 1
     assert stats.jobs_link_rejected == 1
@@ -173,12 +173,75 @@ def test_scan_alerts_only_the_apply_ready_job(repo):
     assert stored.raw_data["application_url_quality"] == "social"
     assert stored.raw_data["application_url_usable"] is False
 
+    unmatched = repo.get_by_source_id("telegram", "jobs_beta-3")
+    assert unmatched is not None and unmatched.notified_at is None
+    assert unmatched.match_result["match"] is False
+    assert unmatched.ai_decision["relevant"] is False
+
     # The alerted job remembers it was alerted, so the next scan stays quiet.
     alerted = repo.get_by_source_id("telegram", "jobs_alpha-1")
     assert alerted.notified_at is not None and alerted.notification_channel == "telegram"
     assert alerted.raw_data["freshness_label"]
     assert str(alerted.url).startswith("https://t.me/")
     assert str(alerted.application_url).startswith("https://boards.greenhouse.io/")
+
+
+def test_ai_rejected_job_is_persisted_without_becoming_notification_eligible(repo):
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/unmatched")
+    matcher = FakeMatcher(default=AIResponse(
+        relevant=False, priority=Priority.P3, match_score=32,
+        reasons=["the role does not fit the candidate"],
+    ))
+    notifier = FakeNotifier()
+
+    stats = run(build_pipeline(
+        [FakeSource([job])], repo, matcher, notifier, ai_match_weight=1.0
+    ))
+
+    stored = repo.get_by_source_id(job.source, job.source_job_id)
+    assert stored is not None
+    assert stored.ai_decision["relevant"] is False
+    assert stored.match_result["match"] is False
+    assert stored.match_result["match_score"] == 32
+    assert stored.match_result["priority"] == "P3"
+    assert stored.match_result["ai_score"] == 32
+    assert stats.jobs_new == 1 and stats.jobs_below_match == 1
+    assert stats.jobs_notification_eligible == 0
+    assert notifier.sent == []
+
+
+def test_retry_after_persistence_reuses_the_same_telegram_job_record(repo):
+    class RetryOnceRepository(JobRepository):
+        fail_completion = True
+
+        def complete_telegram_job(self, message_identity):
+            if self.fail_completion:
+                self.fail_completion = False
+                raise RuntimeError("simulate interruption after persistence")
+            return super().complete_telegram_job(message_identity)
+
+    retry_repo = RetryOnceRepository(repo.db_path)
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/retry")
+    source = FakeSource([job])
+    matcher = FakeMatcher(default=AIResponse(
+        relevant=False, priority=Priority.P3, match_score=32,
+        reasons=["not a fit"],
+    ))
+
+    first = run(build_pipeline([source], retry_repo, matcher, FakeNotifier(), ai_match_weight=1.0))
+    assert first.jobs_new == 1 and first.jobs_failed == 1
+    with retry_repo._get_conn() as connection:
+        connection.execute(
+            "UPDATE processing_queue SET available_at = datetime('now', '-1 second')"
+        )
+        connection.commit()
+
+    second = run(build_pipeline([source], retry_repo, matcher, FakeNotifier(), ai_match_weight=1.0))
+
+    assert second.jobs_new == 0
+    assert retry_repo.get_by_source_id(job.source, job.source_job_id).match_result["match"] is False
+    with retry_repo._get_conn() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
 
 
 def test_scan_logs_collection_matching_priorities_and_notification(repo, caplog):

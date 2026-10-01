@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import re
 import signal
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -173,6 +174,16 @@ class WorkerService:
                         raise RuntimeError("Telegram session could not be verified")
                     self._publish_runtime()
                     result = {"connected": True}
+                elif name == "RELOAD_CONFIGURATION":
+                    self._refresh_environment_keys(arguments.get("env_keys", []))
+                    await self.state.reload_configuration(
+                        propagate_to_worker=False
+                    )
+                    self._publish_runtime()
+                    result = {
+                        "reloaded": True,
+                        "monitor_status": self.runtime.monitor_state,
+                    }
                 elif name == "AUTH_RELEASE":
                     result = await self._release_telegram_for_authentication()
                 elif name == "AUTH_RESUME":
@@ -328,6 +339,24 @@ class WorkerService:
 
     def _set_auth_status(self, status: str) -> None:
         self.repo.set_source_state("system", "telegram_auth_status", status)
+
+    @staticmethod
+    def _refresh_environment_keys(keys) -> None:
+        if not isinstance(keys, list) or any(
+            not isinstance(key, str)
+            or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", key)
+            for key in keys
+        ):
+            raise ValueError("Invalid environment key list")
+        if not keys:
+            return
+        from dotenv import dotenv_values
+
+        settings = dotenv_values(Path.cwd() / ".env")
+        for key in keys:
+            value = settings.get(key)
+            if value is not None:
+                os.environ[key] = value
 
     def _auth_handoff_expired(self) -> bool:
         value = self.repo.get_source_state(

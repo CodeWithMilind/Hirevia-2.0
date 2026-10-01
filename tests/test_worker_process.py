@@ -3,9 +3,13 @@
 import asyncio
 import os
 import subprocess
+from types import SimpleNamespace
 
+from hirevia.config import Config
+from hirevia.core.models import ScanStats
 from hirevia.core.models import Job
 from hirevia.storage.state import JobRepository
+from hirevia.web import state as web_state
 from hirevia.worker import WorkerService
 from hirevia.worker_process import WorkerProcessController, WorkerProcessError
 
@@ -161,6 +165,38 @@ def test_shutdown_kills_only_after_terminate_times_out():
     assert child.terminate_calls == 1
     assert child.kill_calls == 1
     assert child.poll() == -9
+
+
+def test_reload_command_timeout_is_reported_not_completed():
+    class PendingCommandRepository:
+        def __init__(self):
+            self.command = None
+
+        def get_worker_runtime(self):
+            return {"pid": 123, "status": "RUNNING", "alive": True}
+
+        def enqueue_worker_command(self, command, arguments=None):
+            self.command = (command, arguments)
+            return "pending-reload"
+
+        def get_worker_command(self, command_id):
+            return {"status": "PENDING", "result": None, "error": None}
+
+    repo = PendingCommandRepository()
+    controller = WorkerProcessController(repo, spawn_enabled=False)
+
+    try:
+        asyncio.run(controller.send_command(
+            "RELOAD_CONFIGURATION", {"env_keys": ["LLAMACPP_MODEL"]}, timeout=0.01
+        ))
+    except WorkerProcessError as error:
+        assert "did not complete RELOAD_CONFIGURATION" in str(error)
+    else:
+        raise AssertionError("A pending reload was reported as successful")
+
+    assert repo.command == (
+        "RELOAD_CONFIGURATION", {"env_keys": ["LLAMACPP_MODEL"]}
+    )
 
 
 def test_systemd_mode_controller_never_spawns_missing_worker(monkeypatch, tmp_path):
@@ -404,3 +440,232 @@ def test_graceful_shutdown_waits_for_in_progress_scan(tmp_path):
     assert state.close_calls == 1
     assert repo.get_worker_command(shutdown_id)["status"] == "COMPLETED"
     assert repo.get_worker_runtime()["status"] == "STOPPED"
+
+
+def test_worker_reload_applies_latest_yaml_while_stopped(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hirevia.web.state.provider_status", lambda config: [])
+    for key in ("AI_PRIMARY_PROVIDER", "LLAMACPP_MODEL", "LLAMACPP_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    (tmp_path / "sources.yaml").write_text(
+        "sources:\n  telegram:\n    enabled: false\n", encoding="utf-8"
+    )
+    (tmp_path / "filters.yaml").write_text("roles: []\n", encoding="utf-8")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    repo = JobRepository(tmp_path / "config-reload-stopped.db")
+    state = web_state.WebUIState(config=Config(), repo=repo)
+    created = []
+
+    class FakePipeline:
+        def __init__(self, config, current_repo, matcher):
+            self.config = config
+            self.registry = SimpleNamespace(get_source=lambda name: None)
+            created.append(self)
+
+        async def run_scan(self):
+            return ScanStats()
+
+    state.worker_runtime.pipeline_factory = FakePipeline
+    service = WorkerService(state)
+    command_id = repo.enqueue_worker_command("RELOAD_CONFIGURATION")
+
+    async def reload():
+        await service._process_commands()
+
+    asyncio.run(reload())
+
+    (tmp_path / "filters.yaml").write_text(
+        "roles:\n  - Latest Worker Role\n", encoding="utf-8"
+    )
+    (tmp_path / ".env").write_text(
+        "AI_PRIMARY_PROVIDER=llamacpp\n"
+        "LLAMACPP_MODEL=latest-worker-model\n"
+        "LLAMACPP_API_KEY=worker-only-secret\n",
+        encoding="utf-8",
+    )
+    # A second command verifies the worker reads the current files, not startup state.
+    command_id = repo.enqueue_worker_command(
+        "RELOAD_CONFIGURATION",
+        {"env_keys": ["AI_PRIMARY_PROVIDER", "LLAMACPP_MODEL", "LLAMACPP_API_KEY"]},
+    )
+    asyncio.run(reload())
+
+    assert repo.get_worker_command(command_id)["status"] == "COMPLETED"
+    assert state.config.filters.roles == ["Latest Worker Role"]
+    assert state.pipeline.config.filters.roles == ["Latest Worker Role"]
+    assert state.config.ai.providers["llamacpp"].model == "latest-worker-model"
+    assert os.environ["LLAMACPP_API_KEY"] == "worker-only-secret"
+    assert len(created) == 2
+    assert state.is_running is False
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+
+
+def test_worker_defers_active_reload_until_scan_boundary_and_reuses_runtime(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hirevia.web.state.provider_status", lambda config: [])
+    (tmp_path / "sources.yaml").write_text(
+        "sources:\n  telegram:\n    enabled: false\n", encoding="utf-8"
+    )
+    (tmp_path / "filters.yaml").write_text("roles: []\n", encoding="utf-8")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    repo = JobRepository(tmp_path / "config-reload-active.db")
+    config = Config()
+    config.sources.sources["telegram"].enabled = False
+    state = web_state.WebUIState(config=config, repo=repo)
+    scan_gate = asyncio.Event()
+    created = []
+
+    class FakePipeline:
+        def __init__(self, current_config, current_repo, matcher):
+            self.config = current_config
+            self.registry = SimpleNamespace(get_source=lambda name: None)
+            self.wait_for_gate = not created
+            created.append(self)
+
+        async def run_scan(self):
+            if self.wait_for_gate:
+                await scan_gate.wait()
+            return ScanStats()
+
+    state.worker_runtime.pipeline_factory = FakePipeline
+    state._ensure_ai_matcher = lambda: None
+    service = WorkerService(state, poll_seconds=0.01)
+    worker_pid = service.pid
+
+    async def reload_during_monitoring():
+        assert await state.worker_runtime.start_scanner(persist_desired=False)
+        for _ in range(100):
+            if state.is_scanning:
+                break
+            await asyncio.sleep(0.01)
+        assert state.is_scanning is True
+
+        (tmp_path / "filters.yaml").write_text(
+            "roles:\n  - Active Update Role\n", encoding="utf-8"
+        )
+        command_id = repo.enqueue_worker_command("RELOAD_CONFIGURATION")
+        await service._process_commands()
+        assert repo.get_worker_command(command_id)["status"] == "PENDING"
+        assert len(created) == 1
+
+        scan_gate.set()
+        for _ in range(100):
+            if not state.is_scanning:
+                break
+            await asyncio.sleep(0.01)
+        await service._process_commands()
+        assert repo.get_worker_command(command_id)["status"] == "COMPLETED"
+
+        assert state.is_running is True
+        assert state.config.filters.roles == ["Active Update Role"]
+        assert state.pipeline.config.filters.roles == ["Active Update Role"]
+        assert len(created) == 2
+        assert state.worker_runtime is service.runtime
+        assert service.pid == worker_pid
+        await state.worker_runtime.stop_scanner(persist_desired=False)
+
+    try:
+        asyncio.run(reload_during_monitoring())
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
+
+
+def test_active_configuration_reload_never_overlaps_telegram_clients(
+    monkeypatch, tmp_path
+):
+    from hirevia.sources import telegram_source
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hirevia.web.state.provider_status", lambda config: [])
+    monkeypatch.setattr(
+        "hirevia.worker_runtime.load_telegram_settings",
+        lambda: SimpleNamespace(enabled=True),
+    )
+    monkeypatch.setattr(
+        "hirevia.worker_runtime.load_telegram_credentials", lambda: None
+    )
+    (tmp_path / "sources.yaml").write_text(
+        "sources:\n  telegram:\n    enabled: true\n", encoding="utf-8"
+    )
+    (tmp_path / "filters.yaml").write_text("roles: []\n", encoding="utf-8")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    repo = JobRepository(tmp_path / "config-reload-telegram.db")
+    state = web_state.WebUIState(config=Config(), repo=repo)
+    state._ensure_ai_matcher = lambda: None
+    state.validate_telegram_sources = lambda **kwargs: asyncio.sleep(
+        0, result={"authenticated": True, "validation_complete": True}
+    )
+    client_counts = {"active": 0, "maximum": 0, "created": 0, "closed": 0}
+    sources = []
+    pipelines = []
+
+    class FakeTelegramSource:
+        last_collection_failed = False
+        has_more_backfill = False
+
+        async def start_continuous_monitoring(self):
+            assert client_counts["active"] == 0
+            client_counts["active"] += 1
+            client_counts["created"] += 1
+            client_counts["maximum"] = max(
+                client_counts["maximum"], client_counts["active"]
+            )
+
+        async def stop_continuous_monitoring(self):
+            client_counts["active"] -= 1
+            client_counts["closed"] += 1
+
+        def enable_event_mode(self):
+            return None
+
+        def retry_uncommitted_event(self):
+            return False
+
+    class FakePipeline:
+        def __init__(self, config, current_repo, matcher):
+            source = FakeTelegramSource()
+            sources.append(source)
+            self.registry = SimpleNamespace(get_source=lambda name: source)
+            self.config = config
+            pipelines.append(self)
+
+        async def run_scan(self):
+            return ScanStats()
+
+    state.worker_runtime.pipeline_factory = FakePipeline
+    service = WorkerService(state, poll_seconds=0.01)
+
+    async def reload():
+        assert await state.worker_runtime.start_scanner(persist_desired=False)
+        for _ in range(100):
+            if sources and state.worker_runtime.continuous_telegram_source is sources[0]:
+                break
+            await asyncio.sleep(0.01)
+        command_id = repo.enqueue_worker_command("RELOAD_CONFIGURATION")
+        for _ in range(200):
+            await service._process_commands()
+            command = repo.get_worker_command(command_id)
+            if command["status"] in {"COMPLETED", "ERROR"}:
+                break
+            await asyncio.sleep(0.01)
+
+        assert repo.get_worker_command(command_id)["status"] == "COMPLETED"
+        assert state.is_running is True
+        assert client_counts == {"active": 1, "maximum": 1, "created": 2, "closed": 1}
+        assert len(pipelines) == 2
+        await state.worker_runtime.stop_scanner(persist_desired=False)
+        assert client_counts["active"] == 0
+
+    try:
+        asyncio.run(reload())
+    finally:
+        telegram_source._shared_client = None
+        web_state._web_state = None
+        web_state.WebUIState._instance = None

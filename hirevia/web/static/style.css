@@ -103,6 +103,8 @@ p { margin: 5px 0 0; color: var(--muted); }
 .skill-tag { padding: 2px 6px; border: 1px solid var(--border); border-radius: 3px; color: #c4c9c5; font-size: 10px; }
 .job-side { display: flex; flex-direction: column; align-items: end; gap: 7px; min-width: 110px; }
 .match-score { color: var(--green); font: 12px var(--mono); }
+.match-status { color: var(--muted); font: 10px var(--mono); text-transform: uppercase; }
+.match-status.unmatched { color: var(--yellow); }
 .application-state { color: var(--muted); font-size: 10px; text-transform: capitalize; }
 .job-actions { display: flex; gap: 5px; margin-top: 3px; }
 .text-action { padding: 3px 5px; border: 0; background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; }

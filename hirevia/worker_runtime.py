@@ -53,6 +53,32 @@ class WorkerRuntime:
             return True
         return bool(self.telegram_session_lock and self.telegram_session_lock.acquired)
 
+    async def reload_configuration(self, config, ai_matcher) -> None:
+        state = self.state
+        was_running = self.is_running
+        if was_running:
+            stopped = await self.stop_scanner(
+                persist_desired=False, rebuild_pipeline=False
+            )
+            if not stopped:
+                raise RuntimeError("Monitor could not pause for configuration reload")
+
+        state.config = config
+        state.ai_matcher = ai_matcher
+        state.scan_interval_minutes = config.scan_interval_minutes
+        state.notifier = None
+        state.telegram_source_validation = None
+        state.telegram_source_validation_at = None
+        state.telegram_validation_complete = False
+
+        if was_running:
+            if not await self.start_scanner(persist_desired=False):
+                raise RuntimeError(
+                    state.monitor_start_error or "Monitor could not resume after configuration reload"
+                )
+        else:
+            self.pipeline = self.pipeline_factory(config, state.repo, ai_matcher)
+
     async def start_scanner(self, persist_desired: bool = True) -> bool:
         state = self.state
         if self.is_running or self.monitor_state == "STARTING":
@@ -119,7 +145,7 @@ class WorkerRuntime:
                 state.monitor_start_error = "Telegram collector could not be initialized"
                 return False
             try:
-                await source.start_continuous_monitoring()
+                channel_count = await source.start_continuous_monitoring()
             except Exception as error:
                 self.monitor_state = "ERROR"
                 state.monitor_start_error = "Telegram listener could not be started"
@@ -127,6 +153,10 @@ class WorkerRuntime:
                     f"Telegram monitor startup failed ({type(error).__name__})", "error"
                 )
                 return False
+            if isinstance(channel_count, int):
+                logger.info("Telegram connected (%d channels)", channel_count)
+            else:
+                logger.info("Telegram connected")
             self.continuous_telegram_source = source
 
         self.scanner_started = asyncio.Event()
@@ -151,9 +181,12 @@ class WorkerRuntime:
         if persist_desired:
             state.repo.set_source_state("system", "monitor_desired", "running")
         state.add_activity("Scanner started")
+        logger.info("Monitor started")
         return True
 
-    async def stop_scanner(self, persist_desired: bool = True) -> bool:
+    async def stop_scanner(
+        self, persist_desired: bool = True, *, rebuild_pipeline: bool = True
+    ) -> bool:
         state = self.state
         if persist_desired:
             state.repo.set_source_state("system", "monitor_desired", "stopped")
@@ -176,9 +209,10 @@ class WorkerRuntime:
                 logger.warning("Monitor worker was cancelled during shutdown")
             self.scanner_task = None
 
-        self.pipeline = self.pipeline_factory(
-            state.config, state.repo, state.ai_matcher
-        )
+        if rebuild_pipeline:
+            self.pipeline = self.pipeline_factory(
+                state.config, state.repo, state.ai_matcher
+            )
         self.monitor_state = "STOPPED"
         state.add_activity("Scanner stopped")
         return True
@@ -230,6 +264,14 @@ class WorkerRuntime:
                 f"{stats.jobs_new} new, {stats.jobs_duplicate} duplicates, "
                 f"{stats.jobs_filtered} filtered",
                 "info" if not stats.errors else "warning",
+            )
+            matched_summary = (
+                f" | Matched: {stats.jobs_ai_matched}"
+                if stats.jobs_ai_matched else ""
+            )
+            logger.info(
+                "Scan complete | Found: %d | New: %d%s",
+                stats.jobs_found, stats.jobs_new, matched_summary,
             )
             return stats
         except Exception as error:

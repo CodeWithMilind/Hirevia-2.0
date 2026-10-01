@@ -78,7 +78,19 @@ class Job(BaseModel):
 
     def verdict(self) -> Dict[str, Any]:
         """The score/priority to display, in dict form."""
-        return self.match_result or self.ai_decision or {}
+        verdict = dict(self.match_result or self.ai_decision or {})
+        for payload in (self.match_result, self.ai_decision):
+            if not isinstance(payload, dict):
+                continue
+            match = next((
+                payload[key]
+                for key in ("match", "matched", "relevant")
+                if isinstance(payload.get(key), bool)
+            ), None)
+            if match is not None:
+                verdict["match"] = match
+                break
+        return verdict
 
     def verdict_model(self) -> Optional["MatchResult"]:
         """The canonical MatchResult for a stored job, rebuilt from whichever

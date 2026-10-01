@@ -1,5 +1,6 @@
 """Cross-process exclusion for the persistent Telethon session file."""
 
+import os
 import subprocess
 import sys
 import time
@@ -76,8 +77,13 @@ def test_process_crash_releases_lock_without_changing_session(tmp_path):
         f"Path({str(ready_file)!r}).write_text('ready'); "
         "time.sleep(60)"
     )
+    python_executable = (
+        getattr(sys, "_base_executable", sys.executable)
+        if os.name == "nt"
+        else sys.executable
+    )
     owner = subprocess.Popen(
-        [sys.executable, "-c", script],
+        [python_executable, "-c", script],
         cwd=Path.cwd(),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

@@ -141,6 +141,30 @@ class WorkerProcessController:
         database_path = Path(self.repo.db_path).expanduser().resolve()
         child_environment = os.environ.copy()
         child_environment["HIREVIA_DB_PATH"] = str(database_path)
+        command = [sys.executable, "-m", "hirevia", "worker"]
+        if os.name == "nt":
+            base_executable = getattr(sys, "_base_executable", sys.executable)
+            if Path(base_executable).resolve() != Path(sys.executable).resolve():
+                import site
+
+                site_paths = site.getsitepackages()
+                bootstrap = (
+                    "import runpy, site, sys; "
+                    f"sys.prefix = sys.exec_prefix = {sys.prefix!r}; "
+                    + "; ".join(
+                        f"site.addsitedir({path!r})" for path in site_paths
+                    )
+                    + "; sys.argv = ['hirevia', 'worker']; "
+                    + "runpy.run_module('hirevia', run_name='__main__', alter_sys=True)"
+                )
+                command = [
+                    base_executable,
+                    "-c",
+                    bootstrap,
+                    "-m",
+                    "hirevia",
+                    "worker",
+                ]
         options = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
@@ -157,7 +181,7 @@ class WorkerProcessController:
         else:
             options["start_new_session"] = True
         self._spawned_process = self._popen(
-            [sys.executable, "-m", "hirevia", "worker"], **options
+            command, **options
         )
         self._spawned_db_path = database_path
 

@@ -51,12 +51,17 @@ def _state():
     return get_web_state()
 
 
-def _require_monitor_stopped(state) -> None:
-    if state.is_running or state.is_scanning:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop monitoring and wait for the current scan to finish before changing configuration",
+async def _reload_configuration(state, *, env_keys=()) -> None:
+    try:
+        await state.reload_configuration(env_keys=env_keys)
+    except Exception as error:
+        state.add_activity(
+            f"Configuration reload failed ({type(error).__name__})", "error"
         )
+        raise HTTPException(
+            status_code=503,
+            detail="Configuration was saved, but the worker did not apply it. Check worker status and retry.",
+        ) from error
 
 
 def _log_directory() -> Path:
@@ -245,6 +250,7 @@ async def get_jobs(
     status: Optional[str] = Query(None),
     priority: Optional[str] = Query(None, pattern="^(P1|P2|P3)$"),
     min_match: Optional[int] = Query(None),
+    match_status: Optional[str] = Query(None, pattern="^unmatched$"),
     location: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
@@ -257,6 +263,7 @@ async def get_jobs(
         status=status,
         priority=priority,
         min_match=min_match,
+        match_status=match_status,
         location=location,
         limit=limit,
         offset=offset,
@@ -358,7 +365,6 @@ async def validate_config_file(filename: str, request: ConfigFileRequest):
 @router.put("/config/files/{filename}")
 async def save_config_file(filename: str, request: ConfigFileRequest):
     state = _state()
-    _require_monitor_stopped(state)
     path = _config_path(filename)
     _validate_yaml(filename, request.content)
     temp_name = None
@@ -377,7 +383,7 @@ async def save_config_file(filename: str, request: ConfigFileRequest):
         if temp_name:
             Path(temp_name).unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail="Could not save configuration file") from error
-    await state.reload_configuration()
+    await _reload_configuration(state)
     state.add_activity(f"Configuration file saved: {filename}")
     return {"success": True, "name": filename}
 
@@ -450,7 +456,6 @@ def _persist_env_settings(settings: dict[str, str]) -> None:
 @router.put("/ai/config")
 async def update_ai_config(request: AISettingsRequest):
     state = _state()
-    _require_monitor_stopped(state)
     name = request.primary.strip().lower()
     if name not in state.config.ai.providers:
         raise HTTPException(status_code=422, detail="Unknown AI provider")
@@ -478,7 +483,7 @@ async def update_ai_config(request: AISettingsRequest):
         _persist_env_settings(settings)
     except (OSError, ValueError) as error:
         raise HTTPException(status_code=500, detail="Could not save AI settings") from error
-    await state.reload_configuration()
+    await _reload_configuration(state, env_keys=settings.keys())
     state.add_activity(f"AI settings updated: primary={name}, model={request.model.strip()}")
     return {"success": True, "primary": state.config.ai.primary, "model": state.config.ai.providers[name].model}
 
@@ -530,7 +535,7 @@ async def join_telegram_sources():
 
 @router.put("/telegram/sources/{username}")
 async def update_telegram_source(username: str, request: TelegramSourceUpdate):
-    _require_monitor_stopped(_state())
+    state = _state()
     path = Path.cwd() / "telegram.yaml"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="telegram.yaml does not exist")
@@ -568,8 +573,8 @@ async def update_telegram_source(username: str, request: TelegramSourceUpdate):
         if temp_name:
             Path(temp_name).unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail="Could not save Telegram sources") from error
-    await _state().reload_configuration()
-    _state().add_activity(
+    await _reload_configuration(state)
+    state.add_activity(
         f"Telegram source @{normalized} collection {'enabled' if request.enabled else 'disabled'}"
     )
     return {"success": True, "username": normalized, "enabled": request.enabled}

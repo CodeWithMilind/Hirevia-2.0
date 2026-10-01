@@ -141,6 +141,7 @@ class JobResponse(BaseModel):
     notification_channel: Optional[str] = None
     ai_decision: Optional[Dict[str, Any]] = None
     freshness_minutes: Optional[int] = None
+    match_status: Optional[str] = None
     match_score: Optional[int] = None
     match_priority: Optional[str] = None
     # Phase 7 hybrid verdict (deterministic evidence + AI). Declared here so

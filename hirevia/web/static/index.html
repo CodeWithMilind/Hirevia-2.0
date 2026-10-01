@@ -33,11 +33,12 @@
         <main class="content">
             <section class="view active" id="view-jobs">
                 <div class="view-heading"><div><div class="eyebrow">OPPORTUNITY FEED</div><h1>Jobs</h1></div><div class="feed-tools"><label class="search-box"><span>⌕</span><input id="jobSearch" type="search" placeholder="Search opportunities" autocomplete="off"></label><button class="button quiet" id="deleteAllJobs" title="Permanently delete all jobs">Delete all</button></div></div>
-                <div class="priority-tabs" role="tablist" aria-label="Filter by priority">
+                <div class="priority-tabs" role="tablist" aria-label="Filter by match status or priority">
                     <button class="priority-tab active" data-priority="">ALL <span id="countAll">0</span></button>
                     <button class="priority-tab" data-priority="P1">P1 <span id="countP1">0</span></button>
                     <button class="priority-tab" data-priority="P2">P2 <span id="countP2">0</span></button>
                     <button class="priority-tab" data-priority="P3">P3 <span id="countP3">0</span></button>
+                    <button class="priority-tab" data-match-status="unmatched">UNMATCHED <span id="countUnmatched">0</span></button>
                 </div>
                 <div class="feed-meta"><span id="feedCount">Loading active opportunities</span><span>Active window · 24 hours</span></div>
                 <div class="job-feed" id="jobsList"><div class="empty-state">Loading opportunities…</div></div>

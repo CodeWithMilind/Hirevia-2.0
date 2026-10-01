@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 import re
 import socket
 import sys
+from datetime import datetime
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -39,7 +40,10 @@ LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s | %(message)s"
 
 def _redact_log_text(message: str) -> str:
     """Remove configured secret values and secret-shaped assignments."""
-    secret_markers = ("API_KEY", "API_HASH", "BOT_TOKEN", "ADMIN_TOKEN", "PASSWORD", "OTP", "SECRET", "SESSION")
+    secret_markers = (
+        "API_KEY", "API_HASH", "API_ID", "BOT_TOKEN", "ADMIN_TOKEN",
+        "PASSWORD", "OTP", "SECRET", "SESSION", "PHONE",
+    )
     secret_values = sorted(
         {
             value
@@ -52,7 +56,7 @@ def _redact_log_text(message: str) -> str:
     for secret in secret_values:
         message = message.replace(secret, "[REDACTED]")
     return re.sub(
-        r"(?i)\b(api[_-]?key|api[_-]?hash|bot[_-]?token|admin[_-]?token|password|otp|secret|session)(\s*[:=]\s*)([^\s,;]+)",
+        r"(?i)\b(api[_-]?(?:key|hash|id)|bot[_-]?token|admin[_-]?token|password|passphrase|otp|verification code|one[- ]time code|2fa code|phone(?:[_ ]number)?|secret|session)(\s*(?:[:=]|is\b|-)\s*)([^\s,;]+)",
         r"\1\2[REDACTED]",
         message,
     )
@@ -64,7 +68,7 @@ class _SecretRedactingFormatter(logging.Formatter):
 
 
 def configure_logging(verbose: bool = False) -> None:
-    """Configure the application logger without stacking console handlers."""
+    """Configure concise terminal output and complete rotating file logs."""
     configured_level = os.getenv("HIREVIA_LOG_LEVEL", "").strip().upper()
     level = getattr(logging, configured_level, None) if configured_level else None
     if not isinstance(level, int):
@@ -72,25 +76,35 @@ def configure_logging(verbose: bool = False) -> None:
 
     root = logging.getLogger()
     root.setLevel(level)
-    logging.getLogger("telethon").setLevel(
-        logging.DEBUG if level <= logging.DEBUG else logging.WARNING
-    )
-    for logger_name in ("httpx", "httpx2"):
-        logging.getLogger(logger_name).setLevel(
-            logging.DEBUG if level <= logging.DEBUG else logging.WARNING
-        )
     stream_handlers = [
         handler for handler in root.handlers
         if isinstance(handler, logging.StreamHandler)
         and not isinstance(handler, logging.FileHandler)
+        and getattr(handler, "_hirevia_console_handler", False)
     ]
     if not stream_handlers:
-        stream_handlers = [logging.StreamHandler()]
-        root.addHandler(stream_handlers[0])
-    for handler in root.handlers:
-        handler.setLevel(level)
+        candidates = [
+            handler for handler in root.handlers
+            if isinstance(handler, logging.StreamHandler)
+            and not isinstance(handler, logging.FileHandler)
+            and type(handler).__name__ != "LogCaptureHandler"
+        ]
+        stream_handler = candidates[0] if candidates else logging.StreamHandler(sys.stdout)
+        if candidates:
+            stream_handler.stream = sys.stdout
+        stream_handler._hirevia_console_handler = True
+        if stream_handler not in root.handlers:
+            root.addHandler(stream_handler)
+        stream_handlers = [stream_handler]
+        for handler in candidates[1:]:
+            root.removeHandler(handler)
+            handler.close()
     for handler in stream_handlers:
-        handler.setFormatter(_SecretRedactingFormatter(LOG_FORMAT))
+        handler.stream = sys.stdout
+        handler.setLevel(logging.DEBUG)
+        handler.filters.clear()
+        handler.addFilter(_MonitorLogFilter(verbose=verbose))
+        handler.setFormatter(_SecretRedactingFormatter("%(message)s"))
 
     log_directory = Path(os.getenv("HIREVIA_LOG_DIR", "logs")).expanduser()
     log_directory.mkdir(parents=True, exist_ok=True)
@@ -100,6 +114,23 @@ def configure_logging(verbose: bool = False) -> None:
         if isinstance(handler, RotatingFileHandler)
         and Path(handler.baseFilename).resolve() == log_path
     ]
+    for handler in list(root.handlers):
+        if (
+            isinstance(handler, RotatingFileHandler)
+            and getattr(handler, "_hirevia_file_handler", False)
+            and Path(handler.baseFilename).resolve() != log_path
+        ):
+            root.removeHandler(handler)
+            handler.close()
+    file_handlers = [
+        handler for handler in root.handlers
+        if isinstance(handler, RotatingFileHandler)
+        and Path(handler.baseFilename).resolve() == log_path
+    ]
+    for handler in file_handlers[1:]:
+        root.removeHandler(handler)
+        handler.close()
+    file_handlers = file_handlers[:1]
     if not file_handlers:
         file_handler = RotatingFileHandler(
             log_path,
@@ -109,11 +140,19 @@ def configure_logging(verbose: bool = False) -> None:
         )
         file_handler.setLevel(level)
         file_handler.setFormatter(_SecretRedactingFormatter(LOG_FORMAT))
+        file_handler._hirevia_file_handler = True
         root.addHandler(file_handler)
+    else:
+        file_handlers[0].setLevel(level)
+        file_handlers[0].setFormatter(_SecretRedactingFormatter(LOG_FORMAT))
 
 
 class _MonitorLogFilter(logging.Filter):
-    """Translate selected internal monitor events into concise console lines."""
+    """Send only concise status and actionable failure lines to the terminal."""
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+        self.verbose = verbose
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -121,8 +160,22 @@ class _MonitorLogFilter(logging.Filter):
         except Exception:
             return False
 
+        if record.name in {"telethon", "httpx", "httpx2"} and record.levelno < logging.WARNING:
+            return False
+
         display = None
-        if record.name == "hirevia.sources.telegram_source":
+        if self.verbose:
+            display = f"{record.levelname} {record.name} | {message}"
+        if record.name == "hirevia.cli" and message.startswith("Starting web server at "):
+            display = "Hirevia started"
+        elif record.name == "hirevia.worker_runtime":
+            if message.startswith("Monitor started"):
+                display = "Monitor started"
+            elif message.startswith("Telegram connected ("):
+                display = message
+            elif message.startswith("Scan complete | "):
+                display = message
+        elif record.name == "hirevia.sources.telegram_source":
             if "New message: channel=" in message:
                 display = "[Telegram] New message received"
             elif "[Filter] REJECTED" in message:
@@ -140,10 +193,16 @@ class _MonitorLogFilter(logging.Filter):
             if "Message processing incomplete; retrying" in message or "Startup catch-up incomplete; retrying" in message:
                 display = "[Telegram] Processing failed — retrying"
 
-        if display:
-            if not getattr(record, "_hirevia_monitor_rendered", False):
-                record._hirevia_monitor_rendered = True
-                console.print(display)
+        if display is None and record.levelno >= logging.WARNING:
+            error_type = record.exc_info[0].__name__ if record.exc_info else None
+            detail = f" ({error_type})" if error_type else ""
+            display = f"{record.levelname}: {record.name}{detail}"
+        if display is not None:
+            timestamp = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+            rendered = _redact_log_text(display)
+            if self.verbose:
+                rendered = _redact_log_text(f"{record.levelname} {record.name} | {message}")
+            console.print(f"[{timestamp}] {rendered}", markup=False)
         return False
 
 
@@ -154,26 +213,16 @@ def _monitor_log_presentation(verbose: bool):
         yield
         return
 
-    root = logging.getLogger()
-    handlers = list(root.handlers)
-    handler_states = [(handler, handler.level) for handler in handlers]
     monitor_loggers = [
         logging.getLogger("hirevia.core.pipeline"),
         logging.getLogger("hirevia.sources.telegram_source"),
     ]
     logger_states = [(item, item.level) for item in monitor_loggers]
-    output_filter = _MonitorLogFilter()
-    for handler in handlers:
-        handler.addFilter(output_filter)
-        handler.setLevel(logging.DEBUG)
     for item in monitor_loggers:
         item.setLevel(logging.DEBUG)
     try:
         yield
     finally:
-        for handler, level in handler_states:
-            handler.removeFilter(output_filter)
-            handler.setLevel(level)
         for item, level in logger_states:
             item.setLevel(level)
 

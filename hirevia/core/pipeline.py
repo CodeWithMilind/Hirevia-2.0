@@ -345,6 +345,10 @@ class Pipeline:
         filters = apply_filters(job, self.config.filters, self.profile)
         if not filters.passed:
             self.stats.jobs_filtered += 1
+            job.raw_data["filter_status"] = filters.status
+            job.raw_data["filter_reason"] = filters.reason
+            if self.repo.upsert_job(job):
+                self.stats.jobs_new += 1
             logger.info(
                 "%s %s Stage 4 filtered %r: %s (%s; %.3fs)",
                 PREFIX, tag, job.title, filters.reason, filters.status,
@@ -365,6 +369,12 @@ class Pipeline:
         self.stats.jobs_rule_strong += int(evidence.score >= self.config.match_min_score)
         if evidence.hard_reject:
             self.stats.jobs_filtered += 1
+            verdict = combine(evidence, self.config)
+            job.match_result = verdict.model_dump(mode="json")
+            job.raw_data["deterministic_score"] = verdict.deterministic_score
+            job.raw_data["ai_status"] = verdict.ai_status
+            if self.repo.upsert_job(job):
+                self.stats.jobs_new += 1
             logger.info(
                 "%s %s Stage 4 profile eligibility rejected %r: %s",
                 PREFIX, tag, job.title, evidence.reject_reasons[0],
@@ -411,6 +421,8 @@ class Pipeline:
                 )
             if not verdict.match:
                 self.stats.jobs_below_match += 1
+                if self.repo.upsert_job(job):
+                    self.stats.jobs_new += 1
                 return
         else:
             self.stats.jobs_matching_attempted += 1
@@ -455,6 +467,8 @@ class Pipeline:
                     )
         if not verdict.match:
             self.stats.jobs_below_match += 1
+            if self.repo.upsert_job(job):
+                self.stats.jobs_new += 1
             logger.debug(
                 "%s %s Stage 5: no match for %r (%d%%, deterministic %d%%) - %s",
                 PREFIX, tag, job.title, verdict.match_score, verdict.deterministic_score,

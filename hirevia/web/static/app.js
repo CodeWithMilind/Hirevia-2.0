@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { priority: "", search: "", page: 0, limit: 25, total: 0, jobs: [], status: null, configFile: null, ai: null, telegram: null, telegramMembership: null };
+const state = { priority: "", matchStatus: "", search: "", page: 0, limit: 25, total: 0, jobs: [], status: null, configFile: null, ai: null, telegram: null, telegramMembership: null };
 let searchTimer;
 let toastTimer;
 let adminTokenPrompt;
@@ -98,6 +98,7 @@ function jobCard(job) {
 
   const side = node("div", "job-side");
   side.append(node("span", "match-score", typeof job.match_score === "number" ? `${job.match_score}% match` : "Not scored"));
+  if (job.match_status === "unmatched") side.append(node("span", "match-status unmatched", "Unmatched"));
   side.append(node("span", "application-state", job.application_status || "unknown"));
   const actions = node("div", "job-actions");
   const view = node("button", "text-action", "View");
@@ -123,13 +124,14 @@ function jobCard(job) {
 async function loadJobs() {
   const params = new URLSearchParams({ limit: String(state.limit), offset: String(state.page * state.limit) });
   if (state.priority) params.set("priority", state.priority);
+  if (state.matchStatus) params.set("match_status", state.matchStatus);
   if (state.search) params.set("search", state.search);
   const results = await api(`/api/jobs?${params}`);
   state.jobs = results.jobs || [];
   state.total = results.total || 0;
   const feed = $("jobsList");
   feed.replaceChildren();
-  if (!state.jobs.length) feed.append(node("div", "empty-state", state.search ? "No matching active opportunities." : "No active opportunities yet. Start monitoring or run a scan."));
+  if (!state.jobs.length) feed.append(node("div", "empty-state", state.matchStatus ? "No unmatched jobs in the active window." : state.search ? "No matching active opportunities." : "No active opportunities yet. Start monitoring or run a scan."));
   else state.jobs.forEach((job) => feed.append(jobCard(job)));
   $("feedCount").textContent = `${state.total} active opportunit${state.total === 1 ? "y" : "ies"}`;
   const pages = Math.max(1, Math.ceil(state.total / state.limit));
@@ -144,6 +146,7 @@ async function loadCounts() {
   $("countP1").textContent = counts.P1 || 0;
   $("countP2").textContent = counts.P2 || 0;
   $("countP3").textContent = counts.P3 || 0;
+  $("countUnmatched").textContent = counts.UNMATCHED || 0;
 }
 
 async function loadStatus() {
@@ -256,7 +259,7 @@ function showJob(job) {
   body.replaceChildren();
   const facts = [
     ["Company", job.company], ["Location", job.location], ["Experience", job.experience],
-    ["Priority", job.match_priority], ["Match score", typeof job.match_score === "number" ? `${job.match_score}%` : "Not scored"],
+    ["Match status", job.match_status], ["Priority", job.match_priority], ["Match score", typeof job.match_score === "number" ? `${job.match_score}%` : "Not scored"],
     ["Application status", job.application_status], ["Source", job.source], ["Detected", relativeTime(job.detected_at)],
     ["Freshness", relativeTime(job.detected_at)], ["Expires", expiresLabel(job.expires_at)],
   ];
@@ -636,7 +639,8 @@ function bind() {
   document.querySelectorAll(".nav-item[data-view]").forEach((button) => button.addEventListener("click", () => setActiveView(button.dataset.view)));
   document.querySelectorAll(".priority-tab").forEach((button) => button.addEventListener("click", async () => {
     document.querySelectorAll(".priority-tab").forEach((tab) => tab.classList.toggle("active", tab === button));
-    state.priority = button.dataset.priority;
+    state.priority = button.dataset.priority || "";
+    state.matchStatus = button.dataset.matchStatus || "";
     state.page = 0;
     try { await loadJobs(); } catch (error) { notify(error.message); }
   }));

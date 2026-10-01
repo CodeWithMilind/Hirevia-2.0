@@ -44,9 +44,11 @@ def _match_fields(job: Job) -> Dict[str, Any]:
     """
     result = job.match_result or {}
     verdict = job.verdict()
+    matched = verdict.get("match", verdict.get("relevant"))
     return {
         "ai_decision": job.ai_decision,
         "match_result": job.match_result,
+        "match_status": "matched" if matched is True else "unmatched" if matched is False else "unscored",
         "match_score": verdict.get("match_score"),
         "match_priority": verdict.get("priority"),
         "deterministic_score": result.get("deterministic_score"),
@@ -487,13 +489,15 @@ class WebUIState:
             )
         return runtime
 
-    async def _send_worker_command(self, command: str) -> Dict[str, Any]:
+    async def _send_worker_command(
+        self, command: str, arguments=None, *, timeout: float = 20.0
+    ) -> Dict[str, Any]:
         from hirevia.worker_process import WorkerProcessController
 
         controller = self.worker_controller or WorkerProcessController(
             self.repo, spawn_enabled=False
         )
-        return await controller.send_command(command)
+        return await controller.send_command(command, arguments, timeout=timeout)
 
     async def run_cleanup_once(self) -> Dict[str, Any]:
         try:
@@ -825,6 +829,7 @@ class WebUIState:
         location: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
+        match_status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Get filtered jobs list"""
         jobs = self.repo.get_active_jobs(hours=24, limit=1000)
@@ -848,6 +853,12 @@ class WebUIState:
         if priority:
             priority = priority.upper()
             jobs = [j for j in jobs if str(j.verdict().get("priority", "")).upper() == priority]
+
+        if match_status == "unmatched":
+            jobs = [
+                j for j in jobs
+                if j.verdict().get("match", j.verdict().get("relevant")) is False
+            ]
         
         if min_match is not None:
             jobs = [j for j in jobs if (j.verdict().get("match_score") or 0) >= min_match]
@@ -944,10 +955,13 @@ class WebUIState:
         }
 
     def get_job_counts(self) -> Dict[str, int]:
-        counts = {"ALL": 0, "P1": 0, "P2": 0, "P3": 0}
+        counts = {"ALL": 0, "P1": 0, "P2": 0, "P3": 0, "UNMATCHED": 0}
         for job in self.repo.get_active_jobs(hours=24, limit=1000):
             counts["ALL"] += 1
-            priority = str(job.verdict().get("priority", "")).upper()
+            verdict = job.verdict()
+            if verdict.get("match", verdict.get("relevant")) is False:
+                counts["UNMATCHED"] += 1
+            priority = str(verdict.get("priority", "")).upper()
             if priority in counts:
                 counts[priority] += 1
         return counts
@@ -984,20 +998,30 @@ class WebUIState:
             },
         }
 
-    async def reload_configuration(self) -> None:
-        self.config = load_config()
-        self.scan_interval_minutes = self.config.scan_interval_minutes
-        self.telegram_source_validation = None
-        self.telegram_source_validation_at = None
-        self.telegram_validation_complete = False
-        self.ai_matcher = (
-            AIMatcher(self.config, os.getenv("NVIDIA_API_KEY"))
-            if any(provider["configured"] for provider in provider_status(self.config))
+    async def reload_configuration(
+        self, *, env_keys=(), propagate_to_worker: bool = True
+    ) -> None:
+        config = load_config()
+        ai_matcher = (
+            AIMatcher(config, os.getenv("NVIDIA_API_KEY"))
+            if any(provider["configured"] for provider in provider_status(config))
             else None
         )
-        self.notifier = None
-        if not self.external_worker:
-            self.pipeline = Pipeline(self.config, self.repo, self.ai_matcher, None)
+        if self.external_worker and propagate_to_worker:
+            await self._send_worker_command(
+                "RELOAD_CONFIGURATION",
+                {"env_keys": list(env_keys)},
+                timeout=45.0,
+            )
+            self.config = config
+            self.ai_matcher = ai_matcher
+            self.scan_interval_minutes = config.scan_interval_minutes
+            self.telegram_source_validation = None
+            self.telegram_source_validation_at = None
+            self.telegram_validation_complete = False
+            self.notifier = None
+        else:
+            await self.worker_runtime.reload_configuration(config, ai_matcher)
         self.add_activity("Configuration reloaded")
 
     async def test_ai_provider(self) -> Dict[str, Any]:
