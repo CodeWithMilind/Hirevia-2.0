@@ -4,15 +4,17 @@ import asyncio
 import logging
 import os
 import signal
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from hirevia.config import load_config
 from hirevia.storage.state import JobRepository
+from hirevia.sources.telegram_session_lock import AUTH_HANDOFF_TIMEOUT_SECONDS
 from hirevia.web.state import initialize_web_state
 
 logger = logging.getLogger(__name__)
+AUTH_HANDOFF_TIMEOUT = timedelta(seconds=AUTH_HANDOFF_TIMEOUT_SECONDS)
 
 
 class WorkerService:
@@ -43,7 +45,12 @@ class WorkerService:
         self._install_signal_handlers()
         self.repo.update_worker_runtime(self.pid, "STARTING")
         try:
-            self._start_auth_restore()
+            acquire_session = getattr(self.runtime, "acquire_telegram_session", None)
+            if acquire_session is None or await acquire_session():
+                self._set_auth_status("RECONNECTING")
+                self._start_auth_restore()
+            else:
+                self._set_auth_status("AUTHENTICATING")
             self.repo.update_worker_runtime(self.pid, "RUNNING")
             while not self.stop_requested.is_set():
                 await self._process_commands()
@@ -82,6 +89,11 @@ class WorkerService:
                 if self.runtime.is_running:
                     await self.runtime.stop_scanner(persist_desired=False)
                 await self.state._close_telegram_clients()
+                release_session = getattr(
+                    self.runtime, "release_telegram_session", None
+                )
+                if release_session is not None:
+                    release_session()
             except Exception as error:
                 exit_status = 1
                 self.repo.update_worker_runtime(
@@ -141,12 +153,30 @@ class WorkerService:
                         "jobs_duplicate": stats.jobs_duplicate,
                         "jobs_failed": stats.jobs_failed,
                     }
+                elif name == "VALIDATE_TELEGRAM_SOURCES":
+                    if not self.runtime.owns_telegram_session():
+                        raise RuntimeError("Telegram session is not owned by the worker")
+                    result = await self.state.validate_telegram_sources(force=True)
+                elif name == "JOIN_TELEGRAM_SOURCES":
+                    if not self.runtime.owns_telegram_session():
+                        raise RuntimeError("Telegram session is not owned by the worker")
+                    result = await self.state.join_telegram_sources()
+                elif name == "SET_TELEGRAM_SOURCE_MEMBERSHIP":
+                    if not self.runtime.owns_telegram_session():
+                        raise RuntimeError("Telegram session is not owned by the worker")
+                    result = await self.state.set_telegram_source_membership(
+                        arguments["username"], bool(arguments["join"])
+                    )
                 elif name == "REFRESH_AUTH":
                     await self._refresh_auth()
                     if not self.state.telegram_authenticated:
                         raise RuntimeError("Telegram session could not be verified")
                     self._publish_runtime()
                     result = {"connected": True}
+                elif name == "AUTH_RELEASE":
+                    result = await self._release_telegram_for_authentication()
+                elif name == "AUTH_RESUME":
+                    result = await self._resume_telegram_after_authentication()
                 elif name == "LOGOUT":
                     self.repo.set_source_state("system", "monitor_desired", "stopped")
                     if self.runtime.is_running:
@@ -189,6 +219,31 @@ class WorkerService:
                 )
 
     async def _reconcile_desired_state(self) -> None:
+        acquire_session = getattr(self.runtime, "acquire_telegram_session", None)
+        owns_session = getattr(self.runtime, "owns_telegram_session", lambda: True)
+        auth_status = self.repo.get_source_state(
+            "system", "telegram_auth_status", "DISCONNECTED"
+        )
+        if auth_status == "AUTHENTICATING":
+            if not self._auth_handoff_expired():
+                return
+            if acquire_session is None or not await acquire_session():
+                return
+            self.repo.set_source_state("system", "telegram_auth_handoff_started_at", None)
+            self._set_auth_status("RECONNECTING")
+            self._start_auth_restore()
+            return
+
+        if not owns_session():
+            if acquire_session is None or not await acquire_session():
+                return
+            self._set_auth_status("RECONNECTING")
+            self._start_auth_restore()
+            return
+
+        if self._auth_restore_task is not None and not self._auth_restore_task.done():
+            return
+
         desired = self.repo.get_source_state("system", "monitor_desired", "stopped")
         if desired != "running":
             if self.runtime.is_running:
@@ -236,7 +291,11 @@ class WorkerService:
     def _start_auth_restore(self) -> None:
         if self._auth_restore_task is not None and not self._auth_restore_task.done():
             return
+        owns_session = getattr(self.runtime, "owns_telegram_session", None)
+        if owns_session is not None and not owns_session():
+            return
         self._last_auth_retry = asyncio.get_running_loop().time()
+        self._set_auth_status("RECONNECTING")
         self._auth_restore_task = asyncio.create_task(
             self.state.restore_telegram_auth_for_startup()
         )
@@ -247,12 +306,100 @@ class WorkerService:
             return
         error = task.exception()
         if error is not None:
+            self._set_auth_status("ERROR")
             logger.exception(
                 "Worker Telegram session restoration failed",
                 exc_info=(type(error), error, error.__traceback__),
             )
+            return
+        from hirevia.sources.telegram_config import load_telegram_credentials
+
+        if self.state.telegram_authenticated:
+            self._set_auth_status("CONNECTED")
+            self.repo.set_source_state(
+                "system", "telegram_auth_handoff_started_at", None
+            )
+        elif self.state.telegram_login_state == "reconnecting":
+            self._set_auth_status("RECONNECTING")
+        elif load_telegram_credentials() is None:
+            self._set_auth_status("DISCONNECTED")
+        else:
+            self._set_auth_status("AUTH_REQUIRED")
+
+    def _set_auth_status(self, status: str) -> None:
+        self.repo.set_source_state("system", "telegram_auth_status", status)
+
+    def _auth_handoff_expired(self) -> bool:
+        value = self.repo.get_source_state(
+            "system", "telegram_auth_handoff_started_at"
+        )
+        if not value:
+            return True
+        try:
+            started = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return True
+        return datetime.utcnow() - started >= AUTH_HANDOFF_TIMEOUT
+
+    async def _release_telegram_for_authentication(self) -> dict:
+        if (
+            self.repo.get_source_state("system", "telegram_auth_status")
+            == "AUTHENTICATING"
+            and not self.runtime.owns_telegram_session()
+        ):
+            return {"released": True, "already_released": True}
+
+        self.repo.set_source_state(
+            "system", "telegram_auth_resume_monitor",
+            "running"
+            if self.repo.get_source_state("system", "monitor_desired", "stopped")
+            == "running"
+            else "stopped",
+        )
+        self.repo.set_source_state(
+            "system", "telegram_auth_handoff_started_at", datetime.utcnow().isoformat()
+        )
+        self._set_auth_status("AUTHENTICATING")
+        if self.runtime.is_running:
+            await self.runtime.stop_scanner(persist_desired=False)
+        await self.state._close_telegram_clients()
+        self.runtime.release_telegram_session()
+        self.state.telegram_authenticated = False
+        self.state.telegram_account = None
+        self.state.telegram_source_validation = None
+        self.state.telegram_validation_complete = False
+        self.repo.clear_worker_account(self.pid)
+        return {"released": True, "already_released": False}
+
+    async def _resume_telegram_after_authentication(self) -> dict:
+        self._set_auth_status("RECONNECTING")
+        if not await self.runtime.acquire_telegram_session(timeout=10):
+            raise RuntimeError("Telegram session is still owned by authentication")
+        self.repo.set_source_state(
+            "system", "telegram_auth_handoff_started_at", None
+        )
+        self.state.telegram_authenticated = False
+        self.state.telegram_account = None
+        self.state.telegram_source_validation = None
+        self.state.telegram_validation_complete = False
+        await self.state.restore_telegram_auth_for_startup()
+        if self.state.telegram_authenticated:
+            self._set_auth_status("CONNECTED")
+        else:
+            self._set_auth_status("AUTH_REQUIRED")
+        self._publish_runtime()
+        return {
+            "auth_status": self.repo.get_source_state(
+                "system", "telegram_auth_status", "AUTH_REQUIRED"
+            ),
+            "monitor_desired": self.repo.get_source_state(
+                "system", "monitor_desired", "stopped"
+            ),
+        }
 
     async def _refresh_auth(self) -> None:
+        if not await self.runtime.acquire_telegram_session(timeout=10):
+            raise RuntimeError("Telegram session is owned by authentication")
         self._start_auth_restore()
         if self._auth_restore_task is not None:
             await self._auth_restore_task

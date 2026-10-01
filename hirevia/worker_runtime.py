@@ -7,7 +7,10 @@ from typing import Callable, Optional
 
 from hirevia.core.models import ScanStats
 from hirevia.core.pipeline import Pipeline
-from hirevia.sources.telegram_config import load_telegram_settings
+from hirevia.sources.telegram_config import (
+    load_telegram_credentials,
+    load_telegram_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,27 @@ class WorkerRuntime:
         self.scanner_started: Optional[asyncio.Event] = None
         self.scanner_stop: Optional[asyncio.Event] = None
         self.continuous_telegram_source = None
+        self.telegram_session_lock = None
+
+    async def acquire_telegram_session(self, *, timeout: float = 0.0) -> bool:
+        credentials = load_telegram_credentials()
+        if credentials is None:
+            return True
+        if self.telegram_session_lock is None:
+            from hirevia.sources.telegram_session_lock import TelegramSessionLock
+
+            self.telegram_session_lock = TelegramSessionLock(credentials.session_path)
+        return await self.telegram_session_lock.acquire(timeout=timeout)
+
+    def release_telegram_session(self) -> None:
+        if self.telegram_session_lock is not None:
+            self.telegram_session_lock.release()
+            self.telegram_session_lock = None
+
+    def owns_telegram_session(self) -> bool:
+        if load_telegram_credentials() is None:
+            return True
+        return bool(self.telegram_session_lock and self.telegram_session_lock.acquired)
 
     async def start_scanner(self, persist_desired: bool = True) -> bool:
         state = self.state
@@ -50,6 +74,11 @@ class WorkerRuntime:
             self.monitor_state = "ERROR"
             state.monitor_start_error = "The active AI provider is not configured"
             state.add_activity(state.monitor_start_error, "error")
+            return False
+
+        if not await self.acquire_telegram_session():
+            self.monitor_state = "AUTHENTICATING"
+            state.monitor_start_error = "Telegram session is owned by authentication"
             return False
 
         telegram_config = state.config.sources.sources.get("telegram")
@@ -166,6 +195,8 @@ class WorkerRuntime:
             and telegram_config.enabled
             and load_telegram_settings().enabled
         ):
+            if not await self.acquire_telegram_session():
+                raise RuntimeError("Telegram session is owned by authentication")
             validation = await state.validate_telegram_sources(force=False)
             if not validation["authenticated"]:
                 raise RuntimeError("Connect a Telegram account before scanning")

@@ -28,16 +28,25 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Hirevia Web UI")
     state = get_web_state()
     cleanup_task = None
-    watchdog_task = None
+    supervisor_task = None
+    supervisor_stop = None
     if state.external_worker:
         from hirevia.worker_process import WorkerProcessController
 
-        try:
-            await WorkerProcessController(state.repo).ensure_running()
-        except Exception as error:
-            logger.error("Independent worker startup failed (%s)", type(error).__name__)
+        controller = WorkerProcessController(state.repo)
+        state.worker_controller = controller
+        if controller.spawn_enabled:
+            try:
+                await controller.ensure_running(spawn_if_missing=True)
+            except Exception as error:
+                logger.error("Local worker startup failed (%s)", type(error).__name__)
+            supervisor_stop = asyncio.Event()
+            supervisor_task = asyncio.create_task(
+                controller.supervise(supervisor_stop)
+            )
+        else:
+            logger.info("Worker lifecycle is managed externally; web will not spawn it")
         await state.restore_telegram_auth_for_startup()
-        watchdog_task = asyncio.create_task(state.worker_watchdog_loop())
     else:
         state.repo.recover_processing_queue()
         cleanup_task = asyncio.create_task(state.cleanup_loop())
@@ -47,11 +56,13 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         logger.info("Shutting down Hirevia Web UI")
-        for task in (cleanup_task, watchdog_task):
+        if supervisor_stop is not None:
+            supervisor_stop.set()
+        for task in (cleanup_task, supervisor_task):
             if task is not None:
                 task.cancel()
         await asyncio.gather(
-            *(task for task in (cleanup_task, watchdog_task) if task is not None),
+            *(task for task in (cleanup_task, supervisor_task) if task is not None),
             return_exceptions=True,
         )
         if not state.external_worker and state.is_running:

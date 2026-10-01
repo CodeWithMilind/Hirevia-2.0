@@ -1,11 +1,14 @@
 """Cross-platform process supervision and SQLite command transport for the worker."""
 
 import asyncio
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerProcessError(RuntimeError):
@@ -17,13 +20,45 @@ class WorkerAlreadyRunning(WorkerProcessError):
 
 
 class WorkerProcessController:
-    def __init__(self, repo, *, popen=None, startup_timeout: float = 12.0):
+    def __init__(
+        self,
+        repo,
+        *,
+        popen=None,
+        startup_timeout: float = 12.0,
+        spawn_enabled: Optional[bool] = None,
+    ):
         self.repo = repo
         self._popen = popen or subprocess.Popen
         self.startup_timeout = startup_timeout
+        self.spawn_enabled = (
+            self._local_supervision_enabled()
+            if spawn_enabled is None
+            else spawn_enabled
+        )
         self._spawned_process = None
+        self._spawned_db_path: Optional[Path] = None
 
-    async def ensure_running(self) -> Dict[str, Any]:
+    @staticmethod
+    def _local_supervision_enabled() -> bool:
+        mode = os.getenv("HIREVIA_WORKER_MODE", "").strip().lower()
+        if mode:
+            if mode == "local":
+                return True
+            if mode in {"systemd", "external"}:
+                return False
+            raise WorkerProcessError(
+                "HIREVIA_WORKER_MODE must be 'local' or 'systemd'"
+            )
+        managed = os.getenv("HIREVIA_WORKER_MANAGED", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        return not managed
+
+    async def ensure_running(
+        self, *, spawn_if_missing: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        may_spawn = self.spawn_enabled and spawn_if_missing is not False
         runtime = self.repo.get_worker_runtime()
         if (
             not runtime.get("alive")
@@ -33,10 +68,7 @@ class WorkerProcessController:
             await asyncio.to_thread(self._spawned_process.wait)
             self._spawned_process = None
         if not runtime.get("alive"):
-            managed_externally = os.getenv("HIREVIA_WORKER_MANAGED", "").strip().lower() in {
-                "1", "true", "yes", "on",
-            }
-            if not managed_externally and self._spawned_process is None:
+            if may_spawn and self._spawned_process is None:
                 self._spawn_worker()
 
         deadline = asyncio.get_running_loop().time() + self.startup_timeout
@@ -91,13 +123,31 @@ class WorkerProcessController:
             "Worker process did not become ready with an active database lease"
         )
 
+    async def supervise(self, stop_event, *, retry_seconds: float = 2.0) -> None:
+        """Locally supervise the worker while the web service remains alive."""
+        if not self.spawn_enabled:
+            return
+        while not stop_event.is_set():
+            try:
+                await self.ensure_running(spawn_if_missing=True)
+            except Exception as error:
+                logger.error("Local worker unavailable (%s)", type(error).__name__)
+            try:
+                await asyncio.wait_for(stop_event.wait(), retry_seconds)
+            except asyncio.TimeoutError:
+                pass
+
     def _spawn_worker(self):
+        database_path = Path(self.repo.db_path).expanduser().resolve()
+        child_environment = os.environ.copy()
+        child_environment["HIREVIA_DB_PATH"] = str(database_path)
         options = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
             "cwd": str(Path.cwd()),
             "close_fds": True,
+            "env": child_environment,
         }
         if os.name == "nt":
             options["creationflags"] = (
@@ -109,6 +159,7 @@ class WorkerProcessController:
         self._spawned_process = self._popen(
             [sys.executable, "-m", "hirevia", "worker"], **options
         )
+        self._spawned_db_path = database_path
 
     async def shutdown_worker(
         self, *, timeout: float = 30.0, force_timeout: float = 5.0
@@ -152,7 +203,7 @@ class WorkerProcessController:
                     return {"stopped": True, "already_stopped": False}
                 if current.get("alive") and current.get("pid") != child.pid:
                     if current.get("status") == "RUNNING":
-                        await self._stop_unleased_child(child, current["pid"])
+                        await self._stop_unleased_child(child)
                         return {
                             "stopped": False,
                             "already_stopped": False,
@@ -198,6 +249,7 @@ class WorkerProcessController:
         )
 
     async def _stop_unleased_child(self, child) -> None:
+        self._verify_tracked_worker_child(child)
         if child.poll() is not None:
             await asyncio.to_thread(child.wait)
             return
@@ -214,7 +266,32 @@ class WorkerProcessController:
         await self._terminate_and_reap(child, 5.0)
 
     @staticmethod
-    async def _terminate_and_reap(child, force_timeout: float) -> None:
+    def _is_hirevia_worker_command(arguments) -> bool:
+        normalized = [str(argument).lower() for argument in arguments]
+        return any(
+            normalized[index:index + 3] == ["-m", "hirevia", "worker"]
+            for index in range(max(0, len(normalized) - 2))
+        )
+
+    def _verify_tracked_worker_child(self, child) -> None:
+        if child is not self._spawned_process:
+            raise WorkerProcessError(
+                "Refusing to stop a process not spawned by this controller"
+            )
+        child_args = getattr(child, "args", None)
+        if child_args is not None and not self._is_hirevia_worker_command(child_args):
+            raise WorkerProcessError(
+                "Refusing to stop a process that is not a Hirevia worker"
+            )
+        if self._spawned_db_path is not None:
+            expected_db = Path(self.repo.db_path).expanduser().resolve()
+            if self._spawned_db_path != expected_db:
+                raise WorkerProcessError(
+                    "Refusing to stop a worker for a different database"
+                )
+
+    async def _terminate_and_reap(self, child, force_timeout: float) -> None:
+        self._verify_tracked_worker_child(child)
         if child.poll() is None:
             child.terminate()
             try:
@@ -235,7 +312,7 @@ class WorkerProcessController:
         *,
         timeout: float = 20.0,
     ) -> Dict[str, Any]:
-        await self.ensure_running()
+        await self.ensure_running(spawn_if_missing=False)
         command_id = self.repo.enqueue_worker_command(command, arguments)
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:

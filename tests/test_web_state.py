@@ -4,6 +4,7 @@ from hirevia.config import Config
 from hirevia import cli as cli_module
 from hirevia.storage.state import JobRepository
 from hirevia.web import state as web_state
+from hirevia.web import main as web_main
 import asyncio
 import logging
 from click.testing import CliRunner
@@ -297,6 +298,100 @@ def test_service_launcher_injects_one_runtime_and_starts_web_server(monkeypatch,
         assert "Agent      STOPPED" in capsys.readouterr().out
         assert "Hirevia command center startup requested" in caplog.text
         assert "Starting web server at http://127.0.0.1:8123" in caplog.text
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
+
+
+def test_systemd_web_lifespan_never_spawns_or_supervises_worker(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("HIREVIA_WORKER_MODE", raising=False)
+    monkeypatch.setenv("HIREVIA_WORKER_MANAGED", "1")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    state = web_state.initialize_web_state(
+        Config(), JobRepository(tmp_path / "systemd-web.db")
+    )
+    state.external_worker = True
+    calls = []
+
+    class ManagedController:
+        def __init__(self, repo):
+            self.spawn_enabled = False
+            calls.append(("init", repo))
+
+        async def ensure_running(self, **kwargs):
+            calls.append(("ensure", kwargs))
+            raise AssertionError("systemd mode must not ensure or spawn a worker")
+
+        async def supervise(self, stop_event):
+            calls.append(("supervise", stop_event))
+            raise AssertionError("systemd mode must not start a web supervisor")
+
+    monkeypatch.setattr("hirevia.worker_process.WorkerProcessController", ManagedController)
+    monkeypatch.setattr(web_main, "get_web_state", lambda: state)
+
+    async def run_lifespan():
+        async with web_main.lifespan(web_main.app):
+            assert state.worker_controller.spawn_enabled is False
+            assert [call[0] for call in calls] == ["init"]
+
+    try:
+        asyncio.run(run_lifespan())
+        assert [call[0] for call in calls] == ["init"]
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
+
+
+def test_local_web_restarts_reuse_worker_without_stopping_it(monkeypatch, tmp_path):
+    monkeypatch.delenv("HIREVIA_WORKER_MODE", raising=False)
+    monkeypatch.delenv("HIREVIA_WORKER_MANAGED", raising=False)
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    state = web_state.initialize_web_state(
+        Config(), JobRepository(tmp_path / "local-web.db")
+    )
+    state.external_worker = True
+    worker = {"alive": False, "spawn_count": 0}
+    controllers = []
+
+    class LocalController:
+        def __init__(self, repo):
+            self.repo = repo
+            self.spawn_enabled = True
+            self.ensure_calls = 0
+            self.supervisor_started = False
+            controllers.append(self)
+
+        async def ensure_running(self, *, spawn_if_missing=None):
+            self.ensure_calls += 1
+            if not worker["alive"]:
+                assert spawn_if_missing is True
+                worker["alive"] = True
+                worker["spawn_count"] += 1
+            return {"alive": True, "status": "RUNNING"}
+
+        async def supervise(self, stop_event):
+            self.supervisor_started = True
+            await stop_event.wait()
+
+    monkeypatch.setattr("hirevia.worker_process.WorkerProcessController", LocalController)
+    monkeypatch.setattr(web_main, "get_web_state", lambda: state)
+
+    async def run_web_lifespans():
+        for _ in range(2):
+            async with web_main.lifespan(web_main.app):
+                await asyncio.sleep(0)
+                assert state.worker_controller.supervisor_started is True
+                assert worker["alive"] is True
+
+    try:
+        asyncio.run(run_web_lifespans())
+        assert worker == {"alive": True, "spawn_count": 1}
+        assert len(controllers) == 2
+        assert all(controller.ensure_calls == 1 for controller in controllers)
     finally:
         web_state._web_state = None
         web_state.WebUIState._instance = None
@@ -826,7 +921,10 @@ def test_phone_otp_authentication_uses_hash_and_verifies_account(monkeypatch, tm
 )
 def test_invalid_and_expired_otp_are_handled_safely(monkeypatch, tmp_path, error_name, expected_state):
     client = _make_fake_telegram_client(code_error=error_name)
-    _configure_fake_telegram_login(monkeypatch, tmp_path, client)
+    credentials = _configure_fake_telegram_login(monkeypatch, tmp_path, client)
+    session_file = Path(f"{credentials.session_path}.session")
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_bytes(b"existing-session-must-survive")
     state = web_state.initialize_web_state(
         Config(), JobRepository(tmp_path / f"{expected_state}.db")
     )
@@ -838,6 +936,7 @@ def test_invalid_and_expired_otp_are_handled_safely(monkeypatch, tmp_path, error
         assert result["success"] is False
         assert result["login_state"] == expected_state
         assert state.telegram_authenticated is False
+        assert session_file.read_bytes() == b"existing-session-must-survive"
         if expected_state == "code_expired":
             assert state.telegram_phone_code_hash is None
             assert client.sign_in_calls

@@ -163,6 +163,34 @@ def test_shutdown_kills_only_after_terminate_times_out():
     assert child.poll() == -9
 
 
+def test_systemd_mode_controller_never_spawns_missing_worker(monkeypatch, tmp_path):
+    monkeypatch.setenv("HIREVIA_WORKER_MODE", "systemd")
+    monkeypatch.delenv("HIREVIA_WORKER_MANAGED", raising=False)
+
+    class MissingWorkerRepository:
+        db_path = tmp_path / "managed.db"
+
+        def get_worker_runtime(self):
+            return {"pid": None, "status": "STOPPED", "alive": False}
+
+    spawned = []
+    controller = WorkerProcessController(
+        MissingWorkerRepository(),
+        popen=lambda *args, **kwargs: spawned.append((args, kwargs)),
+        startup_timeout=0.01,
+    )
+
+    try:
+        asyncio.run(controller.ensure_running(spawn_if_missing=True))
+    except WorkerProcessError:
+        pass
+    else:
+        raise AssertionError("systemd mode reported an absent worker as running")
+
+    assert controller.spawn_enabled is False
+    assert spawned == []
+
+
 def configure_worker_environment(monkeypatch, tmp_path):
     monkeypatch.delenv("HIREVIA_WORKER_MANAGED", raising=False)
     monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
@@ -271,23 +299,50 @@ def test_worker_crash_releases_stale_lease_and_can_restart(monkeypatch, tmp_path
     configure_worker_environment(monkeypatch, tmp_path)
     repo = JobRepository(tmp_path / "worker.db")
     controller = WorkerProcessController(repo, startup_timeout=30)
+    stop_supervisor = asyncio.Event()
+    supervisor_task = None
 
     async def restart_after_crash():
+        nonlocal supervisor_task
         try:
-            first_runtime = await controller.ensure_running()
-            first_process = controller._spawned_process
+            supervisor_task = asyncio.create_task(
+                controller.supervise(stop_supervisor, retry_seconds=0.1)
+            )
+            first_runtime = None
+            for _ in range(300):
+                first_runtime = repo.get_worker_runtime()
+                if first_runtime.get("alive") and first_runtime.get("status") == "RUNNING":
+                    break
+                await asyncio.sleep(0.1)
             assert first_runtime["alive"] is True
+            first_process = controller._spawned_process
+            first_pid = first_runtime["pid"]
 
             first_process.kill()
             await asyncio.to_thread(first_process.wait, 10)
-            assert repo.get_worker_runtime()["alive"] is False
-
-            restarted = await controller.ensure_running()
+            restarted = None
+            for _ in range(300):
+                restarted = repo.get_worker_runtime()
+                if (
+                    restarted.get("alive")
+                    and restarted.get("status") == "RUNNING"
+                    and restarted.get("pid") != first_pid
+                ):
+                    break
+                await asyncio.sleep(0.1)
             assert restarted["alive"] is True
             assert restarted["pid"] == controller._spawned_process.pid
             assert restarted["status"] == "RUNNING"
+            stop_supervisor.set()
+            await asyncio.wait_for(supervisor_task, timeout=5)
+            assert repo.get_worker_runtime()["alive"] is True
+            assert controller._spawned_process.poll() is None
             await controller.shutdown_worker(timeout=20)
         finally:
+            stop_supervisor.set()
+            if supervisor_task is not None and not supervisor_task.done():
+                supervisor_task.cancel()
+                await asyncio.gather(supervisor_task, return_exceptions=True)
             await stop_test_children([controller])
 
     asyncio.run(restart_after_crash())

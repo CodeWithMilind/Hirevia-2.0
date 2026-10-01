@@ -114,6 +114,7 @@ class WebUIState:
             ),
         )
         self.external_worker = False
+        self.worker_controller = None
         self.worker_pid: Optional[int] = None
         self.worker_alive = False
         self.scan_interval_minutes: int = self.config.scan_interval_minutes
@@ -130,6 +131,10 @@ class WebUIState:
         # Source status cache
         self._source_status_cache: Dict[str, Dict[str, Any]] = {}
         self.telegram_login_client = None
+        self.telegram_session_lock = None
+        self.telegram_auth_timeout_task: Optional[asyncio.Task] = None
+        self.telegram_auth_request_task: Optional[asyncio.Task] = None
+        self.telegram_auth_operation_lock = asyncio.Lock()
         self.telegram_login_in_progress = False
         self.telegram_login_state = "disconnected"
         self.telegram_login_phone: Optional[str] = None
@@ -227,6 +232,116 @@ class WebUIState:
         for suffix in ("", "-journal", "-wal", "-shm"):
             Path(f"{session_file}{suffix}").unlink(missing_ok=True)
 
+    async def _acquire_telegram_auth_session(self, credentials) -> bool:
+        from hirevia.sources.telegram_session_lock import TelegramSessionLock
+
+        if self.external_worker:
+            result = await self._send_worker_command("AUTH_RELEASE")
+            if not result.get("released"):
+                return False
+
+        self.telegram_session_lock = TelegramSessionLock(credentials.session_path)
+        acquired = await self.telegram_session_lock.acquire(timeout=10)
+        if acquired:
+            return True
+
+        self.telegram_session_lock = None
+        if self.external_worker:
+            try:
+                await self._send_worker_command("AUTH_RESUME")
+            except Exception:
+                logger.warning("Worker did not resume after session handoff timeout")
+        return False
+
+    async def _release_telegram_auth_session(
+        self, *, resume_worker: bool = True, delete_session=None
+    ) -> None:
+        lock = self.telegram_session_lock
+        cancelled = False
+        cleanup_error = None
+        try:
+            await self._close_telegram_clients()
+            if delete_session is not None:
+                self._remove_telegram_session_file(delete_session)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as error:
+            cleanup_error = error
+        finally:
+            self.telegram_session_lock = None
+            if lock is not None:
+                lock.release()
+
+        if self.external_worker and resume_worker:
+            try:
+                result = await self._send_worker_command("AUTH_RESUME")
+            except asyncio.CancelledError:
+                cancelled = True
+                self.repo.set_source_state(
+                    "system", "telegram_auth_status", "RECONNECTING"
+                )
+                self.repo.set_source_state(
+                    "system", "telegram_auth_handoff_started_at", None
+                )
+                self.telegram_authenticated = False
+            except Exception as error:
+                logger.warning(
+                    "Telegram session returned; worker reconnection pending (%s)",
+                    type(error).__name__,
+                )
+                self.repo.set_source_state(
+                    "system", "telegram_auth_status", "RECONNECTING"
+                )
+                self.repo.set_source_state(
+                    "system", "telegram_auth_handoff_started_at", None
+                )
+                self.telegram_authenticated = False
+            else:
+                auth_status = result.get("auth_status", "AUTH_REQUIRED")
+                self.repo.set_source_state("system", "telegram_auth_status", auth_status)
+                self._sync_external_worker_status()
+
+        if cleanup_error is not None:
+            raise cleanup_error
+        if cancelled:
+            raise asyncio.CancelledError
+
+    def _schedule_telegram_auth_timeout(self) -> None:
+        from hirevia.sources.telegram_session_lock import AUTH_HANDOFF_TIMEOUT_SECONDS
+
+        if self.telegram_auth_timeout_task is not None:
+            self.telegram_auth_timeout_task.cancel()
+
+        async def expire_authentication():
+            try:
+                await asyncio.sleep(AUTH_HANDOFF_TIMEOUT_SECONDS)
+                if self.telegram_session_lock is None:
+                    return
+                self.telegram_login_state = "expired"
+                self.telegram_auth_error = "Telegram login timed out; request a new code"
+                self.telegram_authenticated = False
+                self.telegram_auth_timeout_task = None
+                request_task = self.telegram_auth_request_task
+                if (
+                    request_task is not None
+                    and request_task is not asyncio.current_task()
+                    and not request_task.done()
+                ):
+                    request_task.cancel()
+                    await asyncio.gather(request_task, return_exceptions=True)
+                if self.telegram_session_lock is not None:
+                    await self._release_telegram_auth_session()
+            except asyncio.CancelledError:
+                raise
+
+        self.telegram_auth_timeout_task = asyncio.create_task(expire_authentication())
+
+    def _cancel_telegram_auth_timeout(self) -> None:
+        task = self.telegram_auth_timeout_task
+        self.telegram_auth_timeout_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
     async def _close_telegram_clients(self) -> None:
         from hirevia.sources import telegram_source
 
@@ -238,7 +353,7 @@ class WebUIState:
                 continue
             disconnected.add(id(client))
             try:
-                if client.is_connected():
+                if client is login_client or client.is_connected():
                     await client.disconnect()
             except Exception as error:
                 logger.warning("Telegram client shutdown failed (%s)", type(error).__name__)
@@ -276,8 +391,15 @@ class WebUIState:
             client = await ensure_client()
             user = await client.get_me()
         except Exception as error:
-            self.telegram_login_state = "expired"
-            self.telegram_auth_error = "Telegram session is unavailable; log in again"
+            transient = isinstance(error, (TimeoutError, ConnectionError, OSError)) or (
+                "connection failed" in str(error).casefold()
+            )
+            self.telegram_login_state = "reconnecting" if transient else "expired"
+            self.telegram_auth_error = (
+                "Telegram connection is temporarily unavailable; retrying"
+                if transient
+                else "Telegram session is unavailable; log in again"
+            )
             await self._close_telegram_clients()
             self.add_activity(
                 f"Telegram session restore requires login ({type(error).__name__})", "warning"
@@ -324,6 +446,9 @@ class WebUIState:
         self.worker_pid = runtime.get("pid")
         self.worker_alive = bool(runtime.get("alive"))
         desired = self.repo.get_source_state("system", "monitor_desired", "stopped")
+        auth_status = self.repo.get_source_state(
+            "system", "telegram_auth_status", "DISCONNECTED"
+        )
         if self.worker_alive:
             worker_status = runtime.get("status", "ERROR")
             self.monitor_state = runtime.get("monitor_status", "STOPPED")
@@ -340,8 +465,18 @@ class WebUIState:
             self.is_scanning = self.monitor_state == "SCANNING"
             if self.telegram_authenticated:
                 self.telegram_login_state = "connected"
-            elif desired == "running":
-                self.telegram_login_state = "expired"
+            elif auth_status == "AUTHENTICATING":
+                if self.telegram_login_client is None:
+                    self.telegram_login_state = "authenticating"
+            elif auth_status == "RECONNECTING":
+                if self.telegram_login_client is None:
+                    self.telegram_login_state = "reconnecting"
+            elif auth_status == "ERROR":
+                self.telegram_login_state = "error"
+            elif auth_status == "AUTH_REQUIRED" or desired == "running":
+                self.telegram_login_state = "auth_required"
+            else:
+                self.telegram_login_state = "disconnected"
         else:
             self.is_running = False
             self.is_scanning = False
@@ -355,7 +490,9 @@ class WebUIState:
     async def _send_worker_command(self, command: str) -> Dict[str, Any]:
         from hirevia.worker_process import WorkerProcessController
 
-        controller = WorkerProcessController(self.repo)
+        controller = self.worker_controller or WorkerProcessController(
+            self.repo, spawn_enabled=False
+        )
         return await controller.send_command(command)
 
     async def run_cleanup_once(self) -> Dict[str, Any]:
@@ -380,17 +517,6 @@ class WebUIState:
             await self.run_cleanup_once()
             await asyncio.sleep(60)
 
-    async def worker_watchdog_loop(self) -> None:
-        from hirevia.worker_process import WorkerProcessController
-
-        controller = WorkerProcessController(self.repo)
-        while True:
-            try:
-                await controller.ensure_running()
-            except Exception as error:
-                logger.error("Independent worker unavailable (%s)", type(error).__name__)
-            await asyncio.sleep(3)
-    
     def add_activity(self, message: str, level: str = "info"):
         """Add an activity log entry"""
         entry = ActivityEntry(message, level)
@@ -918,9 +1044,34 @@ class WebUIState:
             "model": self.config.ai.providers[self.config.ai.primary].model,
         }
     
-    async def validate_telegram_sources(self, force: bool = False) -> Dict[str, Any]:
+    async def validate_telegram_sources(
+        self, force: bool = False, *, session_owned: bool = False
+    ) -> Dict[str, Any]:
         from hirevia.sources.telegram_config import load_telegram_settings
         from hirevia.sources.telegram_source import close_shared_client, ensure_client
+
+        if self.external_worker and not session_owned:
+            auth_status = self.repo.get_source_state(
+                "system", "telegram_auth_status", "DISCONNECTED"
+            )
+            if force and auth_status != "AUTHENTICATING":
+                try:
+                    return await self._send_worker_command(
+                        "VALIDATE_TELEGRAM_SOURCES"
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "Worker Telegram validation failed (%s)",
+                        type(error).__name__,
+                    )
+            runtime = self.repo.get_worker_runtime()
+            return runtime.get("validation") or {
+                "authenticated": auth_status == "CONNECTED",
+                "validation_complete": False,
+                "account": runtime.get("account"),
+                "sources": [],
+                "error": auth_status,
+            }
 
         if (
             not force
@@ -1060,10 +1211,14 @@ class WebUIState:
             "validation_complete": False,
             "sources": [],
         }
+        auth_status = self.repo.get_source_state(
+            "system", "telegram_auth_status", "DISCONNECTED"
+        )
         from hirevia.sources.telegram_config import mask_phone
 
         return {
             "connected": self.telegram_authenticated and self.telegram_account is not None,
+            "auth_status": auth_status,
             "account": self.telegram_account if self.telegram_authenticated else None,
             "phone_number": mask_phone(self.telegram_login_phone or "") if self.telegram_authenticated else None,
             "login_state": self.telegram_login_state,
@@ -1083,6 +1238,10 @@ class WebUIState:
         }
 
     async def begin_telegram_phone_login(self, phone_number: str) -> Dict[str, Any]:
+        async with self.telegram_auth_operation_lock:
+            return await self._begin_telegram_phone_login(phone_number)
+
+    async def _begin_telegram_phone_login(self, phone_number: str) -> Dict[str, Any]:
         from hirevia.sources.telegram_config import load_telegram_credentials, mask_phone
         from telethon import TelegramClient
 
@@ -1099,18 +1258,36 @@ class WebUIState:
         if credentials is None:
             return {"success": False, "login_state": "disconnected", "message": "Set Telegram API credentials in the server environment first"}
 
+        try:
+            if not await self._acquire_telegram_auth_session(credentials):
+                self.telegram_login_state = "authenticating"
+                return {
+                    "success": False,
+                    "login_state": self.telegram_login_state,
+                    "message": "Telegram session is currently in use; retry shortly",
+                }
+        except Exception as error:
+            logger.warning("Telegram session handoff failed (%s)", type(error).__name__)
+            return {
+                "success": False,
+                "login_state": "error",
+                "message": "Could not pause the Telegram worker safely",
+            }
+
         self.telegram_login_in_progress = True
         client = None
+        request_task = asyncio.current_task()
+        self.telegram_auth_request_task = request_task
+        self._schedule_telegram_auth_timeout()
         try:
             await self._close_telegram_clients()
-            self._remove_telegram_session_file(credentials)
             credentials.session_path.parent.mkdir(parents=True, exist_ok=True)
             client = TelegramClient(
                 str(credentials.session_path), credentials.api_id, credentials.api_hash
             )
+            self.telegram_login_client = client
             await client.connect()
             sent_code = await client.send_code_request(phone)
-            self.telegram_login_client = client
             self.telegram_login_phone = phone
             self.telegram_phone_code_hash = sent_code.phone_code_hash
             timeout = getattr(sent_code, "timeout", None)
@@ -1127,20 +1304,35 @@ class WebUIState:
                 "resend_after_seconds": max(0, int(self.telegram_resend_after - monotonic())),
                 "message": "Verification code sent by Telegram",
             }
+        except asyncio.CancelledError:
+            timed_out = self.telegram_login_state == "expired"
+            if not timed_out:
+                self._cancel_telegram_auth_timeout()
+                self.telegram_login_state = "error"
+                self.telegram_auth_error = "Telegram login was cancelled"
+            self.telegram_authenticated = False
+            self.telegram_account = None
+            self.telegram_source_validation = None
+            self.telegram_validation_complete = False
+            await self._release_telegram_auth_session()
+            raise
         except Exception as error:
-            if client is not None:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
+            self._cancel_telegram_auth_timeout()
+            await self._release_telegram_auth_session()
             self.telegram_login_state = "error"
             self.telegram_auth_error = _telegram_login_error(error)
             self.add_activity(f"Telegram code request failed ({type(error).__name__})", "warning")
             return {"success": False, "login_state": "error", "message": _telegram_login_error(error)}
         finally:
             self.telegram_login_in_progress = False
+            if self.telegram_auth_request_task is request_task:
+                self.telegram_auth_request_task = None
 
     async def resend_telegram_otp(self) -> Dict[str, Any]:
+        async with self.telegram_auth_operation_lock:
+            return await self._resend_telegram_otp()
+
+    async def _resend_telegram_otp(self) -> Dict[str, Any]:
         if self.telegram_login_in_progress:
             return {"success": False, "login_state": self.telegram_login_state, "message": "A Telegram authentication request is already in progress"}
         if self.telegram_login_client is None or not self.telegram_login_phone:
@@ -1167,6 +1359,7 @@ class WebUIState:
             self.telegram_resend_after = monotonic() + max(30, int(timeout or 0))
             self.telegram_auth_error = None
             self.telegram_login_state = "code_sent"
+            self._schedule_telegram_auth_timeout()
             self.add_activity("Telegram verification code resent")
             return {"success": True, "login_state": "code_sent", "resend_after_seconds": max(0, int(self.telegram_resend_after - monotonic())), "message": "A new verification code was sent"}
         except Exception as error:
@@ -1179,6 +1372,10 @@ class WebUIState:
             self.telegram_login_in_progress = False
 
     async def verify_telegram_otp(self, code: str) -> Dict[str, Any]:
+        async with self.telegram_auth_operation_lock:
+            return await self._verify_telegram_otp(code)
+
+    async def _verify_telegram_otp(self, code: str) -> Dict[str, Any]:
         if self.telegram_login_in_progress:
             return {"success": False, "login_state": self.telegram_login_state, "message": "A Telegram authentication request is already in progress"}
         client = self.telegram_login_client
@@ -1200,6 +1397,7 @@ class WebUIState:
             if name == "SessionPasswordNeededError":
                 self.telegram_login_state = "password_required"
                 self.telegram_auth_error = None
+                self._schedule_telegram_auth_timeout()
                 self.add_activity("Telegram requested two-step verification")
                 return {"success": True, "login_state": "password_required", "message": "Enter your Telegram two-step verification password"}
             if name in {"PhoneCodeInvalidError", "PhoneCodeEmptyError"}:
@@ -1223,6 +1421,10 @@ class WebUIState:
         return await self._complete_telegram_authentication(client)
 
     async def verify_telegram_password(self, password: str) -> Dict[str, Any]:
+        async with self.telegram_auth_operation_lock:
+            return await self._verify_telegram_password(password)
+
+    async def _verify_telegram_password(self, password: str) -> Dict[str, Any]:
         if self.telegram_login_in_progress:
             return {"success": False, "login_state": self.telegram_login_state, "message": "A Telegram authentication request is already in progress"}
         client = self.telegram_login_client
@@ -1253,7 +1455,9 @@ class WebUIState:
             telegram_source._shared_client = client
             self.telegram_login_client = None
             self.telegram_authenticated = True
-            self.telegram_login_state = "connected"
+            self.telegram_login_state = (
+                "reconnecting" if self.external_worker else "connected"
+            )
             self.telegram_auth_error = None
             self.telegram_phone_code_hash = None
             self.telegram_resend_after = 0
@@ -1261,17 +1465,28 @@ class WebUIState:
                 "name": " ".join(filter(None, (user.first_name, user.last_name))) or "Telegram user",
                 "username": user.username,
             }
-            validation = await self.validate_telegram_sources(force=True)
+            validation = await self.validate_telegram_sources(
+                force=True, session_owned=True
+            )
             if self.external_worker:
-                await self._close_telegram_clients()
-                try:
-                    await self._send_worker_command("REFRESH_AUTH")
-                    self._sync_external_worker_status()
-                except Exception as error:
-                    logger.warning(
-                        "Telegram login succeeded but worker refresh failed (%s)",
-                        type(error).__name__,
+                self._cancel_telegram_auth_timeout()
+                await self._release_telegram_auth_session()
+                auth_status = self.repo.get_source_state(
+                    "system", "telegram_auth_status", "AUTH_REQUIRED"
+                )
+                if auth_status != "CONNECTED":
+                    self.telegram_authenticated = False
+                    self.telegram_login_state = (
+                        "reconnecting" if auth_status == "RECONNECTING" else "auth_required"
                     )
+                    return {
+                        "success": False,
+                        "login_state": self.telegram_login_state,
+                        "validation_complete": False,
+                        "message": "Telegram authentication succeeded, but the worker has not verified the session yet",
+                    }
+            else:
+                self._cancel_telegram_auth_timeout()
             self.add_activity(
                 "Telegram login succeeded; channel validation "
                 + ("complete" if validation["validation_complete"] else "needs attention")
@@ -1291,22 +1506,77 @@ class WebUIState:
             return {"success": False, "login_state": "error", "message": "Telegram account verification failed"}
 
     async def logout_telegram(self) -> Dict[str, Any]:
+        async with self.telegram_auth_operation_lock:
+            return await self._logout_telegram()
+
+    async def _logout_telegram(self) -> Dict[str, Any]:
         from hirevia.sources.telegram_config import load_telegram_credentials
 
-        self.repo.set_source_state("system", "monitor_desired", "stopped")
+        credentials = load_telegram_credentials()
         if self.external_worker:
-            self._sync_external_worker_status()
+            self.repo.set_source_state("system", "monitor_desired", "stopped")
+            if credentials is None:
+                try:
+                    await self._send_worker_command("AUTH_RELEASE")
+                    await self._send_worker_command("AUTH_RESUME")
+                except Exception as error:
+                    logger.warning(
+                        "Telegram logout handoff failed (%s)", type(error).__name__
+                    )
+                    return {
+                        "success": False,
+                        "login_state": "error",
+                        "message": "Telegram worker could not release its session",
+                    }
+                self.repo.set_source_state(
+                    "system", "telegram_auth_status", "DISCONNECTED"
+                )
+            else:
+                try:
+                    if not await self._acquire_telegram_auth_session(credentials):
+                        return {
+                            "success": False,
+                            "login_state": "authenticating",
+                            "message": "Telegram session is currently in use; retry logout shortly",
+                        }
+                    from telethon import TelegramClient
+
+                    self.telegram_login_client = TelegramClient(
+                        str(credentials.session_path),
+                        credentials.api_id,
+                        credentials.api_hash,
+                    )
+                    await self.telegram_login_client.connect()
+                    if await self.telegram_login_client.is_user_authorized():
+                        await self.telegram_login_client.log_out()
+                    await self.telegram_login_client.disconnect()
+                    self.telegram_login_client = None
+                except Exception as error:
+                    logger.warning("Telegram logout failed (%s)", type(error).__name__)
+                    await self._release_telegram_auth_session()
+                    return {
+                        "success": False,
+                        "login_state": "error",
+                        "message": "Telegram logout could not be completed; the existing session was preserved",
+                    }
+
+                self._cancel_telegram_auth_timeout()
+                await self._release_telegram_auth_session(
+                    delete_session=credentials
+                )
+                self.repo.set_source_state(
+                    "system", "telegram_auth_status", "DISCONNECTED"
+                )
+        else:
+            self.repo.set_source_state("system", "monitor_desired", "stopped")
+            if self.external_worker:
+                self._sync_external_worker_status()
         if self.is_running:
             await self.stop_scanner()
-        elif self.external_worker and self.worker_alive:
-            try:
-                await self._send_worker_command("LOGOUT")
-            except Exception as error:
-                logger.warning("Telegram logout worker cleanup failed (%s)", type(error).__name__)
         await self._close_telegram_clients()
-        credentials = load_telegram_credentials()
-        if credentials is not None:
+        if not self.external_worker and credentials is not None:
             self._remove_telegram_session_file(credentials)
+        self._cancel_telegram_auth_timeout()
         self.telegram_authenticated = False
         self.telegram_login_state = "disconnected"
         self.telegram_login_phone = None
@@ -1321,6 +1591,17 @@ class WebUIState:
         return {"success": True, "login_state": "disconnected", "message": "Telegram disconnected"}
 
     async def join_telegram_sources(self) -> Dict[str, Any]:
+        if self.external_worker:
+            try:
+                return await self._send_worker_command("JOIN_TELEGRAM_SOURCES")
+            except Exception as error:
+                logger.warning("Worker Telegram join failed (%s)", type(error).__name__)
+                return {
+                    "success": False,
+                    "message": "Telegram worker is unavailable",
+                    "sources": [],
+                }
+
         from telethon.tl.functions.channels import JoinChannelRequest
         from telethon.tl.functions.messages import GetDialogFiltersRequest, UpdateDialogFilterRequest
         from telethon.tl.types import DialogFilter, TextWithEntities
@@ -1417,6 +1698,23 @@ class WebUIState:
         return {"success": True, "folder": folder, "sources": joined}
 
     async def set_telegram_source_membership(self, username: str, join: bool) -> Dict[str, Any]:
+        if self.external_worker:
+            try:
+                return await self._send_worker_command(
+                    "SET_TELEGRAM_SOURCE_MEMBERSHIP",
+                    {"username": username, "join": join},
+                )
+            except Exception as error:
+                logger.warning(
+                    "Worker Telegram membership update failed (%s)",
+                    type(error).__name__,
+                )
+                return {
+                    "success": False,
+                    "status": "unavailable",
+                    "message": "Telegram worker is unavailable",
+                }
+
         from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
         from hirevia.sources.telegram_source import ensure_client
 
