@@ -1,4 +1,4 @@
-"""CLI wiring tests: key resolution, notifier setup and report rendering.
+"""CLI wiring tests: key resolution and report rendering.
 
 The pipeline itself is stubbed - these tests only check that the CLI builds its
 parts correctly, degrades gracefully when credentials are missing, and prints
@@ -19,10 +19,9 @@ from click.testing import CliRunner
 from hirevia.ai.client import AIInvalidResponseError
 from hirevia.ai.matcher import MATCH_RESPONSE_SCHEMA
 from hirevia import cli as cli_module
-from hirevia.cli import _build_notifier, _print_stats, _resolve_nvidia_key, cli
+from hirevia.cli import _print_stats, _resolve_nvidia_key, cli
 from hirevia.config import Config
 from hirevia.core.models import ApplicationStatus, EmploymentType, Job, ScanStats
-from hirevia.notifications.telegram import TelegramNotifier
 from hirevia.sources.telegram_config import TelegramChannel
 from hirevia.sources.telegram_extract import TgMessage
 from hirevia.sources.telegram_source import TelegramSource
@@ -47,7 +46,7 @@ def make_stats():
     )
 
 
-# --- API key + notifier resolution -------------------------------------------
+# --- API key resolution -------------------------------------------------------
 
 def test_nvidia_key_prefers_the_environment(monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "  nv-abc  ")
@@ -78,33 +77,6 @@ def test_provider_configuration_can_enable_groq_without_nvidia(monkeypatch):
     assert seen["api_key"] is None
 
 
-def test_notifier_is_built_from_environment_with_retry_settings(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:token")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
-    config = Config(notification_retry_attempts=5, notification_retry_delay_seconds=30)
-
-    notifier = _build_notifier(config, None, None)
-
-    assert isinstance(notifier, TelegramNotifier)
-    assert notifier.chat_id == "42" and notifier.bot_token == "123:token"
-    assert notifier._retry_attempts == 5 and notifier._retry_delay == 30
-
-
-def test_notifier_is_skipped_without_credentials(monkeypatch):
-    monkeypatch.setattr(cli_module, "get_telegram_token", lambda: "")
-    monkeypatch.setattr(cli_module.click, "prompt",
-                        lambda *a, **k: (_ for _ in ()).throw(EOFError))
-
-    assert _build_notifier(Config(), None, None) is None
-
-
-def test_explicit_flags_win_over_environment(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "env:token")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "env-id")
-    notifier = _build_notifier(Config(), "flag:token", "flag-id")
-    assert notifier.bot_token == "flag:token" and notifier.chat_id == "flag-id"
-
-
 # --- commands ------------------------------------------------------------------
 
 def test_scan_reports_compact_summary_and_real_counts(monkeypatch, tmp_path):
@@ -122,14 +94,8 @@ def test_scan_reports_compact_summary_and_real_counts(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli_module, "run_single_scan", fake_scan)
     monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
-    monkeypatch.setattr(
-        cli_module,
-        "_build_notifier",
-        lambda *a, **k: pytest.fail("diagnostic mode must not create a notifier"),
-    )
-
     result = CliRunner().invoke(
-        cli, ["scan", "--no-ai", "--notify", "--diagnostic", "--db-path", str(tmp_path / "cli.db")]
+        cli, ["scan", "--no-ai", "--diagnostic", "--db-path", str(tmp_path / "cli.db")]
     )
 
     assert result.exit_code == 0, result.output
@@ -142,34 +108,6 @@ def test_scan_reports_compact_summary_and_real_counts(monkeypatch, tmp_path):
         assert label in result.output
     for diagnostic in ("AI Matched", "Jobs Reaching Matching", "Stage 5", "Excluded keywords"):
         assert diagnostic not in result.output
-
-
-def test_scan_closes_the_notifier_it_created(monkeypatch, tmp_path):
-    closed = []
-
-    class SpyNotifier(TelegramNotifier):
-        async def close(self):
-            closed.append(True)
-            await self.client.aclose()
-
-    async def fake_scan(
-        config, repo, ai_matcher=None, notifier=None, diagnostic_output=False,
-        ai_progress_callback=None,
-    ):
-        assert isinstance(notifier, SpyNotifier), "pipeline must receive the notifier"
-        return ScanStats(jobs_notified=1)
-
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:token")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
-    monkeypatch.setattr(cli_module, "TelegramNotifier", SpyNotifier)
-    monkeypatch.setattr(cli_module, "run_single_scan", fake_scan)
-    monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
-
-    result = CliRunner().invoke(
-        cli, ["scan", "--no-ai", "--notify", "--db-path", str(tmp_path / "cli.db")]
-    )
-    assert result.exit_code == 0, result.output
-    assert closed == [True]
 
 
 def test_scan_prints_jobs_sequentially_after_processing(monkeypatch, tmp_path):
@@ -233,7 +171,7 @@ def test_scan_prints_jobs_sequentially_after_processing(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
 
     result = CliRunner().invoke(
-        cli, ["scan", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "progress.db")]
+        cli, ["scan", "--no-ai", "--db-path", str(tmp_path / "progress.db")]
     )
 
     assert result.exit_code == 0, result.output
@@ -346,14 +284,13 @@ def test_scan_prints_final_scan_summary_without_notifications(monkeypatch, tmp_p
     monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
 
     result = CliRunner().invoke(
-        cli, ["scan", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "final.db")]
+        cli, ["scan", "--no-ai", "--db-path", str(tmp_path / "final.db")]
     )
 
     assert result.exit_code == 0, result.output
     assert seen == {"notifier": None, "diagnostic_output": False}
     assert "HIREVIA SCAN COMPLETE" in result.output
     assert "Processed       : 0" in result.output
-    assert "Telegram notifications: DISABLED (--no-notify)" in result.output
 
 
 def test_scan_prints_empty_final_results(monkeypatch, tmp_path):
@@ -367,14 +304,14 @@ def test_scan_prints_empty_final_results(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
 
     result = CliRunner().invoke(
-        cli, ["scan", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "empty.db")]
+        cli, ["scan", "--no-ai", "--db-path", str(tmp_path / "empty.db")]
     )
 
     assert result.exit_code == 0, result.output
     assert "Processed       : 0" in result.output
 
 
-def test_monitor_uses_telegram_only_and_no_notify_still_starts(monkeypatch, tmp_path):
+def test_monitor_uses_telegram_only_without_delivery(monkeypatch, tmp_path):
     config = Config()
     config.sources.sources["greenhouse"].enabled = True
     source_calls = []
@@ -415,14 +352,8 @@ def test_monitor_uses_telegram_only_and_no_notify_still_starts(monkeypatch, tmp_
     monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: config)
     monkeypatch.setattr(cli_module, "Pipeline", FakePipeline)
     monkeypatch.setattr(cli_module, "_build_ai_matcher", lambda *a, **k: None)
-    monkeypatch.setattr(
-        cli_module,
-        "_build_notifier",
-        lambda *a, **k: pytest.fail("--no-notify must not create a notifier"),
-    )
-
     result = CliRunner().invoke(
-        cli, ["monitor", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "monitor.db")]
+        cli, ["monitor", "--no-ai", "--db-path", str(tmp_path / "monitor.db")]
     )
 
     assert result.exit_code == 0, result.output
@@ -433,7 +364,6 @@ def test_monitor_uses_telegram_only_and_no_notify_still_starts(monkeypatch, tmp_
     assert "✓ Monitoring 7 channels" in result.output
     assert "✓ Persistent message tracking enabled" in result.output
     assert "Waiting for new opportunities..." in result.output
-    assert "Telegram notifications: DISABLED (--no-notify)" in result.output
 
 
 def test_monitor_normal_output_is_concise_and_keeps_job_card(monkeypatch, tmp_path):
@@ -526,7 +456,7 @@ def test_monitor_normal_output_is_concise_and_keeps_job_card(monkeypatch, tmp_pa
 
     result = CliRunner().invoke(
         cli,
-        ["monitor", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "monitor.db")],
+        ["monitor", "--no-ai", "--db-path", str(tmp_path / "monitor.db")],
     )
 
     assert result.exit_code == 0, result.output
@@ -606,7 +536,7 @@ def test_monitor_verbose_keeps_pipeline_diagnostics(monkeypatch, tmp_path, caplo
 
     result = CliRunner().invoke(
         cli,
-        ["monitor", "--verbose", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "verbose.db")],
+        ["monitor", "--verbose", "--no-ai", "--db-path", str(tmp_path / "verbose.db")],
     )
 
     assert result.exit_code == 0, result.output
@@ -685,7 +615,7 @@ def test_logging_configuration_is_idempotent_and_verbose_is_debug(monkeypatch):
         assert httpx_logger.level == logging.WARNING
         first_count = len(root.handlers)
         cli_module.configure_logging()
-        assert first_count == len(root.handlers) == 1
+        assert first_count == len(root.handlers) == 2
         cli_module.configure_logging(verbose=True)
         assert root.level == logging.DEBUG
         assert root.handlers[0].level == logging.DEBUG
@@ -717,7 +647,7 @@ def test_scan_verbose_option_enables_debug_logs(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_module, "run_single_scan", fake_scan)
     monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
     result = CliRunner().invoke(
-        cli, ["scan", "--verbose", "--no-ai", "--no-notify", "--db-path", str(tmp_path / "verbose.db")]
+        cli, ["scan", "--verbose", "--no-ai", "--db-path", str(tmp_path / "verbose.db")]
     )
 
     assert result.exit_code == 0, result.output
@@ -1067,18 +997,13 @@ def test_router_removes_primary_from_fallback_and_keeps_other_providers():
     assert router.fallback == ["nvidia", "groq", "ollama"]
 
 
-def test_start_loop_survives_errors_and_closes_the_notifier(monkeypatch, tmp_path):
-    """One broken scan must not kill the daemon, and Ctrl-C must release it."""
-    closed = []
-
-    class SpyNotifier(TelegramNotifier):
-        async def close(self):
-            closed.append(True)
-            await self.client.aclose()
+def test_start_loop_survives_errors_without_delivery(monkeypatch, tmp_path):
+    """One broken scan must not kill the legacy loop; collection has no delivery client."""
 
     calls = {"n": 0}
 
     async def fake_scan(config, repo, ai_matcher=None, notifier=None):
+        assert notifier is None
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("source exploded")
@@ -1087,19 +1012,15 @@ def test_start_loop_survives_errors_and_closes_the_notifier(monkeypatch, tmp_pat
     async def no_sleep(*args, **kwargs):
         return None
 
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:token")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
-    monkeypatch.setattr(cli_module, "TelegramNotifier", SpyNotifier)
     monkeypatch.setattr(cli_module, "run_single_scan", fake_scan)
     monkeypatch.setattr(cli_module, "load_config", lambda *a, **k: Config())
     monkeypatch.setattr(cli_module, "asyncio", SimpleNamespace(sleep=no_sleep, run=asyncio.run))
 
     result = CliRunner().invoke(
-        cli, ["start", "--interval", "0", "--no-ai", "--notify",
+        cli, ["start", "--interval", "0", "--no-ai",
               "--db-path", str(tmp_path / "loop.db")]
     )
 
     assert result.exit_code == 0, result.output
     assert calls["n"] == 2          # the error did not abort the loop
-    assert closed == [True]         # ... but stopping always cleans up
     assert "Stopping" in result.output

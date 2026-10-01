@@ -551,6 +551,36 @@ def test_continuous_monitor_registers_every_enabled_channel_and_stops():
     assert source._connection_task is None
 
 
+def test_scan_24h_fetches_history_while_event_mode_is_active(tmp_path):
+    from hirevia.storage.state import JobRepository
+
+    write_yaml("telegram:\n  channels:\n    - username: jobs_alpha\n")
+    source = TelegramSource()
+    source._event_mode = True
+    source.force_24h_lookback = True
+    source.bind_state(JobRepository(tmp_path / "scan-24h.db"))
+    fetched = []
+
+    async def use_client():
+        return object()
+
+    async def fetch_history(client, channel):
+        fetched.append(channel.username)
+        return [TgMessage(channel.username, 45, NOW, JOB_TEXT, [])]
+
+    async def fail_if_event_mode_is_used(channels):
+        raise AssertionError("Scan 24h must fetch channel history")
+
+    source._ensure_client = use_client
+    source._fetch_channel_messages = fetch_history
+    source._collect_queued_message = fail_if_event_mode_is_used
+
+    jobs = asyncio.run(source.collect())
+
+    assert fetched == ["jobs_alpha"]
+    assert len(jobs) == 1
+
+
 def test_reconnect_reattaches_handler_without_resetting_channel_cursor():
     source = TelegramSource()
     channel = TelegramChannel(username="jobs_alpha")

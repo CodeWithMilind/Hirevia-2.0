@@ -15,6 +15,7 @@ The tests here pin the scoring CONTRACT, not incidental numbers:
 import pytest
 from pydantic import ValidationError
 
+from hirevia.config import Config
 from hirevia.core.matching import WEIGHTS, analyze, combine, match_job, parse_experience
 from hirevia.core.models import (
     AIResponse,
@@ -27,6 +28,18 @@ from hirevia.core.models import (
 
 
 # --- helpers ------------------------------------------------------------------
+
+
+def test_priority_threshold_defaults_and_order_validation():
+    config = Config()
+
+    assert config.priority_p1_min_score == 85
+    assert config.priority_p2_min_score == 65
+    assert config.priority_p3_min_score == 40
+    with pytest.raises(ValidationError):
+        Config(priority_p1_min_score=60, priority_p2_min_score=70, priority_p3_min_score=40)
+    with pytest.raises(ValidationError):
+        Config(priority_p1_min_score=85, priority_p2_min_score=65, priority_p3_min_score=65)
 
 
 def make_profile(**overrides) -> CandidateProfile:

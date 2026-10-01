@@ -108,11 +108,10 @@ class TelegramChannel(BaseModel):
 
 
 class TelegramSettings(BaseModel):
-    """telegram.yaml contents: which public communities to monitor."""
+    """telegram.yaml contents: which public channels to monitor."""
 
     enabled: bool = True
     channels: List[TelegramChannel] = Field(default_factory=list)
-    community_destinations: Dict[str, str] = Field(default_factory=dict)
 
     def get_enabled_channels(self) -> List[TelegramChannel]:
         return [c for c in self.channels if c.enabled]
@@ -161,9 +160,4 @@ def load_telegram_settings(path: Optional[Path] = None) -> TelegramSettings:
     return TelegramSettings(
         enabled=bool(section.get("enabled", True)),
         channels=channels,
-        community_destinations={
-            str(priority).upper(): str(destination)
-            for priority, destination in (section.get("community_destinations") or {}).items()
-            if destination
-        },
     )

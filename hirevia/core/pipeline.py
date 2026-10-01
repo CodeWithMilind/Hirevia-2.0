@@ -39,6 +39,10 @@ from hirevia.storage.state import JobRepository
 logger = logging.getLogger(__name__)
 PREFIX = "[Pipeline]"
 
+
+class RetryableAIError(RuntimeError):
+    """An AI outage that must leave the Telegram candidate queued for retry."""
+
 # Priorities that always earn an alert; P3 needs a strong score instead.
 ALERT_PRIORITIES = {Priority.P1, Priority.P2}
 
@@ -112,9 +116,11 @@ class Pipeline:
         try:
             expiry_started = time.perf_counter()
             self.stats.jobs_expired = self.repo.expire_jobs()
+            expired_messages = self.repo.expire_pending_telegram_jobs()
             logger.info(
-                "%s Stage 1 expiry completed: %d job(s) in %.3fs",
-                PREFIX, self.stats.jobs_expired, time.perf_counter() - expiry_started,
+                "%s Stage 1 expiry completed: %d job(s), %d queued message(s) in %.3fs",
+                PREFIX, self.stats.jobs_expired, expired_messages,
+                time.perf_counter() - expiry_started,
             )
 
             sources = self.registry.get_enabled_sources()
@@ -141,6 +147,20 @@ class Pipeline:
                 self.stats.jobs_normalized, len(all_jobs),
             )
 
+            non_telegram_jobs = [job for job in all_jobs if job.source != "telegram"]
+            telegram_jobs = [job for job in all_jobs if job.source == "telegram"]
+            for job in telegram_jobs:
+                if not self.repo.enqueue_telegram_job(job):
+                    self.stats.jobs_duplicate += 1
+            self.stats.jobs_expired += self.repo.expire_jobs()
+            self.repo.expire_pending_telegram_jobs()
+            claimed_telegram_jobs = self.repo.claim_telegram_jobs()
+            queue_identity_by_job = {
+                id(job): identity for identity, job in claimed_telegram_jobs
+            }
+            all_jobs = sort_by_freshness(
+                non_telegram_jobs + [job for _, job in claimed_telegram_jobs]
+            )
             total = len(all_jobs)
             if self.ai_progress_callback:
                 if not getattr(self, "_progress_started", False):
@@ -159,9 +179,21 @@ class Pipeline:
                     )
                 try:
                     await self._process_job(job, index, total)
+                    queue_identity = queue_identity_by_job.get(id(job))
+                    if queue_identity:
+                        self.repo.complete_telegram_job(queue_identity)
                 except Exception as e:  # noqa: BLE001 - a job must not kill the scan
                     self.stats.jobs_failed += 1
                     self._record_error(f"{job.source}:{job.source_job_id} {type(e).__name__}: {e}")
+                    queue_identity = queue_identity_by_job.get(id(job))
+                    if queue_identity:
+                        retry_delay = self.repo.retry_telegram_job(
+                            queue_identity, f"{type(e).__name__}: {e}"
+                        )
+                        logger.warning(
+                            "%s Telegram queue item deferred for %ss (%s)",
+                            PREFIX, retry_delay, type(e).__name__,
+                        )
                     logger.error(
                         "%s [%d/%d] job %r (%s) failed: %s",
                         PREFIX, index, total, job.title, job.source, e, exc_info=True,
@@ -576,6 +608,8 @@ class Pipeline:
                     "%s AI provider failed for %r (%s); continuing with profile evidence",
                     PREFIX, job.title, decision.error or "unknown error",
                 )
+                if job.source == "telegram":
+                    raise RetryableAIError("AI evaluation failed; Telegram message remains queued")
             elif decision.relevant:
                 self.stats.jobs_ai_matched += 1
             else:

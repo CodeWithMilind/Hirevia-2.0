@@ -229,7 +229,7 @@ def test_status_api_detects_a_stopped_monitor_worker(monkeypatch, tmp_path, capl
         with caplog.at_level(logging.ERROR, logger="hirevia.web.state"):
             status = state.get_status()
 
-        assert status["status"] == "STOPPED"
+        assert status["status"] == "ERROR"
         assert status["is_running"] is False
         assert "Web monitor worker exited unexpectedly" in caplog.text
     finally:
@@ -387,8 +387,10 @@ def test_ai_web_settings_update_the_shared_configuration_without_returning_keys(
         primary="llamacpp",
         model="web-selected-model",
         base_url="http://127.0.0.1:8080/v1",
-        fallback=["nvidia"],
         timeout_seconds=60,
+        p1_threshold=90,
+        p2_threshold=70,
+        p3_threshold=45,
         api_key="local-secret-CANARY",
     )))
     public_config = asyncio.run(routes.get_ai_config())
@@ -397,31 +399,16 @@ def test_ai_web_settings_update_the_shared_configuration_without_returning_keys(
     assert (tmp_path / ".env").read_text(encoding="utf-8").find("NVIDIA_API_KEY=masked-secret-CANARY") == -1
     assert state.config.ai.primary == "llamacpp"
     assert state.config.ai.providers["llamacpp"].model == "web-selected-model"
-    assert state.config.ai.fallback == ["nvidia"]
+    assert state.config.priority_p1_min_score == 90
+    assert state.config.priority_p2_min_score == 70
+    assert state.config.priority_p3_min_score == 45
     assert state.config.ai.timeout_seconds == 60
     assert "LLAMACPP_API_KEY=local-secret-CANARY" in (tmp_path / ".env").read_text(encoding="utf-8")
     assert "masked-secret-CANARY" not in repr(public_config)
     assert "local-secret-CANARY" not in repr(public_config)
-    web_state._web_state = None
-    web_state.WebUIState._instance = None
-
-
-def test_telegram_web_destination_updates_existing_yaml(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    telegram_file = tmp_path / "telegram.yaml"
-    telegram_file.write_text("telegram:\n  enabled: true\n  channels: []\n", encoding="utf-8")
-    state = web_state.initialize_web_state(Config(), JobRepository(tmp_path / "jobs.db"))
-    monkeypatch.setattr(routes, "_state", lambda: state)
-
-    result = asyncio.run(routes.update_community_destinations(
-        routes.CommunityDestinationsRequest(
-            destinations={"P1": "-1001", "P2": "-1002", "P3": "-1003"}
-        )
-    ))
-
-    assert result["success"] is True
-    assert load_telegram_settings().community_destinations == {
-        "P1": "-1001", "P2": "-1002", "P3": "-1003"
+    assert "fallback" not in public_config
+    assert public_config["matching"] == {
+        "p1_threshold": 90, "p2_threshold": 70, "p3_threshold": 45
     }
     web_state._web_state = None
     web_state.WebUIState._instance = None
@@ -463,6 +450,9 @@ def test_monitor_starts_after_telegram_authentication_and_validation(monkeypatch
     from hirevia.sources import telegram_source
 
     monkeypatch.chdir(tmp_path)
+    (tmp_path / "telegram.yaml").write_text(
+        "telegram:\n  channels:\n    - username: jobs_alpha\n", encoding="utf-8"
+    )
     web_state._web_state = None
     web_state.WebUIState._instance = None
 
@@ -470,14 +460,47 @@ def test_monitor_starts_after_telegram_authentication_and_validation(monkeypatch
         async def get_me(self):
             return SimpleNamespace(first_name="Hirevia", last_name=None, username="hirevia_user")
 
+        async def get_entity(self, username):
+            return SimpleNamespace(username=username)
+
+        async def __call__(self, request):
+            return SimpleNamespace()
+
     async def existing_session():
         return AccountClient()
 
+    class FakeTelegramSource:
+        last_collection_failed = False
+        has_more_backfill = False
+
+        def __init__(self):
+            self.stopped = asyncio.Event()
+            self.event_mode = False
+
+        async def start_continuous_monitoring(self):
+            return 1
+
+        def enable_event_mode(self):
+            self.event_mode = True
+
+        def retry_uncommitted_event(self):
+            return False
+
+        async def stop_continuous_monitoring(self):
+            self.stopped.set()
+
+    source = FakeTelegramSource()
+
     class FakePipeline:
         def __init__(self, *args, **kwargs):
-            pass
+            self.registry = SimpleNamespace(get_source=lambda name: source if name == "telegram" else None)
+            self.scan_calls = 0
 
         async def run_scan(self):
+            self.scan_calls += 1
+            if self.scan_calls == 1:
+                return ScanStats()
+            await source.stopped.wait()
             return ScanStats()
 
     monkeypatch.setattr(telegram_source, "ensure_client", existing_session)
@@ -492,7 +515,10 @@ def test_monitor_starts_after_telegram_authentication_and_validation(monkeypatch
         started = await state.start_scanner()
         assert started is True
         assert state.is_running is True
+        assert state.repo.get_source_state("system", "monitor_desired") == "running"
+        assert source.event_mode is True
         await state.stop_scanner()
+        assert state.repo.get_source_state("system", "monitor_desired") == "stopped"
 
     try:
         asyncio.run(start_then_stop())
@@ -502,7 +528,38 @@ def test_monitor_starts_after_telegram_authentication_and_validation(monkeypatch
         web_state.WebUIState._instance = None
 
 
-def test_existing_telegram_session_is_not_reused_automatically(monkeypatch, tmp_path):
+def test_monitor_desired_state_defaults_stopped_and_recovers_only_when_requested(monkeypatch, tmp_path):
+    config = Config()
+    config.sources.sources["telegram"].enabled = False
+    state = web_state.initialize_web_state(
+        config, JobRepository(tmp_path / "monitor-recovery.db")
+    )
+    start_calls = []
+
+    async def fake_start(persist_desired=True):
+        start_calls.append(persist_desired)
+        return True
+
+    monkeypatch.setattr(state, "start_scanner", fake_start)
+
+    async def recover():
+        stopped = await state.recover_monitoring_for_startup()
+        state.repo.set_source_state("system", "monitor_desired", "running")
+        running = await state.recover_monitoring_for_startup()
+        return stopped, running
+
+    try:
+        stopped, running = asyncio.run(recover())
+        assert stopped is False
+        assert running is True
+        assert state.monitor_state == "STOPPED"
+        assert start_calls == [False]
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
+
+
+def test_existing_telegram_session_is_restored_on_startup(monkeypatch, tmp_path):
     from hirevia.sources import telegram_source
     from hirevia.sources.telegram_config import TelegramCredentials
 
@@ -526,11 +583,17 @@ def test_existing_telegram_session_is_not_reused_automatically(monkeypatch, tmp_
 
     old_client = OldClient()
     telegram_source._shared_client = old_client
-    ensure_calls = []
+    restored_client = OldClient()
 
     async def existing_session():
-        ensure_calls.append(True)
-        raise AssertionError("startup/status must not load an existing session")
+        return restored_client
+
+    async def get_me():
+        return SimpleNamespace(
+            first_name="Hirevia", last_name="User", username="hirevia_user", phone="12025550123"
+        )
+
+    restored_client.get_me = get_me
 
     monkeypatch.setattr(telegram_source, "ensure_client", existing_session)
     state = web_state.initialize_web_state(
@@ -538,15 +601,15 @@ def test_existing_telegram_session_is_not_reused_automatically(monkeypatch, tmp_
     )
 
     try:
-        asyncio.run(state.reset_telegram_auth_for_startup())
+        asyncio.run(state.restore_telegram_auth_for_startup())
         status = asyncio.run(state.telegram_status())
 
-        assert status["connected"] is False
-        assert status["login_state"] == "disconnected"
-        assert status["account"] is None
-        assert not session_file.exists()
+        assert status["connected"] is True
+        assert status["login_state"] == "connected"
+        assert status["account"] == {"name": "Hirevia User", "username": "hirevia_user"}
+        assert session_file.exists()
         assert old_client.closed is True
-        assert ensure_calls == []
+        assert telegram_source._shared_client is restored_client
     finally:
         telegram_source._shared_client = None
         web_state._web_state = None
@@ -887,7 +950,7 @@ def test_deleting_jobs_database_does_not_delete_telegram_session_file(tmp_path):
     assert session_file.exists()
 
 
-def test_service_startup_clears_previous_telegram_session_and_client(monkeypatch, tmp_path):
+def test_service_startup_preserves_session_and_closes_clients(monkeypatch, tmp_path):
     from hirevia.sources import telegram_source
     from hirevia.sources.telegram_config import TelegramCredentials
 
@@ -910,23 +973,34 @@ def test_service_startup_clears_previous_telegram_session_and_client(monkeypatch
         async def disconnect(self):
             closed.append(True)
 
+    class RestoredClient(OldClient):
+        async def get_me(self):
+            return SimpleNamespace(
+                first_name="Hirevia", last_name="User", username="hirevia_user", phone="12025550123"
+            )
+
+    restored_client = RestoredClient()
+
+    async def restore_client():
+        return restored_client
+
     telegram_source._shared_client = OldClient()
+    monkeypatch.setattr(telegram_source, "ensure_client", restore_client)
     web_state._web_state = None
     web_state.WebUIState._instance = None
     state = web_state.initialize_web_state(
         Config(), JobRepository(tmp_path / "startup-session.db")
     )
-    app.state.auto_start_monitoring = True
+    app.state.auto_start_monitoring = False
 
     try:
         with TestClient(app) as client:
             status = client.get("/api/telegram/config").json()
-            telegram_source._shared_client = OldClient()
 
         assert closed == [True, True]
-        assert not session_file.exists()
-        assert status["connected"] is False
-        assert status["login_state"] == "disconnected"
+        assert session_file.exists()
+        assert status["connected"] is True
+        assert status["login_state"] == "connected"
         assert state.is_running is False
     finally:
         telegram_source._shared_client = None
@@ -1128,8 +1202,8 @@ def test_web_control_routes_call_the_injected_monitor_and_scan_methods(monkeypat
             self.is_running = False
             return True
 
-        async def trigger_scan(self):
-            calls.append("scan")
+        async def trigger_scan(self, scan_24h=False):
+            calls.append(("scan", scan_24h))
             return ScanStats()
 
         def get_status(self):
@@ -1154,7 +1228,7 @@ def test_web_control_routes_call_the_injected_monitor_and_scan_methods(monkeypat
     stopped = asyncio.run(routes.stop_scanner())
 
     assert started.success and scanned.success and stopped.success
-    assert calls == ["start", "scan", "stop"]
+    assert calls == ["start", ("scan", True), "stop"]
 
 
 def test_web_monitor_scan_and_job_actions_write_backend_logs(monkeypatch, tmp_path, caplog):
@@ -1200,10 +1274,49 @@ def test_web_monitor_scan_and_job_actions_write_backend_logs(monkeypatch, tmp_pa
             "Web action: Manual scan triggered",
             "Web action: Scan completed",
             "Web action: Job saved",
-            "Web action: Job removed from active feed",
+            "Web action: Job permanently deleted",
             "Web action: Scanner stopped",
         ):
             assert message in caplog.text
     finally:
         web_state._web_state = None
         web_state.WebUIState._instance = None
+
+
+def test_log_api_lists_and_downloads_only_managed_files(monkeypatch, tmp_path):
+    log_directory = tmp_path / "private-logs"
+    log_directory.mkdir()
+    current = log_directory / "hirevia.log"
+    current.write_text("service log data", encoding="utf-8")
+    (log_directory / "other.txt").write_text("not downloadable", encoding="utf-8")
+    monkeypatch.setenv("HIREVIA_LOG_DIR", str(log_directory))
+
+    files = asyncio.run(routes.list_log_files())
+    response = asyncio.run(routes.download_log_file("hirevia.log"))
+
+    assert [item["name"] for item in files] == ["hirevia.log"]
+    assert files[0]["size_bytes"] == len("service log data")
+    assert Path(response.path) == current
+    with pytest.raises(HTTPException, match="Log file not found"):
+        asyncio.run(routes.download_log_file("..\\secrets.env"))
+
+
+def test_delete_all_jobs_route_keeps_telegram_history(monkeypatch, tmp_path):
+    state = web_state.initialize_web_state(Config(), JobRepository(tmp_path / "bulk-delete.db"))
+    job = Job(
+        source="telegram", source_job_id="bulk-delete-1", title="Role", company="Example",
+        location="Remote", description="Test", url="https://t.me/jobs_alpha/1",
+        raw_data={"source_channel": "jobs_alpha", "source_message_id": 1},
+    )
+    state.repo.upsert_job(job)
+    state.repo.record_telegram_message("jobs_alpha", "1")
+    state.repo.mark_telegram_message_processed("jobs_alpha", "1")
+    monkeypatch.setattr(routes, "_state", lambda: state)
+
+    result = asyncio.run(routes.delete_all_jobs())
+
+    assert result == {"success": True, "deleted": 1}
+    assert state.repo.get_job(job.id) is None
+    assert state.repo.record_telegram_message("jobs_alpha", "1") is False
+    web_state._web_state = None
+    web_state.WebUIState._instance = None

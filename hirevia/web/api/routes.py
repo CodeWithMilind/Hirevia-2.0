@@ -1,12 +1,16 @@
 """API routes for Web UI"""
 
 import os
+import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
+from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Query, Body
+from fastapi.responses import FileResponse
 import yaml
 from pydantic import ValidationError
 
@@ -25,8 +29,6 @@ from hirevia.web.api.models import (
     SourceInfo,
     JobsResponse,
     JobResponse,
-    TelegramTestRequest,
-    TelegramTestResponse,
     ScanTriggerResponse,
     StartStopResponse,
     ConfigResponse,
@@ -37,16 +39,38 @@ from hirevia.web.api.models import (
     TelegramPhoneRequest,
     TelegramOTPRequest,
     Telegram2FARequest,
-    CommunityDestinationsRequest,
     TelegramSourceUpdate,
 )
 
 router = APIRouter()
 CONFIG_FILE_NAMES = ("profile.yaml", "filters.yaml", "sources.yaml", "telegram.yaml", "ai.yaml")
+LOG_FILENAME_RE = re.compile(r"^hirevia\.log(?:\.\d+)?$")
 
 
 def _state():
     return get_web_state()
+
+
+def _require_monitor_stopped(state) -> None:
+    if state.is_running or state.is_scanning:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop monitoring and wait for the current scan to finish before changing configuration",
+        )
+
+
+def _log_directory() -> Path:
+    return Path(os.getenv("HIREVIA_LOG_DIR", "logs")).expanduser().resolve()
+
+
+def _available_log_files():
+    directory = _log_directory()
+    if not directory.is_dir():
+        return []
+    return sorted(
+        (path for path in directory.iterdir() if LOG_FILENAME_RE.fullmatch(path.name) and path.is_file()),
+        key=lambda path: path.name,
+    )
 
 
 @router.get("/status", response_model=SystemStatusResponse)
@@ -65,6 +89,15 @@ async def get_status():
         scan_interval_minutes=status["scan_interval_minutes"],
         is_scanning=status["is_scanning"],
         is_running=status["is_running"],
+        telegram_connected=status["telegram_connected"],
+        ai_provider=status["ai_provider"],
+        ai_provider_configured=status["ai_provider_configured"],
+        ai_health_state=status["ai_health_state"],
+        ai_health_checked_at=status["ai_health_checked_at"],
+        queue_size=status["queue_size"],
+        queue_processing=status["queue_processing"],
+        queue_oldest_pending_at=status["queue_oldest_pending_at"],
+        last_cleanup_at=status["last_cleanup_at"],
         sources=[SourceInfo(**s) for s in sources],
     )
 
@@ -84,12 +117,47 @@ async def get_sources():
     return state.get_source_status()
 
 
+@router.get("/logs")
+async def list_log_files():
+    return [
+        {
+            "name": path.name,
+            "size_bytes": path.stat().st_size,
+            "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+        }
+        for path in _available_log_files()
+    ]
+
+
+@router.get("/logs/{filename}")
+async def download_log_file(filename: str):
+    if not LOG_FILENAME_RE.fullmatch(filename):
+        raise HTTPException(status_code=404, detail="Log file not found")
+    directory = _log_directory()
+    candidate = (directory / filename).resolve()
+    if candidate.parent != directory or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Log file not found")
+    return FileResponse(candidate, media_type="text/plain", filename=filename)
+
+
+@router.get("/queue/status")
+async def get_queue_status():
+    state = _state()
+    return {
+        **state.repo.get_telegram_queue_status(),
+        "last_cleanup_at": state.last_cleanup_at.isoformat() if state.last_cleanup_at else None,
+        "cleanup_error": state.cleanup_error,
+    }
+
+
+@router.delete("/jobs")
+async def delete_all_jobs():
+    deleted = _state().delete_all_jobs()
+    return {"success": True, "deleted": deleted}
+
+
 @router.post("/start", response_model=StartStopResponse)
-async def start_scanner(
-    nvidia_key: Optional[str] = Body(None, description="NVIDIA API key"),
-    telegram_token: Optional[str] = Body(None, description="Telegram bot token"),
-    telegram_chat_id: Optional[str] = Body(None, description="Telegram chat ID"),
-):
+async def start_scanner():
     """Start the background scanner"""
     state = _state()
     
@@ -100,11 +168,7 @@ async def start_scanner(
             status=SystemStatus.RUNNING,
         )
     
-    success = await state.start_scanner(
-        nvidia_key=nvidia_key,
-        telegram_token=telegram_token,
-        telegram_chat_id=telegram_chat_id,
-    )
+    success = await state.start_scanner()
     
     status = state.get_status()
     return StartStopResponse(
@@ -149,7 +213,7 @@ async def trigger_scan():
         raise HTTPException(status_code=400, detail="Scan already in progress")
     
     try:
-        stats = await state.trigger_scan()
+        stats = await state.trigger_scan(scan_24h=True)
         return ScanTriggerResponse(
             success=True,
             message="Scan completed",
@@ -225,14 +289,6 @@ async def get_activity(limit: int = Query(50, ge=1, le=200)):
     return state.get_activity(limit)
 
 
-@router.post("/telegram/test", response_model=TelegramTestResponse)
-async def test_telegram(request: TelegramTestRequest):
-    """Send a test Telegram message"""
-    state = _state()
-    result = await state.test_telegram(request.message)
-    return TelegramTestResponse(**result)
-
-
 @router.get("/config", response_model=ConfigResponse)
 async def get_config():
     """Get current configuration"""
@@ -291,6 +347,7 @@ async def validate_config_file(filename: str, request: ConfigFileRequest):
 @router.put("/config/files/{filename}")
 async def save_config_file(filename: str, request: ConfigFileRequest):
     state = _state()
+    _require_monitor_stopped(state)
     path = _config_path(filename)
     _validate_yaml(filename, request.content)
     temp_name = None
@@ -300,7 +357,10 @@ async def save_config_file(filename: str, request: ConfigFileRequest):
             prefix=f".{path.name}.", suffix=".tmp",
         ) as temporary:
             temporary.write(request.content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
             temp_name = temporary.name
+        shutil.copy2(path, path.with_name(f".{path.name}.bak"))
         os.replace(temp_name, path)
     except OSError as error:
         if temp_name:
@@ -317,8 +377,12 @@ async def get_ai_config():
     status = {item["name"]: item for item in provider_status(config)}
     return {
         "primary": config.ai.primary,
-        "fallback": config.ai.fallback,
         "timeout_seconds": config.ai.timeout_seconds,
+        "matching": {
+            "p1_threshold": config.priority_p1_min_score,
+            "p2_threshold": config.priority_p2_min_score,
+            "p3_threshold": config.priority_p3_min_score,
+        },
         "providers": [
             {
                 "name": name,
@@ -356,7 +420,14 @@ def _persist_env_settings(settings: dict[str, str]) -> None:
             prefix=".env.", suffix=".tmp",
         ) as temporary:
             temporary.write("\n".join(lines) + "\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
             temp_name = temporary.name
+        if env_path.exists():
+            backup_path = env_path.with_name(".env.bak")
+            shutil.copy2(env_path, backup_path)
+            os.chmod(backup_path, 0o600)
+        os.chmod(temp_name, 0o600)
         os.replace(temp_name, env_path)
     except OSError:
         if temp_name:
@@ -368,18 +439,19 @@ def _persist_env_settings(settings: dict[str, str]) -> None:
 @router.put("/ai/config")
 async def update_ai_config(request: AISettingsRequest):
     state = _state()
+    _require_monitor_stopped(state)
     name = request.primary.strip().lower()
     if name not in state.config.ai.providers:
         raise HTTPException(status_code=422, detail="Unknown AI provider")
     if not request.model.strip():
         raise HTTPException(status_code=422, detail="Model is required")
-    if any(provider not in state.config.ai.providers for provider in request.fallback):
-        raise HTTPException(status_code=422, detail="Unknown fallback provider")
     settings = {
         "AI_PRIMARY_PROVIDER": name,
         f"{name.upper()}_MODEL": request.model.strip(),
-        "AI_FALLBACK_PROVIDERS": ",".join(request.fallback),
         "AI_TIMEOUT_SECONDS": str(request.timeout_seconds),
+        "MATCHING_P1_THRESHOLD": str(request.p1_threshold),
+        "MATCHING_P2_THRESHOLD": str(request.p2_threshold),
+        "MATCHING_P3_THRESHOLD": str(request.p3_threshold),
     }
     if request.base_url is not None:
         parsed = urlparse(request.base_url)
@@ -415,11 +487,6 @@ async def validate_telegram_sources():
     return await _state().validate_telegram_sources(force=True)
 
 
-@router.get("/telegram/dialogs")
-async def get_telegram_dialogs():
-    return await _state().telegram_dialogs()
-
-
 @router.post("/telegram/login/phone")
 async def begin_telegram_phone_login(request: TelegramPhoneRequest):
     return await _state().begin_telegram_phone_login(request.phone_number)
@@ -452,6 +519,7 @@ async def join_telegram_sources():
 
 @router.put("/telegram/sources/{username}")
 async def update_telegram_source(username: str, request: TelegramSourceUpdate):
+    _require_monitor_stopped(_state())
     path = Path.cwd() / "telegram.yaml"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="telegram.yaml does not exist")
@@ -512,51 +580,3 @@ async def leave_telegram_source(username: str):
     except ValidationError as error:
         raise HTTPException(status_code=422, detail="Invalid public channel username") from error
     return await _state().set_telegram_source_membership(normalized, join=False)
-
-
-@router.put("/telegram/community")
-async def update_community_destinations(request: CommunityDestinationsRequest):
-    path = Path.cwd() / "telegram.yaml"
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="telegram.yaml does not exist")
-    unknown = set(request.destinations) - {"P1", "P2", "P3"}
-    if unknown:
-        raise HTTPException(status_code=422, detail="Destinations must use P1, P2, or P3")
-    try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        section = document.setdefault("telegram", {})
-        if not isinstance(section, dict):
-            raise ValueError("telegram section must be a mapping")
-        section["community_destinations"] = {
-            key: value.strip()
-            for key, value in request.destinations.items()
-            if value.strip()
-        }
-        serialized = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
-    except (yaml.YAMLError, ValueError, AttributeError) as error:
-        raise HTTPException(status_code=422, detail="telegram.yaml is not valid configuration") from error
-
-    temp_name = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, delete=False,
-            prefix=".telegram.yaml.", suffix=".tmp",
-        ) as temporary:
-            temporary.write(serialized)
-            temp_name = temporary.name
-        os.replace(temp_name, path)
-    except OSError as error:
-        if temp_name:
-            Path(temp_name).unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail="Could not save Telegram destinations") from error
-    await _state().reload_configuration()
-    _state().add_activity("Telegram community destinations updated")
-    return {"success": True, "destinations": request.destinations}
-
-
-@router.post("/telegram/community/test/{priority}")
-async def test_community_destination(priority: str):
-    priority = priority.upper()
-    if priority not in {"P1", "P2", "P3"}:
-        raise HTTPException(status_code=404, detail="Unknown priority destination")
-    return await _state().test_community_destination(priority)

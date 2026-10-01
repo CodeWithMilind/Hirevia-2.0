@@ -4,13 +4,17 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from enum import Enum
 
-from pydantic import BaseModel, Field, HttpUrl, SecretStr
+from pydantic import BaseModel, Field, HttpUrl, SecretStr, model_validator
 
 
 class SystemStatus(str, Enum):
     RUNNING = "RUNNING"
     STOPPED = "STOPPED"
     SCANNING = "SCANNING"
+    STARTING = "STARTING"
+    RECONNECTING = "RECONNECTING"
+    STOPPING = "STOPPING"
+    AUTH_REQUIRED = "AUTH_REQUIRED"
     ERROR = "ERROR"
 
 
@@ -51,6 +55,15 @@ class SystemStatusResponse(BaseModel):
     scan_interval_minutes: int
     is_scanning: bool
     is_running: bool
+    telegram_connected: bool = False
+    ai_provider: str = ""
+    ai_provider_configured: bool = False
+    ai_health_state: str = "untested"
+    ai_health_checked_at: Optional[str] = None
+    queue_size: int = 0
+    queue_processing: int = 0
+    queue_oldest_pending_at: Optional[str] = None
+    last_cleanup_at: Optional[str] = None
     sources: List[SourceInfo]
 
 
@@ -115,6 +128,7 @@ class JobResponse(BaseModel):
     fingerprint: Optional[str] = None
     first_seen: Optional[str] = None
     last_seen: Optional[str] = None
+    saved_at: Optional[str] = None
     expires_at: Optional[str] = None
     notified_at: Optional[str] = None
     notification_channel: Optional[str] = None
@@ -142,15 +156,6 @@ class JobsResponse(BaseModel):
     total: int
     limit: int
     offset: int
-
-
-class TelegramTestRequest(BaseModel):
-    message: str = "Test message from Hirevia Web UI"
-
-
-class TelegramTestResponse(BaseModel):
-    success: bool
-    message: str
 
 
 class ScanTriggerResponse(BaseModel):
@@ -183,9 +188,17 @@ class AISettingsRequest(BaseModel):
     primary: str
     model: str
     base_url: Optional[str] = None
-    fallback: List[str] = Field(default_factory=list)
     timeout_seconds: int = Field(default=20, ge=1, le=300)
+    p1_threshold: int = Field(default=85, ge=0, le=100)
+    p2_threshold: int = Field(default=65, ge=0, le=100)
+    p3_threshold: int = Field(default=40, ge=0, le=100)
     api_key: Optional[SecretStr] = None
+
+    @model_validator(mode="after")
+    def validate_threshold_order(self):
+        if not self.p1_threshold > self.p2_threshold > self.p3_threshold:
+            raise ValueError("matching thresholds must satisfy P1 > P2 > P3")
+        return self
 
 
 class TelegramPhoneRequest(BaseModel):
@@ -198,10 +211,6 @@ class TelegramOTPRequest(BaseModel):
 
 class Telegram2FARequest(BaseModel):
     password: SecretStr
-
-
-class CommunityDestinationsRequest(BaseModel):
-    destinations: Dict[str, str]
 
 
 class TelegramSourceUpdate(BaseModel):

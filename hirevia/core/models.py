@@ -51,6 +51,7 @@ class Job(BaseModel):
     fingerprint: Optional[str] = None
     first_seen: Optional[datetime] = None
     last_seen: Optional[datetime] = None
+    saved_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
     notified_at: Optional[datetime] = None
     notification_channel: Optional[str] = None

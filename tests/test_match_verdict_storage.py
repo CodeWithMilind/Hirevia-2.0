@@ -13,7 +13,7 @@ that make it useful afterwards:
 
 import asyncio
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from hirevia.core.models import AIResponse, Job, MatchResult, Priority
 from hirevia.notifications.base import Notifier
@@ -96,6 +96,106 @@ def test_match_result_survives_a_storage_round_trip(tmp_path):
     assert verdict.matched_skills == ["Python", "FastAPI"]
     assert verdict.deterministic_score == 74 and verdict.ai_score == 90
     assert verdict.experience_match is True
+
+
+def test_telegram_processing_queue_survives_restart_and_preserves_history(tmp_path):
+    database_path = tmp_path / "queue.db"
+    repo = JobRepository(database_path)
+    job = make_job(
+        raw_data={"source_channel": "jobs_alpha", "source_message_id": 42},
+        posted_at=datetime.utcnow(),
+    )
+
+    assert repo.enqueue_telegram_job(job) is True
+    identity = "telegram:jobs_alpha:42"
+    claimed = repo.claim_telegram_jobs(limit=1)
+    assert len(claimed) == 1
+    assert claimed[0][0] == identity
+    assert claimed[0][1].title == job.title
+    assert repo.claim_telegram_jobs(limit=1) == []
+
+    restarted = JobRepository(database_path)
+    assert restarted.recover_processing_queue() == 1
+    recovered = restarted.claim_telegram_jobs(limit=1)
+    assert len(recovered) == 1
+    restarted.complete_telegram_job(identity)
+    assert restarted.record_telegram_message("jobs_alpha", "42") is False
+    assert restarted.get_telegram_queue_status()["queued"] == 0
+    with restarted._get_conn() as conn:
+        row = conn.execute(
+            "SELECT status FROM telegram_message_history WHERE message_identity = ?",
+            (identity,),
+        ).fetchone()
+    assert row["status"] == "PROCESSED"
+
+
+def test_expired_telegram_queue_payload_is_removed_but_history_remains(tmp_path):
+    repo = JobRepository(tmp_path / "expired-queue.db")
+    old_job = make_job(
+        raw_data={"source_channel": "jobs_alpha", "source_message_id": 43},
+        posted_at=datetime.utcnow() - timedelta(hours=25),
+    )
+    identity = "telegram:jobs_alpha:43"
+
+    assert repo.enqueue_telegram_job(old_job) is True
+    assert repo.expire_pending_telegram_jobs() == 1
+    assert repo.claim_telegram_jobs() == []
+    assert repo.record_telegram_message("jobs_alpha", "43") is False
+    with repo._get_conn() as conn:
+        queue_row = conn.execute(
+            "SELECT 1 FROM processing_queue WHERE message_identity = ?", (identity,)
+        ).fetchone()
+        history = conn.execute(
+            "SELECT status FROM telegram_message_history WHERE message_identity = ?",
+            (identity,),
+        ).fetchone()
+    assert queue_row is None
+    assert history["status"] == "EXPIRED"
+
+
+def test_expiration_permanently_deletes_job_but_keeps_message_history(tmp_path):
+    repo = JobRepository(tmp_path / "job-expiration.db")
+    job = make_job(raw_data={"source_channel": "jobs_alpha", "source_message_id": 44})
+    repo.upsert_job(job)
+    repo.record_telegram_message("jobs_alpha", "44")
+    repo.mark_telegram_message_processed("jobs_alpha", "44")
+    with repo._get_conn() as conn:
+        conn.execute(
+            "UPDATE jobs SET expires_at = datetime('now', '-1 second') WHERE id = ?",
+            (job.id,),
+        )
+        conn.commit()
+
+    assert repo.expire_jobs() == 1
+    assert repo.get_job(job.id) is None
+    assert repo.record_telegram_message("jobs_alpha", "44") is False
+    with repo._get_conn() as conn:
+        history = conn.execute(
+            "SELECT status FROM telegram_message_history WHERE channel_id = ? AND message_id = ?",
+            ("jobs_alpha", "44"),
+        ).fetchone()
+    assert history["status"] == "PROCESSED"
+
+
+def test_delete_all_jobs_keeps_message_history(tmp_path):
+    repo = JobRepository(tmp_path / "delete-all.db")
+    for message_id in (45, 46):
+        job = make_job(
+            source_job_id=f"job-{message_id}",
+            raw_data={"source_channel": "jobs_alpha", "source_message_id": message_id},
+        )
+        repo.upsert_job(job)
+        repo.record_telegram_message("jobs_alpha", str(message_id))
+        repo.mark_telegram_message_processed("jobs_alpha", str(message_id))
+
+    assert repo.delete_all_jobs() == 2
+    assert repo.get_active_jobs() == []
+    assert repo.record_telegram_message("jobs_alpha", "45") is False
+    with repo._get_conn() as conn:
+        history_count = conn.execute(
+            "SELECT COUNT(*) FROM telegram_message_history"
+        ).fetchone()[0]
+    assert history_count == 2
 
 
 def test_veto_and_degraded_error_fields_survive_a_storage_round_trip(tmp_path):

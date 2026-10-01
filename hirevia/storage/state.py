@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from urllib.parse import urlparse
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -20,12 +21,14 @@ JOB_COLUMNS = [
     "description", "url", "application_url", "posted_at", "detected_at",
     "deadline", "employment_type", "experience", "skills", "raw_data",
     "application_status", "fingerprint", "first_seen", "last_seen",
-    "expires_at", "notified_at", "notification_channel", "ai_decision",
+    "saved_at", "expires_at", "notified_at", "notification_channel", "ai_decision",
     "match_result", "saved", "deleted_at",
 ]
 
 # Columns never overwritten on the UPDATE path (identity + lifecycle anchors).
-UPSERT_IMMUTABLE_COLUMNS = {"id", "source", "source_job_id", "first_seen", "saved", "deleted_at"}
+UPSERT_IMMUTABLE_COLUMNS = {
+    "id", "source", "source_job_id", "first_seen", "saved_at", "saved", "deleted_at"
+}
 
 
 def _load_json(raw, expect: type):
@@ -65,6 +68,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     fingerprint TEXT,
     first_seen TEXT,
     last_seen TEXT,
+    saved_at TEXT,
     expires_at TEXT,
     notified_at TEXT,
     notification_channel TEXT,
@@ -91,6 +95,33 @@ CREATE TABLE IF NOT EXISTS source_state (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (source, key)
 );
+
+CREATE TABLE IF NOT EXISTS telegram_message_history (
+    message_identity TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    first_discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    source_timestamp TEXT,
+    status TEXT NOT NULL DEFAULT 'DISCOVERED',
+    last_processed_at TEXT,
+    last_error TEXT,
+    UNIQUE(channel_id, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS processing_queue (
+    message_identity TEXT PRIMARY KEY
+        REFERENCES telegram_message_history(message_identity) ON DELETE CASCADE,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'QUEUED',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at TEXT NOT NULL DEFAULT (datetime('now')),
+    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    source_timestamp TEXT,
+    processing_started_at TEXT,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_processing_queue_ready
+    ON processing_queue(status, available_at, source_timestamp);
 """
 
 
@@ -106,11 +137,14 @@ END;
 
 class JobRepository:
     def __init__(self, db_path: Path):
-        self.db_path = db_path
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def _init_db(self):
         with self._get_conn() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(SCHEMA)
             conn.executescript(TRIGGERS)
             self._migrate_schema(conn)
@@ -126,6 +160,15 @@ class JobRepository:
             if column not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
 
+        conn.execute(
+            "UPDATE jobs SET saved_at = COALESCE(first_seen, detected_at, created_at, datetime('now')) "
+            "WHERE saved_at IS NULL"
+        )
+        conn.execute(
+            "UPDATE jobs SET expires_at = datetime(saved_at, '+24 hours') "
+            "WHERE expires_at IS NULL AND saved_at IS NOT NULL"
+        )
+
         # Fail fast on any remaining model/schema drift.
         final = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
         missing = [c for c in JOB_COLUMNS if c not in final]
@@ -134,7 +177,8 @@ class JobRepository:
 
     @contextmanager
     def _get_conn(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -171,6 +215,7 @@ class JobRepository:
             fingerprint=row["fingerprint"],
             first_seen=datetime.fromisoformat(row["first_seen"]) if row["first_seen"] else None,
             last_seen=datetime.fromisoformat(row["last_seen"]) if row["last_seen"] else None,
+            saved_at=datetime.fromisoformat(row["saved_at"]) if row["saved_at"] else None,
             expires_at=datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None,
             notified_at=datetime.fromisoformat(row["notified_at"]) if row["notified_at"] else None,
             notification_channel=row["notification_channel"],
@@ -205,6 +250,7 @@ class JobRepository:
             "fingerprint": job.fingerprint,
             "first_seen": job.first_seen.isoformat() if job.first_seen else now,
             "last_seen": job.last_seen.isoformat() if job.last_seen else now,
+            "saved_at": job.saved_at.isoformat() if job.saved_at else now,
             "expires_at": job.expires_at.isoformat() if job.expires_at else None,
             "notified_at": job.notified_at.isoformat() if job.notified_at else None,
             "notification_channel": job.notification_channel,
@@ -231,7 +277,7 @@ class JobRepository:
         """
         with self._get_conn() as conn:
             cursor = conn.execute(
-                "SELECT id, first_seen, match_result FROM jobs WHERE source = ? AND source_job_id = ?",
+                "SELECT id, first_seen, saved_at, match_result FROM jobs WHERE source = ? AND source_job_id = ?",
                 (job.source, job.source_job_id),
             )
             existing = cursor.fetchone()
@@ -247,9 +293,13 @@ class JobRepository:
                     else datetime.utcnow()
                 )
                 job.last_seen = datetime.utcnow()
+                job.saved_at = (
+                    datetime.fromisoformat(existing["saved_at"])
+                    if existing["saved_at"] else job.first_seen
+                )
                 if job.expires_at is None:
                     from datetime import timedelta
-                    job.expires_at = job.first_seen + timedelta(hours=24)
+                    job.expires_at = job.saved_at + timedelta(hours=24)
 
                 values = self._job_to_dict(job)
                 if not values["match_result"] and existing["match_result"]:
@@ -275,7 +325,8 @@ class JobRepository:
                 job.first_seen = datetime.utcnow()
                 job.last_seen = job.first_seen
                 from datetime import timedelta
-                job.expires_at = job.first_seen + timedelta(hours=24)
+                job.saved_at = job.first_seen
+                job.expires_at = job.saved_at + timedelta(hours=24)
 
                 sql = (
                     f"INSERT INTO jobs ({', '.join(JOB_COLUMNS)}) "
@@ -362,28 +413,27 @@ class JobRepository:
     def soft_delete_job(self, job_id: str) -> bool:
         with self._get_conn() as conn:
             cursor = conn.execute(
-                "UPDATE jobs SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
-                (datetime.utcnow().isoformat(), job_id),
+                "DELETE FROM jobs WHERE id = ?",
+                (job_id,),
             )
             conn.commit()
             return cursor.rowcount > 0
 
+    def delete_all_jobs(self) -> int:
+        with self._get_conn() as conn:
+            cursor = conn.execute("DELETE FROM jobs")
+            conn.commit()
+            return cursor.rowcount
+
     def expire_jobs(self) -> int:
-        """Mark jobs past expires_at as expired. Returns count."""
+        """Permanently delete jobs past their individual expiration timestamp."""
         with self._get_conn() as conn:
             cursor = conn.execute(
                 """
-                UPDATE jobs
-                SET application_status = ?
+                DELETE FROM jobs
                 WHERE expires_at IS NOT NULL
                 AND julianday(expires_at) < julianday('now')
-                AND application_status IN (?, ?)
                 """,
-                (
-                    ApplicationStatus.EXPIRED.value,
-                    ApplicationStatus.OPEN.value,
-                    ApplicationStatus.UNKNOWN.value,
-                ),
             )
             conn.commit()
             return cursor.rowcount
@@ -481,6 +531,245 @@ class JobRepository:
                 (source, key, None if value is None else str(value)),
             )
             conn.commit()
+
+    @staticmethod
+    def _telegram_message_identity(channel_id: str, message_id: str) -> str:
+        return f"telegram:{channel_id}:{message_id}"
+
+    def record_telegram_message(
+        self, channel_id: str, message_id: str, source_timestamp: Optional[datetime] = None
+    ) -> bool:
+        """Record a lightweight identity; return false for terminal history rows."""
+        identity = self._telegram_message_identity(str(channel_id), str(message_id))
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO telegram_message_history
+                    (message_identity, channel_id, message_id, source_timestamp)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    identity,
+                    str(channel_id),
+                    str(message_id),
+                    source_timestamp.isoformat() if source_timestamp else None,
+                ),
+            )
+            row = conn.execute(
+                "SELECT status FROM telegram_message_history WHERE message_identity = ?",
+                (identity,),
+            ).fetchone()
+            conn.commit()
+        return bool(row and row["status"] not in {"PROCESSED", "EXPIRED"})
+
+    def mark_telegram_message_processed(self, channel_id: str, message_id: str) -> None:
+        identity = self._telegram_message_identity(str(channel_id), str(message_id))
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE telegram_message_history
+                SET status = 'PROCESSED', last_processed_at = datetime('now'), last_error = NULL
+                WHERE message_identity = ? AND status != 'EXPIRED'
+                """,
+                (identity,),
+            )
+            conn.commit()
+
+    def enqueue_telegram_job(self, job: Job) -> bool:
+        """Persist a normalized Telegram candidate once, keyed by its source message."""
+        if job.application_url:
+            application_url = str(job.application_url)
+            parsed_url = urlparse(application_url)
+            if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+                job.raw_data["invalid_application_url"] = application_url[:500]
+                job.application_url = None
+        channel_id = str(job.raw_data.get("source_channel") or "unknown")
+        message_id = str(job.raw_data.get("source_message_id") or job.source_job_id)
+        identity = self._telegram_message_identity(channel_id, message_id)
+        source_timestamp = job.posted_at.isoformat() if job.posted_at else None
+        payload = job.model_dump_json()
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO telegram_message_history
+                    (message_identity, channel_id, message_id, source_timestamp)
+                VALUES (?, ?, ?, ?)
+                """,
+                (identity, channel_id, message_id, source_timestamp),
+            )
+            history = conn.execute(
+                "SELECT status FROM telegram_message_history WHERE message_identity = ?",
+                (identity,),
+            ).fetchone()
+            if history is None or history["status"] in {"PROCESSED", "EXPIRED"}:
+                conn.commit()
+                return False
+            existing = conn.execute(
+                "SELECT status FROM processing_queue WHERE message_identity = ?",
+                (identity,),
+            ).fetchone()
+            if existing:
+                conn.commit()
+                return False
+            conn.execute(
+                """
+                INSERT INTO processing_queue
+                    (message_identity, payload, status, source_timestamp)
+                VALUES (?, ?, 'QUEUED', ?)
+                """,
+                (identity, payload, source_timestamp),
+            )
+            conn.execute(
+                "UPDATE telegram_message_history SET status = 'QUEUED' WHERE message_identity = ?",
+                (identity,),
+            )
+            conn.commit()
+        return True
+
+    def recover_processing_queue(self) -> int:
+        """Return interrupted claims to the queue after an application restart."""
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE processing_queue
+                SET status = 'QUEUED', processing_started_at = NULL,
+                    available_at = datetime('now')
+                WHERE status = 'PROCESSING'
+                """
+            )
+            conn.execute(
+                """
+                UPDATE telegram_message_history
+                SET status = 'QUEUED'
+                WHERE status = 'PROCESSING'
+                """
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    def claim_telegram_jobs(self, limit: int = 25) -> List[Tuple[str, Job]]:
+        """Atomically claim ready queue entries so only one worker processes each."""
+        limit = max(1, min(int(limit), 100))
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT message_identity, payload FROM processing_queue
+                WHERE status = 'QUEUED'
+                  AND julianday(available_at) <= julianday('now')
+                  AND julianday(COALESCE(source_timestamp, first_seen_at))
+                      > julianday('now', '-24 hours')
+                ORDER BY COALESCE(source_timestamp, first_seen_at), message_identity
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                identity = row["message_identity"]
+                updated = conn.execute(
+                    """
+                    UPDATE processing_queue
+                    SET status = 'PROCESSING', attempts = attempts + 1,
+                        processing_started_at = datetime('now')
+                    WHERE message_identity = ? AND status = 'QUEUED'
+                    """,
+                    (identity,),
+                )
+                if updated.rowcount:
+                    conn.execute(
+                        "UPDATE telegram_message_history SET status = 'PROCESSING' WHERE message_identity = ?",
+                        (identity,),
+                    )
+                    claimed.append((identity, Job.model_validate_json(row["payload"])))
+            conn.commit()
+        return claimed
+
+    def complete_telegram_job(self, message_identity: str) -> None:
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE telegram_message_history
+                SET status = 'PROCESSED', last_processed_at = datetime('now'), last_error = NULL
+                WHERE message_identity = ? AND status != 'EXPIRED'
+                """,
+                (message_identity,),
+            )
+            conn.execute(
+                "DELETE FROM processing_queue WHERE message_identity = ?",
+                (message_identity,),
+            )
+            conn.commit()
+
+    def retry_telegram_job(self, message_identity: str, error: str) -> int:
+        """Requeue a failed item with a capped exponential delay."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM processing_queue WHERE message_identity = ?",
+                (message_identity,),
+            ).fetchone()
+            if row is None:
+                return 0
+            delay = min(2 ** min(max(row["attempts"] - 1, 0), 8), 300)
+            conn.execute(
+                """
+                UPDATE processing_queue
+                SET status = 'QUEUED', processing_started_at = NULL,
+                    available_at = datetime('now', ?), last_error = ?
+                WHERE message_identity = ?
+                """,
+                (f"+{delay} seconds", str(error)[:300], message_identity),
+            )
+            conn.execute(
+                """
+                UPDATE telegram_message_history
+                SET status = 'FAILED', last_error = ?
+                WHERE message_identity = ? AND status != 'EXPIRED'
+                """,
+                (str(error)[:300], message_identity),
+            )
+            conn.commit()
+            return delay
+
+    def expire_pending_telegram_jobs(self) -> int:
+        """Expire queue payloads after 24h while retaining identity history."""
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT message_identity FROM processing_queue
+                WHERE julianday(COALESCE(source_timestamp, first_seen_at))
+                    <= julianday('now', '-24 hours')
+                """
+            ).fetchall()
+            identities = [row["message_identity"] for row in rows]
+            for identity in identities:
+                conn.execute(
+                    "UPDATE telegram_message_history SET status = 'EXPIRED', last_error = NULL WHERE message_identity = ?",
+                    (identity,),
+                )
+                conn.execute(
+                    "DELETE FROM processing_queue WHERE message_identity = ?",
+                    (identity,),
+                )
+            conn.commit()
+        return len(identities)
+
+    def get_telegram_queue_status(self) -> Dict[str, Any]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS count FROM processing_queue GROUP BY status"
+            ).fetchall()
+            oldest = conn.execute(
+                "SELECT MIN(COALESCE(source_timestamp, first_seen_at)) AS oldest FROM processing_queue"
+            ).fetchone()["oldest"]
+        counts = {row["status"].lower(): row["count"] for row in rows}
+        return {
+            "queued": counts.get("queued", 0),
+            "processing": counts.get("processing", 0),
+            "oldest_pending_at": oldest,
+        }
 
     def cleanup_old_jobs(self, days: int = 30) -> int:
         """Remove jobs older than N days that are expired/closed."""

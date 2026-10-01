@@ -3,6 +3,7 @@
 import logging
 import hmac
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -27,15 +28,19 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting Hirevia Web UI")
     state = get_web_state()
-    await state.reset_telegram_auth_for_startup()
-    if getattr(app.state, "auto_start_monitoring", False):
-        await state.start_scanner()
-    yield
-    # Shutdown
-    logger.info("Shutting down Hirevia Web UI")
-    if state.is_running:
-        await state.stop_scanner()
-    await state._close_telegram_clients()
+    state.repo.recover_processing_queue()
+    cleanup_task = asyncio.create_task(state.cleanup_loop())
+    await state.restore_telegram_auth_for_startup()
+    await state.recover_monitoring_for_startup()
+    try:
+        yield
+    finally:
+        logger.info("Shutting down Hirevia Web UI")
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
+        if state.is_running:
+            await state.stop_scanner(persist_desired=False)
+        await state._close_telegram_clients()
 
 
 app = FastAPI(

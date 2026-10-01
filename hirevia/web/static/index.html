@@ -15,7 +15,7 @@
         <div class="brand-row"><span class="brand-mark">H</span><span class="brand-name">HIREVIA</span><button class="icon-button rail-toggle" id="railToggle" title="Collapse sidebar" aria-label="Collapse sidebar">‹</button></div>
         <nav class="navigation" aria-label="Main navigation">
             <button class="nav-item active" data-view="jobs"><span class="nav-icon">▤</span><span>Jobs</span></button>
-            <div class="nav-subgroup"><button class="nav-item sub-item" data-view="telegram"><span class="nav-icon">◉</span><span>Telegram</span></button><button class="nav-item nested" data-view="telegram">Sources</button><button class="nav-item nested" data-view="telegram">Community</button></div>
+            <button class="nav-item" data-view="telegram"><span class="nav-icon">◉</span><span>Telegram</span></button>
             <button class="nav-item" data-view="ai"><span class="nav-icon">⌘</span><span>AI &amp; Models</span></button>
             <button class="nav-item" data-view="config"><span class="nav-icon">⚙</span><span>Configuration</span></button>
             <button class="nav-item" data-view="logs"><span class="nav-icon">≡</span><span>Logs</span></button>
@@ -26,13 +26,13 @@
 
     <div class="workspace">
         <header class="topbar">
-            <div class="topbar-title"><button class="icon-button mobile-rail-toggle" id="mobileRailToggle" title="Open sidebar" aria-label="Open sidebar">☰</button><span id="pageTitle">Jobs</span><span class="topbar-status" id="statusBadge">CONNECTING</span></div>
+            <div class="topbar-title"><button class="icon-button mobile-rail-toggle" id="mobileRailToggle" title="Open sidebar" aria-label="Open sidebar">☰</button><span id="pageTitle">Jobs</span><span class="topbar-status" id="statusBadge">CONNECTING</span><span class="topbar-status" id="telegramGlobalStatus">TELEGRAM DISCONNECTED</span></div>
             <div class="topbar-actions"><button class="button quiet" id="scanButton" title="Run a scan now">↻ <span>Scan 24h</span></button><button class="button quiet" id="startButton">Start Monitor</button><button class="button stop" id="stopButton" disabled>Stop Monitor</button></div>
         </header>
 
         <main class="content">
             <section class="view active" id="view-jobs">
-                <div class="view-heading"><div><div class="eyebrow">OPPORTUNITY FEED</div><h1>Jobs</h1></div><div class="feed-tools"><label class="search-box"><span>⌕</span><input id="jobSearch" type="search" placeholder="Search opportunities" autocomplete="off"></label></div></div>
+                <div class="view-heading"><div><div class="eyebrow">OPPORTUNITY FEED</div><h1>Jobs</h1></div><div class="feed-tools"><label class="search-box"><span>⌕</span><input id="jobSearch" type="search" placeholder="Search opportunities" autocomplete="off"></label><button class="button quiet" id="deleteAllJobs" title="Permanently delete all jobs">Delete all</button></div></div>
                 <div class="priority-tabs" role="tablist" aria-label="Filter by priority">
                     <button class="priority-tab active" data-priority="">ALL <span id="countAll">0</span></button>
                     <button class="priority-tab" data-priority="P1">P1 <span id="countP1">0</span></button>
@@ -45,7 +45,7 @@
             </section>
 
             <section class="view" id="view-telegram">
-                <div class="view-heading"><div><div class="eyebrow">COLLECTION &amp; DELIVERY</div><h1>Telegram</h1></div><button class="button quiet" id="telegramLogout" hidden>Logout / Disconnect</button></div>
+                <div class="view-heading"><div><div class="eyebrow">JOB COLLECTION</div><h1>Telegram</h1></div><button class="button quiet" id="telegramLogout" hidden>Logout / Disconnect</button></div>
                 <div class="settings-section">
                     <div class="section-heading"><div><h2>Account</h2><p id="telegramAccount">DISCONNECTED</p></div><span class="form-message" id="telegramAuthStatus" role="status"></span></div>
                     <div class="auth-step" id="telegramPhoneStep"><label class="field"><span>Phone number with country code</span><input id="telegramPhone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+12025550123"></label><button class="button primary" id="sendTelegramOtp">Send OTP</button></div>
@@ -54,15 +54,6 @@
                     <p class="form-message" id="telegramAuthError" role="alert"></p>
                 </div>
                 <div class="settings-section"><div class="section-heading"><div><h2>Job sources</h2><p id="sourceSummary">Configured public channels from telegram.yaml</p></div><div class="inline-actions"><button class="button quiet" id="refreshSources">Refresh</button><button class="button quiet" id="manageSources">Manage Sources</button><button class="button primary" id="joinSources">Join all configured</button></div></div><div class="source-list" id="telegramSources"><div class="empty-state">Loading sources…</div></div></div>
-                <div class="settings-section">
-                    <div class="section-heading"><div><h2>Community delivery</h2><p>Bot destinations are read from telegram.yaml.</p></div><button class="button primary" id="saveDestinations">Save destinations</button></div>
-                    <div class="destination-grid">
-                        <label class="field"><span>P1 destination</span><select id="destP1"><option value="">Choose group or channel</option></select></label>
-                        <label class="field"><span>P2 destination</span><select id="destP2"><option value="">Choose group or channel</option></select></label>
-                        <label class="field"><span>P3 destination</span><select id="destP3"><option value="">Choose group or channel</option></select></label>
-                    </div>
-                    <div class="test-destinations"><button class="button quiet" id="loadDialogs">Load my groups and channels</button><button class="button quiet" data-test-priority="P1">Test P1</button><button class="button quiet" data-test-priority="P2">Test P2</button><button class="button quiet" data-test-priority="P3">Test P3</button><span class="form-message" id="telegramMessage" role="status"></span></div>
-                </div>
             </section>
 
             <section class="view" id="view-ai">
@@ -75,7 +66,12 @@
                         <label class="field"><span>API key <small>(leave blank to keep current)</small></span><input id="aiApiKey" type="password" autocomplete="new-password" placeholder="Configured key is hidden"></label>
                         <label class="field"><span>Timeout (seconds)</span><input id="aiTimeout" type="number" min="1" max="300"></label>
                     </div>
-                    <div class="section-heading fallback-heading"><div><h2>Fallback providers</h2><p>Used by the existing provider router.</p></div></div>
+                    <div class="provider-grid threshold-grid">
+                        <label class="field"><span>P1 minimum score</span><input id="p1Threshold" type="number" min="0" max="100"></label>
+                        <label class="field"><span>P2 minimum score</span><input id="p2Threshold" type="number" min="0" max="100"></label>
+                        <label class="field"><span>P3 minimum score</span><input id="p3Threshold" type="number" min="0" max="100"></label>
+                    </div>
+                    <div class="section-heading fallback-heading"><div><h2>Available providers</h2><p>Only the selected provider is used for matching.</p></div></div>
                     <div class="provider-list" id="providerList"></div>
                     <div class="form-actions"><button class="button primary" id="saveAi">Save AI settings</button><button class="button quiet" id="testAi">Test connection</button><span class="form-message" id="aiMessage" role="status"></span></div>
                 </div>
@@ -87,11 +83,11 @@
             </section>
 
             <section class="view" id="view-logs">
-                <div class="view-heading"><div><div class="eyebrow">RECENT EVENTS</div><h1>Logs</h1></div></div><div class="log-list" id="activityList"><div class="empty-state">Loading activity…</div></div>
+                <div class="view-heading"><div><div class="eyebrow">SERVER FILES</div><h1>Logs</h1></div></div><div class="log-list" id="logFiles"><div class="empty-state">Loading log files…</div></div>
             </section>
 
             <section class="view" id="view-system">
-                <div class="view-heading"><div><div class="eyebrow">RUNTIME</div><h1>System</h1></div></div><div class="system-grid"><div class="system-row"><span>Agent</span><strong id="systemAgent">—</strong></div><div class="system-row"><span>Operation</span><strong id="systemOperation">—</strong></div><div class="system-row"><span>Last scan</span><strong id="systemLastScan">—</strong></div><div class="system-row"><span>Next scan</span><strong id="systemNextScan">—</strong></div><div class="system-row"><span>Scan interval</span><strong id="systemInterval">—</strong></div><div class="system-row"><span>Sources</span><strong id="systemSources">—</strong></div></div>
+                <div class="view-heading"><div><div class="eyebrow">RUNTIME</div><h1>System</h1></div></div><div class="system-grid"><div class="system-row"><span>Monitor</span><strong id="systemAgent">—</strong></div><div class="system-row"><span>Operation</span><strong id="systemOperation">—</strong></div><div class="system-row"><span>Telegram</span><strong id="systemTelegram">—</strong></div><div class="system-row"><span>AI provider</span><strong id="systemAI">—</strong></div><div class="system-row"><span>Last collection</span><strong id="systemLastScan">—</strong></div><div class="system-row"><span>Next collection</span><strong id="systemNextScan">—</strong></div><div class="system-row"><span>Scan interval</span><strong id="systemInterval">—</strong></div><div class="system-row"><span>Sources</span><strong id="systemSources">—</strong></div><div class="system-row"><span>Queue</span><strong id="systemQueue">—</strong></div><div class="system-row"><span>Oldest pending</span><strong id="systemQueueAge">—</strong></div><div class="system-row"><span>Last cleanup</span><strong id="systemCleanup">—</strong></div></div>
             </section>
         </main>
     </div>

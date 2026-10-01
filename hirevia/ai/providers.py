@@ -168,10 +168,8 @@ def build_ai_provider_router(
     providers: Dict[str, AIProvider] = {}
     configuration_errors: Dict[str, str] = {}
     if not settings.enabled:
-        return AIProviderRouter(
-            providers, settings.primary, settings.fallback, settings.cooldown_seconds
-        )
-    for name in dict.fromkeys([settings.primary, *settings.fallback]):
+        return AIProviderRouter(providers, settings.primary, [], settings.cooldown_seconds)
+    for name in (settings.primary,):
         if name == settings.primary and primary_provider is not None:
             providers[name] = primary_provider
             continue
@@ -208,7 +206,7 @@ def build_ai_provider_router(
     return AIProviderRouter(
         providers,
         primary=settings.primary,
-        fallback=settings.fallback,
+        fallback=[],
         cooldown_seconds=settings.cooldown_seconds,
         configuration_errors=configuration_errors,
     )

@@ -257,8 +257,8 @@ def test_deterministic_only_job_is_reported_as_ai_skipped(repo):
     stats = run(pipeline)
 
     assert [event for event, _ in events] == ["start", "processing", "skipped", "job_complete"]
-    assert events[1][1]["job"] is job
-    assert events[2][1]["job"] is job
+    assert events[1][1]["job"].source_job_id == job.source_job_id
+    assert events[2][1]["job"].source_job_id == job.source_job_id
     assert events[2][1]["rule_score"] == analyze(job, pipeline.profile).score
     assert events[3][1]["status"] == "AI SKIPPED"
     assert events[3][1]["score"] == events[2][1]["rule_score"]
@@ -672,7 +672,7 @@ def test_broken_job_does_not_stop_the_scan(repo):
 
 # --- notification policy ------------------------------------------------------
 
-def test_ai_outage_keeps_the_job_but_never_alerts(repo):
+def test_ai_outage_keeps_telegram_job_queued_for_retry(repo):
     source = FakeSource([make_job(apply="https://boards.greenhouse.io/acme/jobs/6")])
     degraded = FakeMatcher(default=AIResponse.failure(RuntimeError("model down")))
     notifier = FakeNotifier()
@@ -689,14 +689,10 @@ def test_ai_outage_keeps_the_job_but_never_alerts(repo):
     stats = run(pipeline)
 
     assert stats.ai_failures == 1
+    assert stats.jobs_failed == 1
     assert notifier.sent == []
-    assert stats.jobs_skipped_notification == 1 and stats.jobs_notified == 0
-    stored = repo.get_by_source_id("telegram", "jobs_alpha-1")
-    assert stored is not None
-    verdict = stored.verdict_model()
-    assert verdict.match is True and verdict.degraded is True
-    assert verdict.ai_error == "model down"
-    assert verdict.ai_score is None and verdict.deterministic_score > 0
+    assert repo.get_active_jobs() == []
+    assert repo.get_telegram_queue_status()["queued"] == 1
     assert any("AI degraded" in err for err in stats.errors)
 
 
@@ -793,8 +789,14 @@ def test_stale_job_is_recorded_but_not_alerted(repo):
                                notify_max_age_hours=72))
 
     assert notifier.sent == []
-    assert stats.jobs_skipped_notification == 1
-    assert stats.jobs_new == 1  # still recorded as history
+    assert stats.jobs_new == 0
+    assert repo.get_by_source_id("telegram", old.source_job_id) is None
+    assert repo.get_telegram_queue_status()["queued"] == 0
+    with repo._get_conn() as conn:
+        history = conn.execute(
+            "SELECT status FROM telegram_message_history"
+        ).fetchone()
+    assert history["status"] == "EXPIRED"
 
 
 def test_without_notifier_jobs_are_stored_and_nothing_is_alerted(repo):
@@ -806,7 +808,7 @@ def test_without_notifier_jobs_are_stored_and_nothing_is_alerted(repo):
     assert stats.jobs_new == 1
 
 
-def test_failed_alert_is_retried_on_the_next_scan(repo):
+def test_processed_telegram_message_is_not_reprocessed_on_later_scans(repo):
     source = FakeSource([make_job(apply="https://boards.greenhouse.io/acme/jobs/11")])
     failing = FakeNotifier(ok=False)
     first = run(build_pipeline([source], repo, FakeMatcher(), failing))
@@ -815,13 +817,13 @@ def test_failed_alert_is_retried_on_the_next_scan(repo):
     assert any("notification failed" in err for err in first.errors)
     assert repo.get_by_source_id("telegram", "jobs_alpha-1").notified_at is None
 
-    # Same job later, now with a working notifier: it is still a fresh lead.
+    # Terminal message history prevents reprocessing the same Telegram post.
     working = FakeNotifier()
     second = run(build_pipeline([source], repo, FakeMatcher(), working))
-    assert second.jobs_notified == 1 and working.sent == ["Backend Developer"]
+    assert second.jobs_duplicate == 1
+    assert second.jobs_notified == 0 and working.sent == []
     stored = repo.get_by_source_id("telegram", "jobs_alpha-1")
-    assert stored.notified_at is not None
-    assert stored.notification_channel == "telegram"
+    assert stored.notified_at is None
 
 
 def test_ai_disabled_stores_without_alerting(repo):

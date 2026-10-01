@@ -15,7 +15,6 @@ from hirevia.core.pipeline import Pipeline
 from hirevia.storage.state import JobRepository
 from hirevia.ai.matcher import AIMatcher
 from hirevia.ai.providers import provider_status
-from hirevia.notifications.telegram import PriorityTelegramNotifier, TelegramNotifier
 # NOTE: hirevia.web.api.models is imported inside the methods that need it.
 # hirevia.web.api's __init__ imports routes, which imports this module - a
 # module-level import here would deadlock that cycle and make
@@ -104,13 +103,17 @@ class WebUIState:
         self.config: Config = config or load_config()
         self.repo: JobRepository = repo or JobRepository(Path("hirevia.db"))
         self.ai_matcher: Optional[AIMatcher] = ai_matcher
-        self.notifier: Optional[TelegramNotifier] = None
+        self.notifier = None
         self.pipeline: Optional[Pipeline] = None
         
         # Scanner state
         self.scanner_task: Optional[asyncio.Task] = None
         self.is_running: bool = False
         self.is_scanning: bool = False
+        self.monitor_state = "STOPPED"
+        self._scanner_started: Optional[asyncio.Event] = None
+        self._scanner_stop: Optional[asyncio.Event] = None
+        self._continuous_telegram_source = None
         self.scan_interval_minutes: int = self.config.scan_interval_minutes
         
         # Scan tracking
@@ -137,6 +140,10 @@ class WebUIState:
         self.telegram_source_validation_at: Optional[datetime] = None
         self.telegram_validation_complete = False
         self.monitor_start_error: Optional[str] = None
+        self.last_cleanup_at: Optional[datetime] = None
+        self.cleanup_error: Optional[str] = None
+        self.ai_health_state = "untested"
+        self.ai_health_checked_at: Optional[datetime] = None
 
     @staticmethod
     def _telegram_session_file(credentials) -> Path:
@@ -166,16 +173,12 @@ class WebUIState:
         telegram_source._shared_client = None
         self.telegram_login_client = None
 
-    async def reset_telegram_auth_for_startup(self) -> None:
-        """Require a fresh web login for each normal Hirevia service start."""
+    async def restore_telegram_auth_for_startup(self) -> None:
+        """Reconnect an existing Telethon session without deleting it."""
+        from hirevia.sources import telegram_source
         from hirevia.sources.telegram_config import load_telegram_credentials
 
-        if self.is_running:
-            await self.stop_scanner()
         await self._close_telegram_clients()
-        credentials = load_telegram_credentials()
-        if credentials is not None:
-            self._remove_telegram_session_file(credentials)
         self.telegram_login_in_progress = False
         self.telegram_login_state = "disconnected"
         self.telegram_login_phone = None
@@ -187,7 +190,77 @@ class WebUIState:
         self.telegram_source_validation = None
         self.telegram_source_validation_at = None
         self.telegram_validation_complete = False
-        self.add_activity("Telegram login required for this Hirevia session")
+        if load_telegram_credentials() is None:
+            self.add_activity("Telegram credentials are not configured", "warning")
+            return
+
+        try:
+            from hirevia.sources.telegram_source import ensure_client
+
+            client = await ensure_client()
+            user = await client.get_me()
+        except Exception as error:
+            self.telegram_login_state = "expired"
+            self.telegram_auth_error = "Telegram session is unavailable; log in again"
+            await self._close_telegram_clients()
+            self.add_activity(
+                f"Telegram session restore requires login ({type(error).__name__})", "warning"
+            )
+            return
+
+        telegram_source._shared_client = client
+        self.telegram_authenticated = True
+        self.telegram_login_state = "connected"
+        self.telegram_login_phone = getattr(user, "phone", None)
+        self.telegram_account = {
+            "name": " ".join(filter(None, (user.first_name, user.last_name))) or "Telegram user",
+            "username": user.username,
+        }
+        validation = await self.validate_telegram_sources(force=True)
+        self.add_activity(
+            "Telegram session restored; channel validation "
+            + ("complete" if validation["validation_complete"] else "needs attention")
+        )
+
+    async def recover_monitoring_for_startup(self) -> bool:
+        """Resume monitoring only when the persisted desired state requests it."""
+        desired = self.repo.get_source_state("system", "monitor_desired", "stopped")
+        if desired != "running":
+            self.monitor_state = "STOPPED"
+            return False
+        from hirevia.sources.telegram_config import load_telegram_settings
+
+        telegram_config = self.config.sources.sources.get("telegram")
+        telegram_required = bool(
+            telegram_config and telegram_config.enabled and load_telegram_settings().enabled
+        )
+        if telegram_required and not self.telegram_authenticated:
+            self.monitor_state = "AUTH_REQUIRED"
+            self.add_activity("Monitoring recovery requires Telegram authentication", "warning")
+            return False
+        return await self.start_scanner(persist_desired=False)
+
+    async def run_cleanup_once(self) -> Dict[str, Any]:
+        try:
+            expired_jobs = self.repo.expire_jobs()
+            expired_messages = self.repo.expire_pending_telegram_jobs()
+            self.last_cleanup_at = datetime.utcnow()
+            self.cleanup_error = None
+            if expired_jobs or expired_messages:
+                self.add_activity(
+                    f"Retention cleanup removed {expired_jobs} job(s) and "
+                    f"expired {expired_messages} queued message(s)"
+                )
+            return {"expired_jobs": expired_jobs, "expired_messages": expired_messages}
+        except Exception as error:
+            self.cleanup_error = type(error).__name__
+            logger.exception("Retention cleanup failed")
+            return {"expired_jobs": 0, "expired_messages": 0, "error": self.cleanup_error}
+
+    async def cleanup_loop(self) -> None:
+        while True:
+            await self.run_cleanup_once()
+            await asyncio.sleep(60)
     
     def add_activity(self, message: str, level: str = "info"):
         """Add an activity log entry"""
@@ -202,13 +275,26 @@ class WebUIState:
     
     async def start_scanner(
         self,
-        nvidia_key: Optional[str] = None,
-        telegram_token: Optional[str] = None,
-        telegram_chat_id: Optional[str] = None,
+        persist_desired: bool = True,
     ):
         """Start the background scanner"""
-        if self.is_running:
+        if self.is_running or self.monitor_state == "STARTING":
             self.add_activity("Scanner already running", "warning")
+            return False
+
+        self.monitor_state = "STARTING"
+        try:
+            self.repo.get_stats()
+        except Exception as error:
+            self.monitor_state = "ERROR"
+            self.monitor_start_error = "Database is unavailable"
+            self.add_activity(f"Monitor startup database check failed ({type(error).__name__})", "error")
+            return False
+
+        if self.config.ai.enabled and self.config.ai.primary not in self.config.ai.providers:
+            self.monitor_state = "ERROR"
+            self.monitor_start_error = "The active AI provider is not configured"
+            self.add_activity(self.monitor_start_error, "error")
             return False
 
         from hirevia.sources.telegram_config import load_telegram_settings
@@ -221,10 +307,12 @@ class WebUIState:
         ):
             validation = await self.validate_telegram_sources(force=True)
             if not validation["authenticated"]:
+                self.monitor_state = "AUTH_REQUIRED"
                 self.monitor_start_error = "Connect a Telegram account before starting monitoring"
                 self.add_activity(self.monitor_start_error, "warning")
                 return False
             if not validation["validation_complete"]:
+                self.monitor_state = "ERROR"
                 self.monitor_start_error = "Refresh Telegram channel validation before starting monitoring"
                 self.add_activity(self.monitor_start_error, "warning")
                 return False
@@ -236,53 +324,85 @@ class WebUIState:
         ):
             self.ai_matcher = AIMatcher(self.config, os.getenv("NVIDIA_API_KEY"))
         
-        # Initialize Telegram notifier if credentials provided
-        telegram_token = telegram_token or os.getenv("TELEGRAM_BOT_TOKEN")
-        telegram_chat_id = telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID")
-        from hirevia.sources.telegram_config import load_telegram_settings
-
-        destinations = load_telegram_settings().community_destinations
-        if telegram_token and (telegram_chat_id or destinations):
-            self.notifier = (
-                PriorityTelegramNotifier(telegram_token, destinations)
-                if destinations else TelegramNotifier(telegram_token, telegram_chat_id)
-            )
         self.pipeline = Pipeline(
-            self.config, self.repo, self.ai_matcher, self.notifier
+            self.config, self.repo, self.ai_matcher, None
         )
-        
+        self._continuous_telegram_source = None
+        if (
+            telegram_config is not None
+            and telegram_config.enabled
+            and load_telegram_settings().enabled
+        ):
+            registry = getattr(self.pipeline, "registry", None)
+            source = registry.get_source("telegram") if registry else None
+            if source is None:
+                self.monitor_state = "ERROR"
+                self.monitor_start_error = "Telegram collector could not be initialized"
+                return False
+            try:
+                await source.start_continuous_monitoring()
+            except Exception as error:
+                self.monitor_state = "ERROR"
+                self.monitor_start_error = "Telegram listener could not be started"
+                self.add_activity(
+                    f"Telegram monitor startup failed ({type(error).__name__})", "error"
+                )
+                return False
+            self._continuous_telegram_source = source
+        self._scanner_started = asyncio.Event()
+        self._scanner_stop = asyncio.Event()
         self.is_running = True
-        self.add_activity("Scanner started")
-        
-        # Start background task
         self.scanner_task = asyncio.create_task(self._run_scanner_loop())
+        try:
+            await asyncio.wait_for(self._scanner_started.wait(), timeout=5)
+        except Exception:
+            self.is_running = False
+            if self._scanner_stop:
+                self._scanner_stop.set()
+            if self.scanner_task:
+                self.scanner_task.cancel()
+                await asyncio.gather(self.scanner_task, return_exceptions=True)
+            self.scanner_task = None
+            self.monitor_state = "ERROR"
+            self.monitor_start_error = "Monitor worker did not become ready"
+            if persist_desired:
+                self.repo.set_source_state("system", "monitor_desired", "stopped")
+            return False
+        self.monitor_state = "RUNNING"
+        if persist_desired:
+            self.repo.set_source_state("system", "monitor_desired", "running")
+        self.add_activity("Scanner started")
         return True
     
-    async def stop_scanner(self):
+    async def stop_scanner(self, persist_desired: bool = True):
         """Stop the background scanner"""
+        if persist_desired:
+            self.repo.set_source_state("system", "monitor_desired", "stopped")
         if not self.is_running:
+            self.monitor_state = "STOPPED"
             self.add_activity("Scanner not running", "warning")
             return False
-        
+
+        self.monitor_state = "STOPPING"
         self.is_running = False
-        
+        if self._scanner_stop:
+            self._scanner_stop.set()
+        if self._continuous_telegram_source is not None:
+            await self._continuous_telegram_source.stop_continuous_monitoring()
+            self._continuous_telegram_source = None
         if self.scanner_task:
-            self.scanner_task.cancel()
             try:
                 await self.scanner_task
             except asyncio.CancelledError:
-                pass
+                logger.warning("Monitor worker was cancelled during shutdown")
             self.scanner_task = None
         
-        if self.notifier:
-            await self.notifier.close()
-            self.notifier = None
-        self.pipeline = Pipeline(self.config, self.repo, self.ai_matcher)
-        
+        self.pipeline = Pipeline(self.config, self.repo, self.ai_matcher, None)
+        self.monitor_state = "STOPPED"
         self.add_activity("Scanner stopped")
         return True
     
-    async def trigger_scan(self) -> ScanStats:
+    async def trigger_scan(self, scan_24h: bool = False) -> ScanStats:
         """Trigger an immediate scan"""
         if self.is_scanning:
             self.add_activity("Scan already in progress", "warning")
@@ -296,7 +416,7 @@ class WebUIState:
             and telegram_config.enabled
             and load_telegram_settings().enabled
         ):
-            validation = await self.validate_telegram_sources(force=True)
+            validation = await self.validate_telegram_sources(force=False)
             if not validation["authenticated"]:
                 raise RuntimeError("Connect a Telegram account before scanning")
             if not validation["validation_complete"]:
@@ -308,9 +428,16 @@ class WebUIState:
         try:
             if self.pipeline is None:
                 self.pipeline = Pipeline(
-                    self.config, self.repo, self.ai_matcher, self.notifier
+                    self.config, self.repo, self.ai_matcher, None
                 )
+            registry = getattr(self.pipeline, "registry", None)
+            telegram_source = registry.get_source("telegram") if registry else None
+            prior_lookback = getattr(telegram_source, "force_24h_lookback", False)
+            if telegram_source is not None:
+                telegram_source.force_24h_lookback = scan_24h
             stats = await self.pipeline.run_scan()
+            if telegram_source is not None:
+                telegram_source.force_24h_lookback = prior_lookback
             
             # Update state
             self.last_scan = datetime.utcnow()
@@ -331,29 +458,86 @@ class WebUIState:
             self.add_activity(f"Scan failed: {e}", "error")
             raise
         finally:
+            if "telegram_source" in locals() and telegram_source is not None:
+                telegram_source.force_24h_lookback = prior_lookback
             self.is_scanning = False
     
     async def _run_scanner_loop(self):
         """Background scanner loop"""
+        if self._scanner_started:
+            self._scanner_started.set()
+        self.monitor_state = "RUNNING"
+        source = self._continuous_telegram_source
+        retry_delay = 2
+        if source is not None:
+            try:
+                while self.is_running:
+                    stats = await self.trigger_scan()
+                    if source.last_collection_failed or stats.jobs_failed:
+                        self.monitor_state = "RECONNECTING"
+                        await asyncio.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, 60)
+                    elif source.has_more_backfill:
+                        continue
+                    else:
+                        break
+                if self.is_running:
+                    source.enable_event_mode()
+                    retry_delay = 2
+                    while self.is_running:
+                        stats = await self.trigger_scan()
+                        if source.retry_uncommitted_event():
+                            self.monitor_state = "RECONNECTING"
+                            await asyncio.sleep(retry_delay)
+                            retry_delay = min(retry_delay * 2, 60)
+                        else:
+                            retry_delay = 2
+                            self.monitor_state = "RUNNING"
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception("Telegram monitor worker failed")
+                self.monitor_state = "ERROR"
+                self.add_activity(
+                    f"Telegram monitor worker failed ({type(error).__name__})", "error"
+                )
+                self.is_running = False
+                return
         while self.is_running:
             try:
                 if not self.is_scanning:
                     self.add_activity("Starting scheduled scan")
                     await self.trigger_scan()
                 
-                # Wait for next interval
-                wait_seconds = self.scan_interval_minutes * 60
-                for _ in range(wait_seconds):
-                    if not self.is_running:
-                        break
-                    await asyncio.sleep(1)
+                if self._scanner_stop is None:
+                    return
+                try:
+                    await asyncio.wait_for(
+                        self._scanner_stop.wait(),
+                        timeout=self.scan_interval_minutes * 60,
+                    )
+                except asyncio.TimeoutError:
+                    pass
                     
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.exception("Web monitor loop failed")
                 self.add_activity(f"Scanner error: {e}", "error")
-                await asyncio.sleep(60)  # Wait before retry
+                self.monitor_state = (
+                    "AUTH_REQUIRED" if "Connect a Telegram account" in str(e)
+                    else "RECONNECTING"
+                )
+                if self._scanner_stop is None:
+                    return
+                try:
+                    await asyncio.wait_for(self._scanner_stop.wait(), timeout=60)
+                except asyncio.TimeoutError:
+                    if self.is_running:
+                        self.monitor_state = "RUNNING"
+        if self.monitor_state not in {"STOPPING", "STOPPED"}:
+            self.monitor_state = "ERROR"
     
     def get_status(self) -> Dict[str, Any]:
         """Get current system status"""
@@ -365,6 +549,7 @@ class WebUIState:
                 worker_error = self.scanner_task.exception()
             self.is_running = False
             self.is_scanning = False
+            self.monitor_state = "ERROR"
             logger.error(
                 "Web monitor worker exited unexpectedly%s",
                 f" ({type(worker_error).__name__})" if worker_error else "",
@@ -373,19 +558,32 @@ class WebUIState:
             )
             self.add_activity("Monitor worker exited unexpectedly", "error")
 
+        ai_status = next(
+            (item for item in provider_status(self.config) if item["name"] == self.config.ai.primary),
+            {"configured": False},
+        )
+        queue_status = self.repo.get_telegram_queue_status()
         return {
             "status": (
                 SystemStatus.SCANNING.value if self.is_scanning
-                else SystemStatus.RUNNING.value if self.is_running
-                else SystemStatus.STOPPED.value
+                else getattr(SystemStatus, self.monitor_state, SystemStatus.STOPPED).value
             ),
-            "current_operation": "Scanning" if self.is_scanning else ("Idle" if self.is_running else "Stopped"),
+            "current_operation": "Scanning" if self.is_scanning else self.monitor_state.title(),
             "last_scan": self.last_scan.isoformat() if self.last_scan else None,
             "next_scan": self.next_scan.isoformat() if self.next_scan else None,
             "scan_duration": self.last_scan_duration,
             "scan_interval_minutes": self.scan_interval_minutes,
             "is_scanning": self.is_scanning,
             "is_running": self.is_running,
+            "telegram_connected": self.telegram_authenticated,
+            "ai_provider": self.config.ai.primary,
+            "ai_provider_configured": ai_status["configured"],
+            "ai_health_state": self.ai_health_state,
+            "ai_health_checked_at": self.ai_health_checked_at.isoformat() if self.ai_health_checked_at else None,
+            "queue_size": queue_status["queued"],
+            "queue_processing": queue_status["processing"],
+            "queue_oldest_pending_at": queue_status["oldest_pending_at"],
+            "last_cleanup_at": self.last_cleanup_at.isoformat() if self.last_cleanup_at else None,
         }
     
     def get_source_status(self) -> List[Dict[str, Any]]:
@@ -554,6 +752,7 @@ class WebUIState:
                 "fingerprint": job.fingerprint,
                 "first_seen": job.first_seen.isoformat() if job.first_seen else None,
                 "last_seen": job.last_seen.isoformat() if job.last_seen else None,
+                "saved_at": job.saved_at.isoformat() if job.saved_at else None,
                 "expires_at": job.expires_at.isoformat() if job.expires_at else None,
                 "notified_at": job.notified_at.isoformat() if job.notified_at else None,
                 "notification_channel": job.notification_channel,
@@ -600,6 +799,7 @@ class WebUIState:
             "fingerprint": job.fingerprint,
             "first_seen": job.first_seen.isoformat() if job.first_seen else None,
             "last_seen": job.last_seen.isoformat() if job.last_seen else None,
+            "saved_at": job.saved_at.isoformat() if job.saved_at else None,
             "expires_at": job.expires_at.isoformat() if job.expires_at else None,
             "notified_at": job.notified_at.isoformat() if job.notified_at else None,
             "notification_channel": job.notification_channel,
@@ -625,8 +825,13 @@ class WebUIState:
     def delete_job(self, job_id: str) -> bool:
         changed = self.repo.soft_delete_job(job_id)
         if changed:
-            self.add_activity("Job removed from active feed")
+            self.add_activity("Job permanently deleted")
         return changed
+
+    def delete_all_jobs(self) -> int:
+        deleted = self.repo.delete_all_jobs()
+        self.add_activity(f"All jobs permanently deleted ({deleted})")
+        return deleted
     
     def get_config(self) -> Dict[str, Any]:
         """Get current configuration"""
@@ -654,25 +859,14 @@ class WebUIState:
             if any(provider["configured"] for provider in provider_status(self.config))
             else None
         )
-        if self.is_running:
-            from hirevia.sources.telegram_config import load_telegram_settings
-
-            previous = self.notifier
-            token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-            chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
-            destinations = load_telegram_settings().community_destinations
-            self.notifier = (
-                PriorityTelegramNotifier(token, destinations)
-                if token and destinations else TelegramNotifier(token, chat_id)
-                if token and chat_id else None
-            )
-            if previous:
-                await previous.close()
-        self.pipeline = Pipeline(self.config, self.repo, self.ai_matcher, self.notifier)
+        self.notifier = None
+        self.pipeline = Pipeline(self.config, self.repo, self.ai_matcher, None)
         self.add_activity("Configuration reloaded")
 
     async def test_ai_provider(self) -> Dict[str, Any]:
         if not any(provider["configured"] for provider in provider_status(self.config)):
+            self.ai_health_state = "unconfigured"
+            self.ai_health_checked_at = datetime.utcnow()
             self.add_activity("AI provider test skipped: no provider configured", "warning")
             return {"success": False, "message": "No configured AI provider"}
 
@@ -694,10 +888,14 @@ class WebUIState:
         try:
             result = await matcher.match(job, profile, analyze(job, profile))
         except Exception:
+            self.ai_health_state = "unavailable"
+            self.ai_health_checked_at = datetime.utcnow()
             logger.exception("AI provider connection test raised an exception")
             self.add_activity("AI provider connection test failed", "error")
             return {"success": False, "message": "Provider request failed"}
         success = not result.degraded and result.status == "ok"
+        self.ai_health_state = "available" if success else "unavailable"
+        self.ai_health_checked_at = datetime.utcnow()
         self.add_activity(
             "AI provider connection test succeeded" if success else "AI provider connection test failed",
             "info" if success else "warning",
@@ -709,37 +907,6 @@ class WebUIState:
             "model": self.config.ai.providers[self.config.ai.primary].model,
         }
     
-    async def test_telegram(self, message: str) -> Dict[str, Any]:
-        """Send a test Telegram message"""
-        if not self.notifier:
-            return {"success": False, "message": "Telegram not configured"}
-        
-        try:
-            # Create a dummy job and AI response for formatting
-            from hirevia.core.models import Job as JobModel, AIResponse, Priority
-            
-            test_job = JobModel(
-                source="test",
-                source_job_id="test",
-                title="Test Job",
-                company="Test Company",
-                location="Test Location",
-                description="This is a test notification from Hirevia Web UI",
-                url="https://example.com",
-            )
-            
-            test_ai = AIResponse(
-                relevant=True,
-                priority=Priority.P1,
-                match_score=100,
-                reasons=["Test message"],
-            )
-            
-            success = await self.notifier.send(test_job, test_ai)
-            return {"success": success, "message": "Test message sent" if success else "Failed to send"}
-        except Exception as e:
-            return {"success": False, "message": f"Error: {e}"}
-
     async def validate_telegram_sources(self, force: bool = False) -> Dict[str, Any]:
         from hirevia.sources.telegram_config import load_telegram_settings
         from hirevia.sources.telegram_source import close_shared_client, ensure_client
@@ -900,7 +1067,6 @@ class WebUIState:
                 {"username": channel.username, "enabled": channel.enabled}
                 for channel in settings.channels
             ],
-            "community_destinations": settings.community_destinations,
         }
 
     async def begin_telegram_phone_login(self, phone_number: str) -> Dict[str, Any]:
@@ -1104,6 +1270,7 @@ class WebUIState:
     async def logout_telegram(self) -> Dict[str, Any]:
         from hirevia.sources.telegram_config import load_telegram_credentials
 
+        self.repo.set_source_state("system", "monitor_desired", "stopped")
         if self.is_running:
             await self.stop_scanner()
         await self._close_telegram_clients()
@@ -1261,65 +1428,6 @@ class WebUIState:
             logger.warning("Telegram channel operation failed (%s)", error_name, exc_info=True)
             self.add_activity(f"Telegram source {'join' if join else 'leave'} failed ({error_name})", "error")
             return {"success": False, "status": "unavailable", "message": f"Could not {('join' if join else 'leave')} channel ({error_name})"}
-
-    async def telegram_dialogs(self) -> Dict[str, Any]:
-        from telethon.utils import get_peer_id
-        from hirevia.sources.telegram_source import ensure_client
-
-        try:
-            client = await ensure_client()
-            dialogs = []
-            async for dialog in client.iter_dialogs():
-                entity = dialog.entity
-                is_channel = bool(getattr(entity, "broadcast", False) or getattr(entity, "megagroup", False))
-                is_group = entity.__class__.__name__ == "Chat"
-                if not (is_channel or is_group):
-                    continue
-                dialogs.append({
-                    "id": str(get_peer_id(entity)),
-                    "title": dialog.title,
-                    "username": getattr(entity, "username", None),
-                    "type": "channel" if is_channel else "group",
-                })
-            return {"dialogs": dialogs}
-        except Exception:
-            return {"dialogs": [], "error": "Connect a Telegram user account to list destinations"}
-
-    async def test_community_destination(self, priority: str) -> Dict[str, Any]:
-        from hirevia.core.models import AIResponse, Priority
-        from hirevia.notifications.telegram import TelegramNotifier
-        from hirevia.sources.telegram_config import load_telegram_settings
-
-        destination = load_telegram_settings().community_destinations.get(priority)
-        token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-        if not destination or not token:
-            return {"success": False, "message": "Configure a bot token and destination first"}
-        notifier = TelegramNotifier(token, destination)
-        test_job = Job(
-            source="health-check",
-            source_job_id=f"web-community-{priority}",
-            title=f"Hirevia {priority} destination test",
-            company="Hirevia",
-            location="—",
-            description="Telegram community delivery test",
-            url="https://example.com/",
-        )
-        decision = AIResponse(
-            relevant=True,
-            priority=Priority(priority),
-            match_score=90 if priority == "P1" else 70 if priority == "P2" else 40,
-            reasons=["Telegram destination test"],
-        )
-        try:
-            sent = await notifier.send(test_job, decision)
-            self.add_activity(
-                f"Telegram {priority} destination test {'succeeded' if sent else 'failed'}",
-                "info" if sent else "warning",
-            )
-            return {"success": sent, "message": "Test message sent" if sent else "Telegram rejected the test message"}
-        finally:
-            await notifier.close()
-
 
 # Global instance
 _web_state: Optional[WebUIState] = None

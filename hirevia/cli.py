@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 import re
 import socket
 import sys
@@ -22,13 +23,12 @@ from rich.table import Table
 from hirevia.ai.client import AIError
 from hirevia.ai.matcher import AIMatcher
 from hirevia.ai.providers import build_ai_provider_router, provider_status
-from hirevia.config import Config, load_config, get_telegram_token
+from hirevia.config import Config, load_config
 from hirevia.core.matching import analyze
 from hirevia.core.models import CandidateProfile, Job, ScanStats
 from hirevia.core.pipeline import Pipeline, run_single_scan
 from hirevia.core.verification import classify_application_url
 from hirevia.core.freshness import freshness_label
-from hirevia.notifications.telegram import PriorityTelegramNotifier, TelegramNotifier
 from hirevia.storage.state import JobRepository
 from hirevia.web.state import initialize_web_state
 
@@ -91,6 +91,25 @@ def configure_logging(verbose: bool = False) -> None:
         handler.setLevel(level)
     for handler in stream_handlers:
         handler.setFormatter(_SecretRedactingFormatter(LOG_FORMAT))
+
+    log_directory = Path(os.getenv("HIREVIA_LOG_DIR", "logs")).expanduser()
+    log_directory.mkdir(parents=True, exist_ok=True)
+    log_path = (log_directory / "hirevia.log").resolve()
+    file_handlers = [
+        handler for handler in root.handlers
+        if isinstance(handler, RotatingFileHandler)
+        and Path(handler.baseFilename).resolve() == log_path
+    ]
+    if not file_handlers:
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=max(1024 * 1024, int(os.getenv("HIREVIA_LOG_MAX_BYTES", "10000000"))),
+            backupCount=max(1, int(os.getenv("HIREVIA_LOG_BACKUPS", "7"))),
+            encoding="utf-8",
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(_SecretRedactingFormatter(LOG_FORMAT))
+        root.addHandler(file_handler)
 
 
 class _MonitorLogFilter(logging.Filter):
@@ -173,53 +192,6 @@ def _build_ai_matcher(config: Config, disabled: bool = False) -> Optional[AIMatc
     return AIMatcher(config, _resolve_nvidia_key())
 
 
-def _build_notifier(config: Config, token: Optional[str], chat_id: Optional[str]):
-    """Build a TelegramNotifier from flags/env, prompting only when needed.
-
-    Returns None (with a hint) instead of crashing when credentials are
-    missing: a scan without alerts is still a useful scan.
-    """
-    token = (token or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-    chat_id = (chat_id or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
-    from hirevia.sources.telegram_config import load_telegram_settings
-
-    destinations = load_telegram_settings().community_destinations
-
-    if not token and not destinations:
-        try:
-            token = (get_telegram_token() or "").strip()
-        except (EOFError, KeyboardInterrupt):
-            token = ""
-    if not chat_id and not destinations:
-        try:
-            chat_id = (click.prompt("Telegram chat ID", default=os.getenv("TELEGRAM_CHAT_ID", "")) or "").strip()
-        except (EOFError, KeyboardInterrupt):
-            chat_id = ""
-
-    if not token or not (chat_id or destinations):
-        console.print(
-            "[yellow]Notifications skipped - provide a bot token and chat id via "
-            "--telegram-token/--chat-id or TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID[/yellow]"
-        )
-        return None
-
-    if destinations:
-        return PriorityTelegramNotifier(
-            token,
-            destinations,
-            retry_attempts=config.notification_retry_attempts,
-            retry_delay=config.notification_retry_delay_seconds,
-        )
-
-    return TelegramNotifier(
-        token,
-        chat_id,
-        retry_attempts=config.notification_retry_attempts,
-        retry_delay=config.notification_retry_delay_seconds,
-    )
-
-
-
 @click.group(invoke_without_command=True)
 @click.version_option(version="2.0.0", prog_name="hirevia")
 @click.pass_context
@@ -293,10 +265,6 @@ def _run_web_service(host: Optional[str] = None, port: Optional[int] = None) -> 
     repo = JobRepository(Path(os.getenv("HIREVIA_DB_PATH", "hirevia.db")))
     matcher = _build_ai_matcher(config)
     state = initialize_web_state(config, repo, matcher)
-    state.service_notifier_configured = bool(
-        os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")
-    )
-
     from hirevia.web.main import app
 
     app.state.auto_start_monitoring = False
@@ -325,12 +293,9 @@ def web(host: Optional[str], port: Optional[int]) -> None:
 @click.option("--db-path", default="hirevia.db", help="SQLite database path")
 @click.option("--interval", default=30, help="Scan interval in minutes")
 @click.option("--no-ai", is_flag=True, help="Run without AI matching")
-@click.option("--notify/--no-notify", "notify", default=True, help="Send Telegram alerts")
-@click.option("--telegram-token", default=None, help="Telegram bot token (or TELEGRAM_BOT_TOKEN)")
-@click.option("--chat-id", default=None, help="Telegram chat id (or TELEGRAM_CHAT_ID)")
 @click.option("--verbose", is_flag=True, help="Show per-job and provider diagnostics")
-def start(db_path: str, interval: int, no_ai: bool, notify: bool, telegram_token: str, chat_id: str, verbose: bool):
-    """Start continuous scanning with notifications."""
+def start(db_path: str, interval: int, no_ai: bool, verbose: bool):
+    """Start continuous scanning."""
     configure_logging(verbose)
     console.print("[bold green]Starting Hirevia 2.0...[/bold green]")
 
@@ -344,39 +309,29 @@ def start(db_path: str, interval: int, no_ai: bool, notify: bool, telegram_token
     ai_matcher = _build_ai_matcher(config, no_ai)
     if not ai_matcher and not no_ai:
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
-    notifier = _build_notifier(config, telegram_token, chat_id) if notify else None
-
     console.print("[green]Configuration loaded[/green]")
     console.print(f"Enabled sources: {', '.join(config.sources.get_enabled_sources())}")
     console.print(f"Database: {db_path}")
     console.print(f"Scan interval: {interval} minutes")
     console.print(f"AI matching: {'on (' + config.nvidia_model + ')' if ai_matcher else 'off'}")
-    console.print(f"Notifications: {notifier.name if notifier else 'off'}")
 
     async def run_loop():
-        try:
-            while True:
-                try:
-                    console.print("\n[cyan]Starting scan...[/cyan]")
-                    # The pipeline owns notifications now: it alerts only for
-                    # jobs that passed dedup, filters, AI and link checks.
-                    stats = await run_single_scan(config, repo, ai_matcher, notifier)
-                    _print_stats(stats)
+        while True:
+            try:
+                console.print("\n[cyan]Starting scan...[/cyan]")
+                stats = await run_single_scan(config, repo, ai_matcher)
+                _print_stats(stats)
 
-                    console.print(f"[yellow]Waiting {interval} minutes until next scan...[/yellow]")
-                    await asyncio.sleep(interval * 60)
+                console.print(f"[yellow]Waiting {interval} minutes until next scan...[/yellow]")
+                await asyncio.sleep(interval * 60)
 
-                except KeyboardInterrupt:
-                    console.print("\n[red]Stopping...[/red]")
-                    break
-                except Exception as e:
-                    logger.error(f"Scan loop error: {e}")
-                    console.print(f"[red]Error: {e}[/red]")
-                    await asyncio.sleep(60)
-        finally:
-            if notifier:
-                await notifier.close()
-
+            except KeyboardInterrupt:
+                console.print("\n[red]Stopping...[/red]")
+                break
+            except Exception as e:
+                logger.error(f"Scan loop error: {e}")
+                console.print(f"[red]Error: {e}[/red]")
+                await asyncio.sleep(60)
     asyncio.run(run_loop())
 
 
@@ -384,21 +339,15 @@ def start(db_path: str, interval: int, no_ai: bool, notify: bool, telegram_token
 @cli.command()
 @click.option("--db-path", default="hirevia.db", help="SQLite database path")
 @click.option("--no-ai", is_flag=True, help="Run without AI matching")
-@click.option("--notify/--no-notify", "notify", default=False, help="Also send Telegram alerts")
-@click.option("--telegram-token", default=None, help="Telegram bot token (or TELEGRAM_BOT_TOKEN)")
-@click.option("--chat-id", default=None, help="Telegram chat id (or TELEGRAM_CHAT_ID)")
 @click.option("--verbose", is_flag=True, help="Show per-job and provider diagnostics")
 @click.option(
     "--diagnostic",
     is_flag=True,
-    help="Print normalized Telegram jobs grouped by channel; suppress notifications",
+    help="Print normalized Telegram jobs grouped by channel",
 )
 def scan(
     db_path: str,
     no_ai: bool,
-    notify: bool,
-    telegram_token: str,
-    chat_id: str,
     verbose: bool,
     diagnostic: bool,
 ):
@@ -410,24 +359,19 @@ def scan(
     ai_matcher = _build_ai_matcher(config, no_ai)
     if not ai_matcher and not no_ai:
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
-    notifier = _build_notifier(config, telegram_token, chat_id) if notify and not diagnostic else None
     ai_progress_reporter = None if diagnostic else _make_ai_progress_reporter(
-        notifications_enabled=bool(notify and notifier)
+        notifications_enabled=False
     )
 
     async def _run():
-        try:
-            return await run_single_scan(
-                config,
-                repo,
-                ai_matcher,
-                notifier,
-                diagnostic_output=diagnostic,
-                ai_progress_callback=ai_progress_reporter,
-            )
-        finally:
-            if notifier:
-                await notifier.close()
+        return await run_single_scan(
+            config,
+            repo,
+            ai_matcher,
+            None,
+            diagnostic_output=diagnostic,
+            ai_progress_callback=ai_progress_reporter,
+        )
 
     stats = asyncio.run(_run())
     _print_stats(stats, include_top_opportunities=diagnostic)
@@ -435,23 +379,17 @@ def scan(
         ai_progress_reporter(
             "complete",
             duration=stats.duration_seconds,
-            notifications_enabled=bool(notify and notifier),
+            notifications_enabled=False,
         )
 
 
 @cli.command()
 @click.option("--db-path", default="hirevia.db", help="SQLite database path")
 @click.option("--no-ai", is_flag=True, help="Run without AI matching")
-@click.option("--notify/--no-notify", "notify", default=False, help="Send Telegram alerts")
-@click.option("--telegram-token", default=None, help="Telegram bot token (or TELEGRAM_BOT_TOKEN)")
-@click.option("--chat-id", default=None, help="Telegram chat id (or TELEGRAM_CHAT_ID)")
 @click.option("--verbose", is_flag=True, help="Show per-job and provider diagnostics")
 def monitor(
     db_path: str,
     no_ai: bool,
-    notify: bool,
-    telegram_token: str,
-    chat_id: str,
     verbose: bool,
 ):
     """Continuously process new Telegram channel messages."""
@@ -469,22 +407,19 @@ def monitor(
     ai_matcher = _build_ai_matcher(config, no_ai)
     if not ai_matcher and not no_ai:
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
-    notifier = _build_notifier(config, telegram_token, chat_id) if notify else None
     progress_reporter = _make_ai_progress_reporter(
-        notifications_enabled=bool(notify and notifier),
+        notifications_enabled=False,
         normal_monitor=not verbose,
     )
     pipeline = Pipeline(
         monitor_config,
         repo,
         ai_matcher,
-        notifier,
+        None,
         ai_progress_callback=progress_reporter,
     )
     source = pipeline.registry.get_source("telegram")
     if source is None or not callable(getattr(source, "start_continuous_monitoring", None)):
-        if notifier:
-            asyncio.run(notifier.close())
         raise click.ClickException("Telegram collector could not be initialized")
 
     async def _run_monitor():
@@ -499,8 +434,6 @@ def monitor(
             console.print("✓ Telegram monitoring started")
             console.print(f"✓ Monitoring {channel_count} channels")
             console.print("✓ Persistent message tracking enabled")
-            if not notify or not notifier:
-                console.print("Telegram notifications: DISABLED (--no-notify)")
             while True:
                 stats = await pipeline.run_scan()
                 if source.last_collection_failed or stats.jobs_failed:
@@ -536,12 +469,10 @@ def monitor(
                         console.print("[Telegram] Processing completed")
         finally:
             await source.stop_continuous_monitoring()
-            if notifier:
-                await notifier.close()
             progress_reporter(
                 "complete",
                 duration=asyncio.get_running_loop().time() - started_at,
-                notifications_enabled=bool(notify and notifier),
+                notifications_enabled=False,
             )
 
     try:
@@ -1198,10 +1129,6 @@ def _make_ai_progress_reporter(
             console.print(f"AI Skipped      : {counts['skipped']}")
             console.print(f"AI Errors       : {counts['errors']}")
             console.print(f"\nScan completed in: {details.get('duration', 0):.1f}s")
-            if details.get("notifications_enabled", notifications_enabled):
-                console.print("Telegram notifications: ENABLED")
-            else:
-                console.print("Telegram notifications: DISABLED (--no-notify)")
             console.print("=" * 60)
 
     return report

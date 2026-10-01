@@ -276,6 +276,7 @@ def test_invalid_primary_endpoint_does_not_silently_use_fallback(monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "nv-test-key")
     monkeypatch.setenv("GROQ_API_KEY", "groq-test-key")
     config = Config()
+    config.ai.primary = "nvidia"
     config.nvidia_base_url = "not-a-url"
     router = build_ai_provider_router(config)
 
@@ -451,7 +452,7 @@ def test_load_config_reads_env_file_from_working_directory(monkeypatch, tmp_path
 def test_ai_status_prints_configuration_without_secrets_or_network(monkeypatch):
     monkeypatch.setattr("hirevia.config._ensure_dotenv", lambda: None)
     monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-secret-CANARY")
-    monkeypatch.setattr("hirevia.cli.load_config", lambda: Config())
+    monkeypatch.setattr("hirevia.cli.load_config", lambda: Config(ai={"primary": "nvidia"}))
     monkeypatch.setattr(
         "hirevia.ai.providers.OpenAICompatibleClient",
         lambda **kwargs: pytest.fail("ai status must not initialize a provider client"),

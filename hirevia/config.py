@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 try:  # .env is loaded once, here, so every env var (NVIDIA_MODEL included)
     from dotenv import load_dotenv  # is present before load_config() runs
@@ -145,14 +145,24 @@ class Config(BaseModel):
     # Deliberately lower than notify_min_match_score: relevant != interrupt-worthy.
     match_min_score: int = 55
     # Deterministic priority thresholds (clear, no arbitrary buckets).
-    priority_p1_min_score: int = 80
-    priority_p2_min_score: int = 62
+    priority_p1_min_score: int = Field(default=85, ge=0, le=100)
+    priority_p2_min_score: int = Field(default=65, ge=0, le=100)
+    priority_p3_min_score: int = Field(default=40, ge=0, le=100)
     # Weight of the AI verdict in the final score; the rest is deterministic
     # evidence. AI_MATCH_WEIGHT=0 makes matching purely deterministic.
     ai_match_weight: float = 0.40
     # When the model could not be consulted, the score is capped here: a job is
     # never presented as a strong match just because the AI was unavailable.
     ai_failed_score_cap: int = 70
+
+    @model_validator(mode="after")
+    def validate_priority_thresholds(self):
+        if not (
+            self.priority_p1_min_score > self.priority_p2_min_score
+            > self.priority_p3_min_score
+        ):
+            raise ValueError("matching thresholds must satisfy P1 > P2 > P3")
+        return self
 
 
 
@@ -211,8 +221,12 @@ def load_config(
 
     sources_data = load_yaml(sources_path)
     filters_data = load_yaml(filters_path)
-    ai_data = load_yaml(ai_path)
+    ai_document = load_yaml(ai_path)
+    ai_data = ai_document
     ai_data = ai_data.get("ai", ai_data) or {}
+    matching_data = ai_document.get("matching", {}) if isinstance(ai_document, dict) else {}
+    if not isinstance(matching_data, dict):
+        matching_data = {}
 
     provider_data = {
         name: provider.model_dump()
@@ -259,6 +273,15 @@ def load_config(
         verify_timeout_seconds=float(os.getenv("VERIFY_TIMEOUT_SECONDS", "8")),
         notify_min_match_score=int(os.getenv("NOTIFY_MIN_MATCH_SCORE", "80")),
         notify_max_age_hours=int(os.getenv("NOTIFY_MAX_AGE_HOURS", "72")),
+        priority_p1_min_score=_env_int(
+            "MATCHING_P1_THRESHOLD", int(matching_data.get("p1_threshold", 85))
+        ),
+        priority_p2_min_score=_env_int(
+            "MATCHING_P2_THRESHOLD", int(matching_data.get("p2_threshold", 65))
+        ),
+        priority_p3_min_score=_env_int(
+            "MATCHING_P3_THRESHOLD", int(matching_data.get("p3_threshold", 40))
+        ),
     )
 
 

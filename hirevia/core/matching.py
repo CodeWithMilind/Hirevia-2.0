@@ -792,6 +792,7 @@ def combine(
     deterministic = evidence.score
     ai_weight = min(max(float(getattr(config, "ai_match_weight", 0.4)), 0.0), 1.0)
     min_score = int(getattr(config, "match_min_score", 55))
+    min_score = max(min_score, int(getattr(config, "priority_p3_min_score", 40)))
     failed_cap = int(getattr(config, "ai_failed_score_cap", 70))
 
     if ai is None:

@@ -1,10 +1,6 @@
 ai:
   enabled: true
   primary: llamacpp
-  fallback:
-    - nvidia
-    - groq
-    - ollama
   timeout_seconds: 20
   max_retries: 1
   cooldown_seconds: 120
@@ -29,3 +25,8 @@ ai:
       base_url: http://localhost:8080/v1
       model: ""
       api_key_env: LLAMACPP_API_KEY
+
+matching:
+  p1_threshold: 85
+  p2_threshold: 65
+  p3_threshold: 40

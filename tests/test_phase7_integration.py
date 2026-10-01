@@ -247,11 +247,10 @@ def test_failed_telegram_delivery_retries_from_the_stored_verdict(monkeypatch, t
     second = run(pipeline)
     stored = repo.get_by_source_id(job.source, job.source_job_id)
     assert second.jobs_duplicate == 1
-    assert second.jobs_notified == 1
+    assert second.jobs_notified == 0
     assert len(fake_ai.calls) == 1
-    assert stored.notified_at is not None
-    assert stored.notification_channel == "telegram"
-    assert len(telegram.calls) == 2
+    assert stored.notified_at is None
+    assert len(telegram.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -313,7 +312,7 @@ def test_actionability_and_failure_cases_complete_without_false_alerts(
 
     stats = run(pipeline)
 
-    assert stats.jobs_failed == 0
+    assert stats.jobs_failed == (1 if case == "ai-failure" else 0)
     if case == "unknown-verification":
         assert stats.jobs_notified == 1
         assert len(telegram.calls) == 1
@@ -338,12 +337,9 @@ def test_actionability_and_failure_cases_complete_without_false_alerts(
         assert stats.jobs_filtered == 1
         assert verifier.calls == []
     elif case == "ai-failure":
-        stored = repo.get_by_source_id(job.source, job.source_job_id)
-        assert stored is not None
-        verdict = stored.verdict_model()
-        assert verdict.degraded is True
-        assert verdict.ai_error == "fake NVIDIA timeout"
-        assert verdict.deterministic_score > 0
+        assert stats.jobs_failed == 1
+        assert repo.get_by_source_id(job.source, job.source_job_id) is None
+        assert repo.get_telegram_queue_status()["queued"] == 1
         assert telegram.calls == []
     elif case == "malformed-ai":
         assert fake_ai.calls
@@ -354,7 +350,8 @@ def test_actionability_and_failure_cases_complete_without_false_alerts(
         stored = repo.get_by_source_id(job.source, job.source_job_id)
         assert stored.application_status is expected_status
     elif case == "stale":
-        assert verifier.calls == [APPLICATION_URL]
-        assert stats.jobs_skipped_notification == 1
+        assert verifier.calls == []
+        assert repo.get_by_source_id(job.source, job.source_job_id) is None
+        assert repo.get_telegram_queue_status()["queued"] == 0
     else:
         assert verifier.calls == [APPLICATION_URL]

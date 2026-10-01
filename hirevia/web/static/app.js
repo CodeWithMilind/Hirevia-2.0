@@ -73,7 +73,7 @@ function setActiveView(name, refresh = true) {
   if (name === "telegram" && refresh) loadTelegram();
   if (name === "ai") loadAI();
   if (name === "config") loadConfigFiles();
-  if (name === "logs") loadActivity();
+  if (name === "logs") loadLogs();
   if (name === "system") loadStatus();
 }
 
@@ -150,41 +150,69 @@ async function loadStatus() {
   const status = await api("/api/status");
   state.status = status;
   const badge = $("statusBadge");
-  badge.textContent = status.is_running ? "MONITORING" : "STOPPED";
-  badge.className = `topbar-status ${status.is_running ? "running" : "stopped"}`;
-  $("railStatus").textContent = status.status === "RUNNING" || status.status === "SCANNING" ? "Monitoring" : "Stopped";
+  badge.textContent = status.status;
+  badge.className = `topbar-status ${status.status === "RUNNING" || status.status === "SCANNING" ? "running" : status.status === "ERROR" || status.status === "AUTH_REQUIRED" ? "stopped" : ""}`;
+  $("railStatus").textContent = status.status;
   $("railDot").classList.toggle("online", status.status === "RUNNING" || status.status === "SCANNING");
+  $("telegramGlobalStatus").textContent = status.telegram_connected ? "TELEGRAM CONNECTED" : "TELEGRAM DISCONNECTED";
+  $("telegramGlobalStatus").classList.toggle("running", status.telegram_connected);
   const telegramRequired = state.telegram?.telegram_enabled !== false;
   const telegramReady = !telegramRequired || (
     state.telegram?.connected && state.telegram?.validation_complete
   );
   $("startButton").disabled = status.is_running || !telegramReady;
   $("stopButton").disabled = !status.is_running;
-  $("systemAgent").textContent = status.is_running ? "Monitoring" : "Stopped";
+  $("systemAgent").textContent = status.status;
   $("systemOperation").textContent = status.current_operation || "Idle";
+  $("systemTelegram").textContent = status.telegram_connected ? "Connected" : "Disconnected";
+  $("systemAI").textContent = `${status.ai_provider} · ${status.ai_health_state}${status.ai_provider_configured ? " · configured" : " · not configured"}`;
   $("systemLastScan").textContent = status.last_scan ? relativeTime(status.last_scan) : "Never";
   $("systemNextScan").textContent = status.next_scan ? relativeTime(status.next_scan) : "—";
   $("systemInterval").textContent = `${status.scan_interval_minutes} minutes`;
   $("systemSources").textContent = (status.sources || []).filter((source) => source.enabled).map((source) => source.name).join(", ") || "None enabled";
 }
 
-async function loadActivity() {
-  const entries = await api("/api/activity?limit=100");
-  const list = $("activityList");
+async function loadLogs() {
+  const files = await api("/api/logs");
+  const list = $("logFiles");
   list.replaceChildren();
-  if (!entries.length) list.append(node("div", "empty-state", "No recent activity."));
-  entries.slice().reverse().forEach((entry) => {
-    const row = node("div", "log-row");
-    row.append(node("time", "log-time", relativeTime(entry.timestamp)));
-    row.append(node("span", `log-level ${entry.level || "info"}`, entry.level || "info"));
-    row.append(node("span", "", entry.message || ""));
+  if (!files.length) list.append(node("div", "empty-state", "No log files available."));
+  files.forEach((file) => {
+    const row = node("div", "source-row");
+    const identity = node("div", "source-identity");
+    identity.append(node("strong", "", file.name), node("span", "source-state", `${file.size_bytes} bytes · ${relativeTime(file.modified_at)}`));
+    const download = node("a", "button quiet", "Download");
+    download.href = `/api/logs/${encodeURIComponent(file.name)}`;
+    download.addEventListener("click", async (event) => {
+      event.preventDefault();
+      try {
+        const response = await fetch(download.href, {
+          headers: { ...(sessionStorage.getItem("hireviaAdminToken") ? { Authorization: `Bearer ${sessionStorage.getItem("hireviaAdminToken")}` } : {}) },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const blobUrl = URL.createObjectURL(await response.blob());
+        const anchor = document.createElement("a");
+        anchor.href = blobUrl;
+        anchor.download = file.name;
+        anchor.click();
+        URL.revokeObjectURL(blobUrl);
+      } catch (error) { notify(`Could not download log: ${error.message}`); }
+    });
+    row.append(identity, download);
     list.append(row);
   });
 }
 
+async function loadQueueStatus() {
+  const queue = await api("/api/queue/status");
+  $("systemQueue").textContent = `${queue.queued} queued · ${queue.processing} processing`;
+  $("systemQueueAge").textContent = queue.oldest_pending_at ? relativeTime(queue.oldest_pending_at) : "None";
+  $("systemCleanup").textContent = queue.last_cleanup_at ? relativeTime(queue.last_cleanup_at) : "Pending";
+}
+
 async function poll() {
-  const tasks = [loadStatus(), loadJobs(), loadCounts()];
-  if ($("view-logs").classList.contains("active")) tasks.push(loadActivity());
+  const tasks = [loadStatus(), loadJobs(), loadCounts(), loadQueueStatus(), loadTelegram()];
+  if ($("view-logs").classList.contains("active")) tasks.push(loadLogs());
   try { await Promise.all(tasks); } catch (error) { $("railStatus").textContent = error.message; }
 }
 
@@ -205,11 +233,20 @@ async function saveJob(id, saved) {
 }
 
 async function deleteJob(id) {
-  if (!window.confirm("Remove this opportunity from the active feed?")) return;
+  if (!window.confirm("Permanently delete this job? Telegram duplicate history will be kept.")) return;
   try {
     await api(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
     await Promise.all([loadJobs(), loadCounts()]);
-    notify("Opportunity removed from active feed");
+    notify("Job permanently deleted");
+  } catch (error) { notify(error.message); }
+}
+
+async function deleteAllJobs() {
+  if (!window.confirm("Permanently delete all saved jobs? Telegram duplicate history will be kept.")) return;
+  try {
+    const result = await api("/api/jobs", { method: "DELETE" });
+    await Promise.all([loadJobs(), loadCounts()]);
+    notify(`${result.deleted} job(s) permanently deleted`);
   } catch (error) { notify(error.message); }
 }
 
@@ -337,15 +374,6 @@ async function loadTelegram() {
       row.append(identity, controls);
       list.append(row);
     });
-    const destinations = data.community_destinations || {};
-    for (const [priority, element] of [["P1", $("destP1")], ["P2", $("destP2")], ["P3", $("destP3")]]) {
-      const configured = destinations[priority] || "";
-      if (configured && ![...element.options].some((option) => option.value === configured)) {
-        element.append(node("option", "", `${configured} · configured`));
-        element.lastElementChild.value = configured;
-      }
-      element.value = configured;
-    }
     if (data.connected) {
       $("telegramOtp").value = "";
       $("telegramPassword").value = "";
@@ -501,7 +529,10 @@ async function loadAI() {
     });
     updateAIPrimaryFields();
     $("aiTimeout").value = data.timeout_seconds;
-    renderProviders(data.providers, data.fallback);
+    $("p1Threshold").value = data.matching.p1_threshold;
+    $("p2Threshold").value = data.matching.p2_threshold;
+    $("p3Threshold").value = data.matching.p3_threshold;
+    renderProviders(data.providers);
   } catch (error) { $("aiMessage").textContent = error.message; }
 }
 
@@ -512,20 +543,14 @@ function updateAIPrimaryFields() {
   $("aiBaseUrl").value = provider.base_url || "";
 }
 
-function renderProviders(providers, fallbacks) {
+function renderProviders(providers) {
   const list = $("providerList");
   list.replaceChildren();
   providers.forEach((provider) => {
-    const row = node("label", "provider-row");
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.value = provider.name;
-    checkbox.checked = fallbacks.includes(provider.name);
-    checkbox.dataset.fallback = "true";
-    checkbox.disabled = provider.name === $("aiPrimary").value;
+    const row = node("div", "provider-row");
     const info = node("span", "provider-info");
     info.append(node("span", "provider-name", provider.name), node("span", "provider-detail", `${provider.model || "model not set"} · ${provider.base_url || "no endpoint"}`));
-    row.append(checkbox, info, node("span", "provider-state", provider.configured ? "Configured" : provider.api_key_configured ? "Key present" : "Not configured"));
+    row.append(node("span", "provider-state", provider.primary ? "Active" : "Available"), info, node("span", "provider-state", provider.configured ? "Configured" : provider.api_key_configured ? "Key present" : "Not configured"));
     list.append(row);
   });
 }
@@ -578,13 +603,14 @@ async function saveYaml() {
 }
 
 async function saveAI() {
-  const fallback = [...document.querySelectorAll("[data-fallback]:checked")].map((item) => item.value);
   const payload = {
     primary: $("aiPrimary").value,
     model: $("aiModel").value.trim(),
     base_url: $("aiBaseUrl").value.trim(),
-    fallback,
     timeout_seconds: Number($("aiTimeout").value),
+    p1_threshold: Number($("p1Threshold").value),
+    p2_threshold: Number($("p2Threshold").value),
+    p3_threshold: Number($("p3Threshold").value),
   };
   if ($("aiApiKey").value) payload.api_key = $("aiApiKey").value;
   try {
@@ -594,44 +620,6 @@ async function saveAI() {
     notify("AI settings updated");
     await loadAI();
   } catch (error) { $("aiMessage").textContent = error.message; }
-}
-
-async function saveDestinations() {
-  const destinations = { P1: $("destP1").value.trim(), P2: $("destP2").value.trim(), P3: $("destP3").value.trim() };
-  try {
-    await api("/api/telegram/community", { method: "PUT", body: JSON.stringify({ destinations }) });
-    $("telegramMessage").textContent = "Saved to telegram.yaml";
-    notify("Telegram destinations saved");
-  } catch (error) { $("telegramMessage").textContent = error.message; }
-}
-
-async function loadTelegramDialogs() {
-  try {
-    const result = await api("/api/telegram/dialogs");
-    if (result.error) throw new Error(result.error);
-    state.telegramMembership = new Set((result.dialogs || []).map((dialog) => dialog.username?.toLowerCase()).filter(Boolean));
-    for (const element of [$("destP1"), $("destP2"), $("destP3")]) {
-      const selected = element.value;
-      element.replaceChildren(node("option", "", "Choose group or channel"));
-      element.firstElementChild.value = "";
-      (result.dialogs || []).forEach((dialog) => {
-        const label = `${dialog.title}${dialog.username ? ` · @${dialog.username}` : ""} · ${dialog.type}`;
-        const option = node("option", "", label);
-        option.value = dialog.id;
-        element.append(option);
-      });
-      element.value = selected;
-    }
-    $("telegramMessage").textContent = `${result.dialogs.length} groups and channels available`;
-    await loadTelegram();
-  } catch (error) { $("telegramMessage").textContent = error.message; }
-}
-
-async function testDestination(priority) {
-  try {
-    const result = await api(`/api/telegram/community/test/${priority}`, { method: "POST", body: "{}" });
-    $("telegramMessage").textContent = result.message;
-  } catch (error) { $("telegramMessage").textContent = error.message; }
 }
 
 async function joinConfiguredSources() {
@@ -669,6 +657,7 @@ function bind() {
   $("scanButton").addEventListener("click", () => control("/api/scan", "Scan complete"));
   $("closeDialog").addEventListener("click", () => $("jobDialog").close());
   $("jobDialog").addEventListener("click", (event) => { if (event.target === $("jobDialog")) $("jobDialog").close(); });
+  $("deleteAllJobs").addEventListener("click", deleteAllJobs);
   $("sendTelegramOtp").addEventListener("click", sendTelegramOtp);
   $("verifyTelegramOtp").addEventListener("click", verifyTelegramOtp);
   $("resendTelegramOtp").addEventListener("click", resendTelegramOtp);
@@ -677,10 +666,7 @@ function bind() {
   $("joinSources").addEventListener("click", joinConfiguredSources);
   $("refreshSources").addEventListener("click", refreshTelegramValidation);
   $("manageSources").addEventListener("click", async () => { setActiveView("config"); await loadConfigFiles(); if ([...document.querySelectorAll(".config-file")].some((item) => item.textContent === "telegram.yaml")) await openConfigFile("telegram.yaml"); });
-  $("saveDestinations").addEventListener("click", saveDestinations);
-  $("loadDialogs").addEventListener("click", loadTelegramDialogs);
-  document.querySelectorAll("[data-test-priority]").forEach((button) => button.addEventListener("click", () => testDestination(button.dataset.testPriority)));
-  $("aiPrimary").addEventListener("change", () => { updateAIPrimaryFields(); renderProviders(state.ai.providers, state.ai.fallback); });
+  $("aiPrimary").addEventListener("change", () => { updateAIPrimaryFields(); renderProviders(state.ai.providers); });
   $("saveAi").addEventListener("click", saveAI);
   $("testAi").addEventListener("click", async () => {
     try { const result = await api("/api/ai/test", { method: "POST", body: "{}" }); $("aiMessage").textContent = result.message; }

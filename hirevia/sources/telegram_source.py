@@ -1,14 +1,7 @@
-"""Telegram community collector (MTProto via Telethon, strictly read-only).
+"""Telegram job-channel collector (MTProto via Telethon, strictly read-only).
 
-This is the job-discovery side of Telegram. It is deliberately separate from
-the notification side (hirevia/notifications/telegram.py, Bot API):
-
-    Telegram public channels  ->  this module (MTProto user session, READ ONLY)
-    Hirevia alerts            ->  TelegramNotifier (Bot API, WRITE ONLY)
-
-The collector never sends messages, never joins channels, never prompts for
-OTP (authentication happens once via `hirevia telegram-login`) and only reads
-the public communities listed in telegram.yaml.
+The collector never sends messages, never prompts for OTP, and only reads the
+public channels listed in `telegram.yaml`.
 
 The SourceRegistry instantiates sources per scan, so the connected client and
 per-channel message cursors live at module level and are reused across scans.
@@ -239,6 +232,7 @@ class TelegramSource(JobSource):
         self._last_collection_failed = False
         self._event_queue = None
         self._event_mode = False
+        self.force_24h_lookback = False
         self._active_event = None
         self._retry_event = None
         self._event_channels: Dict[str, TelegramChannel] = {}
@@ -250,9 +244,11 @@ class TelegramSource(JobSource):
         self._listener_handler = None
         self._connection_task = None
         self._stop_connection_watch = asyncio.Event()
+        self._state_store = None
 
     def bind_state(self, repo) -> None:
         """Called by the Pipeline: store per-channel cursors in the jobs DB."""
+        self._state_store = repo
         bind_state_store(repo)
 
     async def collect(self) -> List[Job]:
@@ -266,7 +262,7 @@ class TelegramSource(JobSource):
             logger.info("%s No enabled channels in telegram.yaml - skipping", PREFIX)
             return []
 
-        if self._event_mode:
+        if self._event_mode and not self.force_24h_lookback:
             return await self._collect_queued_message(channels)
 
         self._has_more_backfill = False
@@ -325,6 +321,13 @@ class TelegramSource(JobSource):
                 )
                 continue
 
+            unprocessed_messages = []
+            for message in messages:
+                if self._state_store is None or self._state_store.record_telegram_message(
+                    channel.username, message.message_id, message.date
+                ):
+                    unprocessed_messages.append(message)
+            messages = unprocessed_messages
             messages_checked += len(messages)
             if (
                 channel.max_messages > 0
@@ -333,6 +336,16 @@ class TelegramSource(JobSource):
             ):
                 self._has_more_backfill = True
             channel_jobs = self._normalize_messages(channel, messages)
+            candidate_ids = {
+                int(job.raw_data.get("source_message_id", 0) or 0)
+                for job in channel_jobs
+            }
+            if self._state_store is not None:
+                for message in messages:
+                    if message.message_id not in candidate_ids:
+                        self._state_store.mark_telegram_message_processed(
+                            channel.username, message.message_id
+                        )
             jobs_detected += len(channel_jobs)
             printed_ids = set()
             for job in channel_jobs:
@@ -476,7 +489,24 @@ class TelegramSource(JobSource):
         if queued is not None:
             self._retry_event = None
         else:
-            queued = await self._event_queue.get()
+            message_task = asyncio.create_task(self._event_queue.get())
+            stop_task = asyncio.create_task(self._stop_connection_watch.wait())
+            done, pending = await asyncio.wait(
+                (message_task, stop_task),
+                timeout=5,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if not done:
+                self.last_stats = {"channels_scanned": 0, "messages_checked": 0}
+                return []
+            if message_task not in done:
+                self.last_stats = {"channels_scanned": 0, "messages_checked": 0}
+                return []
+            queued = message_task.result()
 
         username, message = queued
         channel = self._event_channels.get(username.casefold())
@@ -492,7 +522,14 @@ class TelegramSource(JobSource):
             message_id, self._pending_message_ids.get(username, 0)
         )
         tg_message = to_tgmessage(message, username)
+        if self._state_store is not None and not self._state_store.record_telegram_message(
+            username, message_id, tg_message.date
+        ):
+            self.last_stats = {"channels_scanned": 1, "messages_checked": 0}
+            return []
         jobs = self._normalize_messages(channel, [tg_message])
+        if not jobs and self._state_store is not None:
+            self._state_store.mark_telegram_message_processed(username, message_id)
         unique = {job.source_job_id: job for job in jobs}
         self.last_stats = {
             "channels_scanned": 1,
@@ -711,7 +748,10 @@ class TelegramSource(JobSource):
         last_seen_id = _cursor_for(channel.username)
 
         collected: List[TgMessage] = []
-        if last_seen_id:
+        if self.force_24h_lookback:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+            iterator = self._lookback_iterator(client, entity, channel, cutoff)
+        elif last_seen_id:
             iterator = client.iter_messages(
                 entity,
                 min_id=last_seen_id,
