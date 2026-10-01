@@ -181,6 +181,8 @@ def build_ai_provider_router(
         key = primary_api_key if name == "nvidia" and primary_api_key else None
         if key is None and spec.api_key_env:
             key = os.getenv(spec.api_key_env)
+        if not key and not spec.requires_api_key:
+            key = "local"
         model = config.nvidia_model if name == "nvidia" else os.getenv(f"{name.upper()}_MODEL", spec.model)
         base_url = config.nvidia_base_url if name == "nvidia" else os.getenv(f"{name.upper()}_BASE_URL", spec.base_url)
         if not model or not base_url:
@@ -189,7 +191,7 @@ def build_ai_provider_router(
         if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc or parsed_url.username:
             configuration_errors[name] = "invalid endpoint"
             continue
-        if not key:
+        if spec.requires_api_key and not key:
             continue
         try:
             providers[name] = OpenAICompatibleClient(
@@ -218,7 +220,9 @@ def provider_status(config: Config) -> List[dict[str, Any]]:
     for name, spec in config.ai.providers.items():
         model = config.nvidia_model if name == "nvidia" else os.getenv(f"{name.upper()}_MODEL", spec.model)
         base_url = config.nvidia_base_url if name == "nvidia" else os.getenv(f"{name.upper()}_BASE_URL", spec.base_url)
-        key_ready = bool(spec.api_key_env and os.getenv(spec.api_key_env))
+        key_ready = not spec.requires_api_key or bool(
+            spec.api_key_env and os.getenv(spec.api_key_env)
+        )
         parsed_url = urlparse(base_url) if base_url else None
         valid_url = bool(
             parsed_url

@@ -143,6 +143,7 @@ def build_pipeline(monkeypatch, tmp_path, job, ai_outcome=AI_PAYLOAD,
                    telegram_responses=None, verifier_status=ApplicationStatus.OPEN,
                    verifier_usable=True, max_age_hours=72):
     config = Config()
+    config.ai.fallback = []
     config.verify_application_urls = True
     config.notify_max_age_hours = max_age_hours
 

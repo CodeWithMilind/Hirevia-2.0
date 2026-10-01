@@ -1,12 +1,15 @@
 """CLI for Hirevia"""
 
 import asyncio
+import json
 import logging
 import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import click
 from rich.console import Console
@@ -720,6 +723,19 @@ def ai_test():
 
     console.print("Testing primary provider...\n")
     console.print(f"Provider: {primary}\nModel: {row['model']}")
+    if primary == "llamacpp":
+        spec = config.ai.providers[primary]
+        endpoint = os.getenv("LLAMACPP_BASE_URL", spec.base_url).rstrip("/")
+        api_key = os.getenv(spec.api_key_env, "") if spec.api_key_env else ""
+        success, detail = _test_llamacpp_provider(provider, endpoint, api_key, row["model"])
+        if not success:
+            console.print(f"[red]✗ {detail}[/red]")
+            raise click.exceptions.Exit(1)
+        console.print("\n[green]✓ Connection successful[/green]")
+        console.print("[green]✓ Model responded[/green]")
+        console.print("[green]✓ AI provider is ready[/green]")
+        return
+
     job = Job(
         source="ai-health-check",
         source_job_id="synthetic-python-backend-role",
@@ -753,6 +769,88 @@ def ai_test():
     console.print("\n[green]✓ Connection successful[/green]")
     console.print("[green]✓ Model responded[/green]")
     console.print("[green]✓ AI provider is ready[/green]")
+
+
+def _test_llamacpp_provider(provider, endpoint: str, api_key: str, model: str) -> tuple[bool, str]:
+    """Probe llama.cpp's models endpoint, then send one bounded non-streaming prompt."""
+    models_url = endpoint + "/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    request = Request(models_url, headers=headers)
+    try:
+        with urlopen(request, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        if error.code in {401, 403}:
+            return False, f"llama.cpp server rejected its API key (HTTP {error.code})\n  URL: {models_url}"
+        return False, f"llama.cpp /v1/models returned HTTP {error.code}\n  URL: {models_url}"
+    except URLError as error:
+        reason = error.reason
+        if isinstance(reason, (TimeoutError,)) or "timeout" in type(reason).__name__.casefold():
+            return False, f"llama.cpp /v1/models request timed out\n  URL: {models_url}"
+        winerror = getattr(reason, "winerror", None) or getattr(reason, "errno", None)
+        code = f" (WinError {winerror})" if winerror else ""
+        return False, f"llama.cpp server unreachable{code}\n  URL: {endpoint}"
+    except (TimeoutError, OSError):
+        return False, f"llama.cpp server unreachable\n  URL: {endpoint}"
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return False, f"llama.cpp /v1/models returned malformed JSON\n  URL: {models_url}"
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return False, f"llama.cpp /v1/models returned an unexpected response\n  URL: {models_url}"
+    available_models = [
+        str(item["id"]) for item in payload["data"]
+        if isinstance(item, dict) and item.get("id")
+    ]
+
+    try:
+        response = asyncio.run(provider.client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Reply with exactly: OK"}],
+            temperature=0,
+            max_tokens=4,
+            stream=False,
+        ))
+    except Exception as error:
+        error_type = type(error).__name__.casefold()
+        status = getattr(error, "status_code", None)
+        error_detail = str(error).casefold()
+        body = getattr(error, "body", None)
+        if body is not None:
+            error_detail += f" {body}".casefold()
+        if "timeout" in error_type or "timed out" in str(error).casefold():
+            return False, f"llama.cpp model request timed out\n  Server reachable: yes\n  Model: {model}"
+        if status in {400, 404}:
+            available = ", ".join(available_models) or "not reported"
+            model_error = "model" in error_detail and any(
+                phrase in error_detail
+                for phrase in ("not found", "not exist", "invalid", "unavailable", "unknown")
+            )
+            if model_error:
+                return False, (
+                    f"llama.cpp rejected the configured model (HTTP {status})\n"
+                    f"  Model: {model}\n  Available models: {available}\n"
+                    "  Set LLAMACPP_MODEL to a model ID accepted by this server."
+                )
+            if status == 404:
+                return False, (
+                    "llama.cpp server does not provide the expected chat-completions endpoint "
+                    f"(HTTP 404)\n  Model: {model}"
+                )
+            return False, f"llama.cpp rejected the chat request (HTTP {status})\n  Check request compatibility and model configuration."
+        if status in {401, 403}:
+            return False, f"llama.cpp server rejected its API key (HTTP {status})\n  Server reachable: yes"
+        if status is not None:
+            return False, f"llama.cpp chat completion returned HTTP {status}\n  Server reachable: yes"
+        if "connection" in error_type or "connect" in error_type:
+            return False, f"llama.cpp chat endpoint connection failed\n  Server reachable: yes\n  Model: {model}"
+        return False, f"llama.cpp chat request failed ({type(error).__name__})\n  Model: {model}"
+
+    choices = getattr(response, "choices", None) or []
+    message = getattr(choices[0], "message", None) if choices else None
+    content = getattr(message, "content", None)
+    if not isinstance(content, str) or content.strip() != "OK":
+        return False, f"llama.cpp returned an unexpected health-check response\n  Model: {model}"
+    return True, ""
 
 
 def _print_stats(stats: ScanStats, include_top_opportunities: bool = True):

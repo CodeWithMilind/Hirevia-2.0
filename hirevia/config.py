@@ -22,7 +22,7 @@ def _ensure_dotenv() -> None:
     built-in default model.
     """
     try:
-        load_dotenv()
+        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
     except Exception:  # noqa: BLE001 - a broken .env must not stop a scan
         pass
 
@@ -73,6 +73,7 @@ class AIProviderConfig(BaseModel):
     base_url: str = ""
     model: str = ""
     api_key_env: str = ""
+    requires_api_key: bool = True
 
 
 def _default_ai_providers() -> Dict[str, AIProviderConfig]:
@@ -90,10 +91,12 @@ def _default_ai_providers() -> Dict[str, AIProviderConfig]:
         "ollama": AIProviderConfig(
             base_url="http://localhost:11434/v1",
             api_key_env="OLLAMA_API_KEY",
+            requires_api_key=False,
         ),
         "llamacpp": AIProviderConfig(
             base_url="http://localhost:8080/v1",
             api_key_env="LLAMACPP_API_KEY",
+            requires_api_key=False,
         ),
     }
 
@@ -218,6 +221,13 @@ def load_config(
     for name, values in (ai_data.get("providers") or {}).items():
         provider_data.setdefault(name, {})
         provider_data[name].update(values or {})
+    for name, values in provider_data.items():
+        base_url = os.getenv(f"{name.upper()}_BASE_URL")
+        model = os.getenv(f"{name.upper()}_MODEL")
+        if base_url is not None:
+            values["base_url"] = base_url
+        if model is not None:
+            values["model"] = model
     nvidia = provider_data["nvidia"]
     nvidia["base_url"] = os.getenv("NVIDIA_BASE_URL", nvidia["base_url"])
     nvidia["model"] = os.getenv("NVIDIA_MODEL", nvidia["model"])

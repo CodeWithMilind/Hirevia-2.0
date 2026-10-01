@@ -79,7 +79,7 @@ VALID_JSON = json.dumps(VALID_PAYLOAD)
 
 def make_config(**overrides) -> Config:
     defaults = dict(nvidia_model="nvidia/test-model", nvidia_base_url=BASE_URL,
-                    ai_timeout_seconds=5)
+                    ai_timeout_seconds=5, ai={"fallback": []})
     defaults.update(overrides)
     return Config(**defaults)
 

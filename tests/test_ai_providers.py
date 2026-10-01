@@ -5,6 +5,7 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+from click.testing import CliRunner
 
 from hirevia.ai.client import (
     AIAuthError,
@@ -20,6 +21,7 @@ from hirevia.ai.client import (
 from hirevia.ai.matcher import AIMatcher, MATCH_RESPONSE_SCHEMA, SYSTEM_PROMPT
 from hirevia.ai.providers import AIConfigurationError, AIProviderRouter, build_ai_provider_router, provider_status
 from hirevia.config import AIConfig, Config, load_config
+from hirevia.cli import cli
 from hirevia.core.matching import analyze
 from hirevia.core.models import CandidateProfile, Job
 
@@ -244,7 +246,11 @@ def test_provider_cooldown_skips_primary_until_expiry():
 
 
 def test_unconfigured_providers_are_skipped_and_reported(monkeypatch, tmp_path):
-    for name in ("NVIDIA_API_KEY", "GROQ_API_KEY", "OLLAMA_API_KEY", "LLAMACPP_API_KEY"):
+    for name in (
+        "NVIDIA_API_KEY", "GROQ_API_KEY", "OLLAMA_API_KEY", "LLAMACPP_API_KEY",
+        "NVIDIA_BASE_URL", "NVIDIA_MODEL", "GROQ_BASE_URL", "GROQ_MODEL",
+        "OLLAMA_BASE_URL", "OLLAMA_MODEL", "LLAMACPP_BASE_URL", "LLAMACPP_MODEL",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr("hirevia.config._ensure_dotenv", lambda: None)
     config = load_config(base_dir=tmp_path)
@@ -319,6 +325,7 @@ def test_reasoning_content_is_never_used_as_completion_or_error_text(caplog):
 
 
 def test_nvidia_legacy_model_configuration_still_builds_primary(monkeypatch):
+    monkeypatch.setenv("AI_PRIMARY_PROVIDER", "nvidia")
     monkeypatch.setenv("NVIDIA_API_KEY", "nv-test-key")
     monkeypatch.setenv("NVIDIA_MODEL", "openai/gpt-oss-20b")
     config = load_config()
@@ -326,3 +333,131 @@ def test_nvidia_legacy_model_configuration_still_builds_primary(monkeypatch):
 
     assert router.model == "openai/gpt-oss-20b"
     assert router.providers["nvidia"].provider_name == "nvidia"
+
+
+def test_llamacpp_provider_reads_endpoint_model_and_key_from_environment(monkeypatch):
+    monkeypatch.setattr("hirevia.config._ensure_dotenv", lambda: None)
+    monkeypatch.setenv("AI_PRIMARY_PROVIDER", "llamacpp")
+    monkeypatch.setenv("LLAMACPP_BASE_URL", "http://127.0.0.1:8181/v1")
+    monkeypatch.setenv("LLAMACPP_MODEL", "local-qwen-model")
+    monkeypatch.setenv("LLAMACPP_API_KEY", "local-test-key")
+    config = Config(ai={"primary": "llamacpp", "fallback": []})
+    router = build_ai_provider_router(config)
+
+    provider = router.providers["llamacpp"]
+    status = next(row for row in provider_status(config) if row["name"] == "llamacpp")
+    assert provider.model == "local-qwen-model"
+    assert str(provider.client.base_url).rstrip("/") == "http://127.0.0.1:8181/v1"
+    assert provider.api_key_env == "LLAMACPP_API_KEY"
+    assert status["configured"] is True
+    assert status["model"] == "local-qwen-model"
+
+
+def test_provider_environment_configuration_and_local_key_requirements(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hirevia.config._ensure_dotenv", lambda: None)
+    variables = (
+        "AI_PRIMARY_PROVIDER", "AI_TIMEOUT_SECONDS", "NVIDIA_API_KEY",
+        "NVIDIA_BASE_URL", "NVIDIA_MODEL", "GROQ_API_KEY", "GROQ_BASE_URL",
+        "GROQ_MODEL", "OLLAMA_API_KEY", "OLLAMA_BASE_URL", "OLLAMA_MODEL",
+        "LLAMACPP_API_KEY", "LLAMACPP_BASE_URL", "LLAMACPP_MODEL",
+    )
+    for variable in variables:
+        monkeypatch.delenv(variable, raising=False)
+
+    monkeypatch.setenv("AI_PRIMARY_PROVIDER", "nvidia")
+    monkeypatch.setenv("AI_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-secret-CANARY")
+    monkeypatch.setenv("NVIDIA_BASE_URL", "https://nvidia.example/v1")
+    monkeypatch.setenv("NVIDIA_MODEL", "nvidia-safe-model")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret-CANARY")
+    monkeypatch.setenv("GROQ_BASE_URL", "https://groq.example/v1")
+    monkeypatch.setenv("GROQ_MODEL", "groq-safe-model")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("OLLAMA_MODEL", "ollama-local")
+    monkeypatch.setenv("LLAMACPP_BASE_URL", "http://127.0.0.1:8080/v1")
+    monkeypatch.setenv("LLAMACPP_MODEL", "llamacpp")
+
+    config = load_config(base_dir=tmp_path)
+    rows = {row["name"]: row for row in provider_status(config)}
+
+    assert config.ai.primary == "nvidia"
+    assert config.ai.timeout_seconds == 60
+    assert config.nvidia_base_url == "https://nvidia.example/v1"
+    assert config.nvidia_model == "nvidia-safe-model"
+    assert rows["nvidia"]["configured"] is True
+    assert rows["nvidia"]["model"] == "nvidia-safe-model"
+    assert config.ai.providers["groq"].base_url == "https://groq.example/v1"
+    assert rows["groq"]["configured"] is True
+    assert rows["groq"]["model"] == "groq-safe-model"
+    assert rows["ollama"]["configured"] is True
+    assert rows["ollama"]["model"] == "ollama-local"
+    assert rows["llamacpp"]["configured"] is True
+    assert rows["llamacpp"]["model"] == "llamacpp"
+    assert "nvidia-secret-CANARY" not in repr(rows)
+    assert "groq-secret-CANARY" not in repr(rows)
+
+
+def test_local_provider_requires_endpoint_and_model_but_not_api_key(monkeypatch):
+    monkeypatch.setattr("hirevia.config._ensure_dotenv", lambda: None)
+    monkeypatch.delenv("LLAMACPP_API_KEY", raising=False)
+    monkeypatch.delenv("LLAMACPP_BASE_URL", raising=False)
+    monkeypatch.delenv("LLAMACPP_MODEL", raising=False)
+    config = Config(ai={"primary": "llamacpp", "fallback": []})
+    rows = {row["name"]: row for row in provider_status(config)}
+    assert rows["llamacpp"]["configured"] is False
+
+    monkeypatch.setenv("LLAMACPP_BASE_URL", "http://127.0.0.1:8080/v1")
+    monkeypatch.setenv("LLAMACPP_MODEL", "llamacpp")
+    rows = {row["name"]: row for row in provider_status(config)}
+    assert rows["llamacpp"]["configured"] is True
+
+
+def test_llamacpp_set_primary_needs_configuration_not_api_key(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hirevia.config._ensure_dotenv", lambda: None)
+    monkeypatch.delenv("LLAMACPP_API_KEY", raising=False)
+    monkeypatch.setenv("LLAMACPP_BASE_URL", "http://127.0.0.1:8080/v1")
+    monkeypatch.setenv("LLAMACPP_MODEL", "llamacpp")
+
+    result = CliRunner().invoke(cli, ["ai", "set-primary", "LLAMACPP"])
+
+    assert result.exit_code == 0, result.output
+    assert "Primary : llamacpp" in result.output
+    assert "Model   : llamacpp" in result.output
+    assert (tmp_path / ".env").read_text(encoding="utf-8").strip() == "AI_PRIMARY_PROVIDER=llamacpp"
+
+
+def test_load_config_reads_env_file_from_working_directory(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    for variable in ("AI_PRIMARY_PROVIDER", "AI_TIMEOUT_SECONDS", "LLAMACPP_BASE_URL", "LLAMACPP_MODEL"):
+        monkeypatch.delenv(variable, raising=False)
+    (tmp_path / ".env").write_text(
+        "AI_PRIMARY_PROVIDER=llamacpp\n"
+        "AI_TIMEOUT_SECONDS=60\n"
+        "LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1\n"
+        "LLAMACPP_MODEL=llamacpp\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(base_dir=tmp_path)
+    rows = {row["name"]: row for row in provider_status(config)}
+
+    assert config.ai.primary == "llamacpp"
+    assert config.ai.timeout_seconds == 60
+    assert rows["llamacpp"]["configured"] is True
+
+
+def test_ai_status_prints_configuration_without_secrets_or_network(monkeypatch):
+    monkeypatch.setattr("hirevia.config._ensure_dotenv", lambda: None)
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-secret-CANARY")
+    monkeypatch.setattr("hirevia.cli.load_config", lambda: Config())
+    monkeypatch.setattr(
+        "hirevia.ai.providers.OpenAICompatibleClient",
+        lambda **kwargs: pytest.fail("ai status must not initialize a provider client"),
+    )
+    result = CliRunner().invoke(cli, ["ai", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "nvidia-secret-CANARY" not in result.output
+    assert "NVIDIA (primary)" in result.output

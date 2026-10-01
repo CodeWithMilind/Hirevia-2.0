@@ -6,10 +6,12 @@ every ScanStats field the pipeline reports.
 """
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
 
 import pytest
 from click.testing import CliRunner
@@ -819,20 +821,20 @@ def test_ai_test_calls_only_selected_primary_provider(monkeypatch):
                 "matched_skills": ["Python", "SQL"],
             }
 
-    config = Config(ai={"primary": "llamacpp"})
+    config = Config(ai={"primary": "nvidia"})
     monkeypatch.setattr(cli_module, "load_config", lambda: config)
     monkeypatch.setattr(cli_module, "provider_status", lambda config: [
-        {"name": "llamacpp", "model": "hirevia-qwen3-1.7b", "configured": True}
+        {"name": "nvidia", "model": "openai/gpt-oss-20b", "configured": True}
     ])
     monkeypatch.setattr(cli_module, "build_ai_provider_router", lambda config: SimpleNamespace(
-        primary="llamacpp", providers={"llamacpp": FakeProvider()}
+        primary="nvidia", providers={"nvidia": FakeProvider()}
     ))
 
     result = CliRunner().invoke(cli, ["ai", "test"])
 
     assert result.exit_code == 0, result.output
-    assert "Provider: llamacpp" in result.output
-    assert "Model: hirevia-qwen3-1.7b" in result.output
+    assert "Provider: nvidia" in result.output
+    assert "Model: openai/gpt-oss-20b" in result.output
     assert "✓ Connection successful" in result.output
     assert "✓ Model responded" in result.output
     assert len(called) == 1
@@ -842,6 +844,196 @@ def test_ai_test_calls_only_selected_primary_provider(monkeypatch):
     assert called[0]["messages"][0]["role"] == "system"
     assert called[0]["messages"][1]["role"] == "user"
     assert "Junior Python Backend Developer" in called[0]["messages"][1]["content"]
+
+
+def _configure_llamacpp_ai_test(monkeypatch, create, models_payload=None):
+    config = Config(ai={"primary": "llamacpp"})
+    config.ai.providers["llamacpp"].model = "llamacpp"
+    calls = []
+
+    class ModelResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(models_payload or {"data": [{"id": "llamacpp"}]}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append((request, timeout))
+        return ModelResponse()
+
+    provider = SimpleNamespace(
+        model="llamacpp",
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    monkeypatch.setenv("LLAMACPP_BASE_URL", "http://127.0.0.1:8181/v1")
+    monkeypatch.setenv("LLAMACPP_API_KEY", "local-test-key")
+    monkeypatch.setattr(cli_module, "urlopen", fake_urlopen)
+    monkeypatch.setattr(cli_module, "load_config", lambda: config)
+    monkeypatch.setattr(cli_module, "provider_status", lambda config: [
+        {"name": "llamacpp", "model": "llamacpp", "configured": True}
+    ])
+    monkeypatch.setattr(cli_module, "build_ai_provider_router", lambda config: SimpleNamespace(
+        primary="llamacpp", providers={"llamacpp": provider}
+    ))
+    return calls
+
+
+def test_llamacpp_ai_test_gets_models_then_non_streaming_minimal_completion(monkeypatch):
+    completion_calls = []
+
+    async def fake_create(**kwargs):
+        completion_calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="OK")
+        )])
+
+    get_calls = _configure_llamacpp_ai_test(monkeypatch, fake_create)
+    result = CliRunner().invoke(cli, ["ai", "test"])
+
+    assert result.exit_code == 0, result.output
+    assert "Connection successful" in result.output
+    assert "Model responded" in result.output
+    request, timeout = get_calls[0]
+    assert request.full_url == "http://127.0.0.1:8181/v1/models"
+    assert request.get_header("Authorization") == "Bearer local-test-key"
+    assert timeout == 3
+    assert completion_calls == [{
+        "model": "llamacpp",
+        "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+        "temperature": 0,
+        "max_tokens": 4,
+        "stream": False,
+    }]
+
+
+def test_llamacpp_configured_model_alias_is_used_even_when_models_lists_another_id(monkeypatch):
+    async def fake_create(**kwargs):
+        assert kwargs["model"] == "llamacpp"
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="OK")
+        )])
+
+    _configure_llamacpp_ai_test(
+        monkeypatch,
+        fake_create,
+        models_payload={"data": [{"id": "server-model-path.gguf"}]},
+    )
+    result = CliRunner().invoke(cli, ["ai", "test"])
+
+    assert result.exit_code == 0, result.output
+    assert "Connection successful" in result.output
+
+
+def test_llamacpp_ai_test_distinguishes_invalid_request_from_invalid_model(monkeypatch):
+    class InvalidRequest(RuntimeError):
+        status_code = 400
+
+    async def invalid_request(**kwargs):
+        raise InvalidRequest("response format parameter unsupported")
+
+    _configure_llamacpp_ai_test(monkeypatch, invalid_request)
+    result = CliRunner().invoke(cli, ["ai", "test"])
+
+    assert result.exit_code == 1
+    assert "rejected the chat request (HTTP 400)" in result.output
+    assert "Available models" not in result.output
+
+
+def test_llamacpp_ai_test_reports_unreachable_server(monkeypatch):
+    async def unexpected_completion(**kwargs):
+        pytest.fail("do not attempt chat when /models cannot connect")
+
+    _configure_llamacpp_ai_test(monkeypatch, unexpected_completion)
+
+    def refused(request, timeout):
+        raise URLError(ConnectionRefusedError(10061, "connection refused"))
+
+    monkeypatch.setattr(cli_module, "urlopen", refused)
+    result = CliRunner().invoke(cli, ["ai", "test"])
+
+    assert result.exit_code == 1
+    assert "llama.cpp server unreachable (WinError 10061)" in result.output
+    assert "http://127.0.0.1:8181/v1" in result.output
+    assert "local-test-key" not in result.output
+
+
+def test_llamacpp_ai_test_distinguishes_models_timeout_and_inference_timeout(monkeypatch):
+    async def timeout_completion(**kwargs):
+        raise TimeoutError("model inference timed out")
+
+    _configure_llamacpp_ai_test(monkeypatch, timeout_completion)
+    result = CliRunner().invoke(cli, ["ai", "test"])
+
+    assert result.exit_code == 1
+    assert "llama.cpp model request timed out" in result.output
+    assert "Server reachable: yes" in result.output
+    assert "Model: llamacpp" in result.output
+
+
+def test_llamacpp_ai_test_reports_configured_model_not_served(monkeypatch):
+    class FakeAPIError(RuntimeError):
+        status_code = 404
+
+    async def unavailable_model(**kwargs):
+        raise FakeAPIError("model not found")
+
+    _configure_llamacpp_ai_test(
+        monkeypatch,
+        unavailable_model,
+        models_payload={"data": [{"id": "actual-model-id"}]},
+    )
+    result = CliRunner().invoke(cli, ["ai", "test"])
+
+    assert result.exit_code == 1
+    assert "rejected the configured model" in result.output
+    assert "Available models: actual-model-id" in result.output
+    assert "Set LLAMACPP_MODEL" in result.output
+
+
+def test_llamacpp_ai_test_reports_malformed_models_response(monkeypatch):
+    async def unexpected_completion(**kwargs):
+        pytest.fail("do not attempt chat with malformed /models data")
+
+    _configure_llamacpp_ai_test(monkeypatch, unexpected_completion)
+
+    class MalformedResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b"not-json"
+
+    monkeypatch.setattr(cli_module, "urlopen", lambda request, timeout: MalformedResponse())
+    result = CliRunner().invoke(cli, ["ai", "test"])
+
+    assert result.exit_code == 1
+    assert "llama.cpp /v1/models returned malformed JSON" in result.output
+
+
+def test_llamacpp_ai_test_reports_http_error_from_models_endpoint(monkeypatch):
+    async def unexpected_completion(**kwargs):
+        pytest.fail("do not attempt chat when /models returned an HTTP error")
+
+    _configure_llamacpp_ai_test(monkeypatch, unexpected_completion)
+
+    def unauthorized(request, timeout):
+        raise HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(cli_module, "urlopen", unauthorized)
+    result = CliRunner().invoke(cli, ["ai", "test"])
+
+    assert result.exit_code == 1
+    assert "server rejected its API key (HTTP 401)" in result.output
+    assert "local-test-key" not in result.output
 
 
 def test_ai_test_rejects_unusable_matching_response(monkeypatch):
