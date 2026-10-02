@@ -354,9 +354,87 @@ def test_weak_deterministic_match_is_not_rescued_by_a_strong_ai_verdict():
     result = combine(evidence, None, ai)
 
     assert evidence.score < 30
-    assert result.match_score == round(evidence.score * 0.6 + 100 * 0.4)
+    bounded_ai_score = min(100, evidence.score + 10)
+    assert result.match_score == round(evidence.score * 0.6 + bounded_ai_score * 0.4)
     assert result.match is False
-    assert result.priority is Priority.P2
+    assert result.priority is Priority.P3
+
+
+def test_ai_cannot_claim_a_jd_skill_the_candidate_does_not_have():
+    profile = make_profile(skills=["Python"])
+    evidence = analyze(
+        make_job(description="Python, FastAPI and SQL are required. 0-1 years."),
+        profile,
+    )
+    ai = AIResponse(
+        relevant=True,
+        priority=Priority.P1,
+        match_score=80,
+        matched_skills=["FastAPI", "SQL"],
+    )
+
+    result = combine(evidence, None, ai)
+
+    assert result.matched_skills == ["Python"]
+    assert result.missing_skills == ["FastAPI", "SQL"]
+
+
+def test_weak_unrelated_evidence_cannot_be_rescued_by_score_blending():
+    profile = CandidateProfile(
+        candidate_type="fresher",
+        experience_years=0,
+        target_max_experience_years=2,
+        accept_fresher=True,
+        skills=["Python", "FastAPI", "SQL", "Docker", "Postgres", "MongoDB", "Pandas", "Machine Learning", "Scikit-learn"],
+        preferred_roles=["Python Developer", "Backend Developer", "Data Scientist", "Data Analyst", "AI Engineer", "Machine Learning Engineer"],
+        role_families=["python_backend", "ai_ml", "data"],
+        preferred_locations=["Pune"],
+        remote_preference="preferred",
+        employment_types=["full_time", "internship"],
+    )
+    job = make_job(
+        title="Graphic Designer",
+        description="Rust, Kubernetes, Terraform, and AWS required for infrastructure automation.",
+        location="Pune",
+        employment_type="full_time",
+    )
+    evidence = analyze(job, profile)
+    ai = AIResponse(relevant=True, priority=Priority.P1, match_score=95)
+
+    result = combine(evidence, Config(ai_match_weight=0.4, match_min_score=55), ai)
+
+    assert evidence.score == 37
+    assert evidence.role_match is False
+    assert result.match_score <= evidence.score + 4
+    assert result.match is False
+
+
+def test_ai_relevance_cannot_override_a_deterministic_role_mismatch():
+    profile = make_profile()
+    job = make_job(
+        title="Sales Executive",
+        description="Python, FastAPI, SQL and Machine Learning. 0-1 years.",
+        location="Pune",
+    )
+    evidence = analyze(job, profile)
+    ai = AIResponse(relevant=True, priority=Priority.P1, match_score=100)
+
+    result = combine(evidence, None, ai)
+
+    assert evidence.score >= 55
+    assert evidence.role_match is False
+    assert result.match_score < 55
+    assert result.match is False
+
+
+def test_ai_rejection_cannot_leave_a_matching_final_score():
+    evidence = analyze(make_job(), make_profile())
+    ai = AIResponse(relevant=False, priority=Priority.P1, match_score=100)
+
+    result = combine(evidence, Config(match_min_score=55), ai)
+
+    assert result.match_score < 55
+    assert result.match is False
 
 
 @pytest.mark.parametrize(
@@ -440,7 +518,7 @@ def test_ai_priority_does_not_override_the_shared_score_classification():
 
     result = combine(evidence, config, ai)
 
-    assert result.match_score == 95       # pure AI score at weight 1.0
+    assert result.match_score == 95       # no deterministic role preference was declared
     assert result.priority is Priority.P1
 
 

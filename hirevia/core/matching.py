@@ -43,7 +43,6 @@ from hirevia.core.skills import (
     extract_jd_skills,
     find_skills,
     normalize_skill,
-    skill_in_text,
     transferable_matches,
 )
 
@@ -63,6 +62,7 @@ NEUTRAL = 0.6          # share of a weight awarded when no preference was declar
 TRANSFERABLE_CREDIT = 0.15   # per transferable skill, as a share of the skill weight
 MAX_SKILLS_SHOWN = 12
 REJECTED_SCORE_CAP = 40      # a hard veto can never present a score above this
+AI_SCORE_TOLERANCE = 10      # AI may refine, but cannot overwhelm deterministic evidence
 
 # Profile "role families" -> words that make a job title belong to that family.
 ROLE_FAMILY_KEYWORDS: Dict[str, List[str]] = {
@@ -848,12 +848,25 @@ def combine(
         match = False
         notes.append("rejected: " + "; ".join(evidence.reject_reasons[:2]))
     elif status == "ok":
-        blended = deterministic * (1 - ai_weight) + ai_score * ai_weight
+        blending_ai_score = ai_score
+        if evidence.role_match is False and deterministic < min_score:
+            blending_ai_score = min(ai_score, deterministic + AI_SCORE_TOLERANCE)
+        if blending_ai_score != ai_score:
+            notes.append("AI score bounded to deterministic evidence")
+        blended = deterministic * (1 - ai_weight) + blending_ai_score * ai_weight
         if not ai.relevant and blended >= min_score:
             blended -= 12  # the model explicitly said "not worth your time"
             notes.append("AI judged this not relevant")
         score = int(min(100, max(0, round(blended))))
-        match = score >= min_score
+        if not ai.relevant or evidence.role_match is False:
+            score = min(score, max(0, min_score - 1))
+        match = bool(
+            ai.relevant
+            and evidence.role_match is not False
+            and score >= min_score
+        )
+        if ai.relevant and evidence.role_match is False:
+            notes.append("deterministic role evidence conflicts with AI relevance")
     else:
         # Without a completed assessment there is evidence, but no final score
         # or match decision. Keep deterministic evidence in its own field.
@@ -867,7 +880,7 @@ def combine(
     )
     if status != "ok" and priority is Priority.P1:
         priority = Priority.P2  # an unconfirmed assessment cannot receive the top banner
-    matched, missing = _reconcile_skills(evidence, ai if status == "ok" else None)
+    matched, missing = _reconcile_skills(evidence)
 
     reason = evidence.reason()
     if status == "ok" and ai.reason:
@@ -925,25 +938,12 @@ def combine(
     )
 
 
-def _reconcile_skills(evidence: MatchEvidence, ai: Optional[AIResponse]) -> Tuple[List[str], List[str]]:
-    """Deterministic skills are the source of truth.
-
-    The AI may only ADD a matched skill when the posting really contains it -
-    checked against the posting text - so a hallucinated "Kubernetes match"
-    cannot inflate the evidence shown to the user.
-    """
-    matched = list(evidence.matched_skills)
-    known = set(matched) | set(evidence.missing_skills)
-
-    if ai is not None:
-        for claim in ai.matched_skills:
-            canonical = normalize_skill(claim)
-            if canonical and canonical not in matched and canonical in known:
-                if skill_in_text(canonical, evidence.text):
-                    matched.append(canonical)
-
-    missing = [skill for skill in evidence.missing_skills if skill not in matched]
-    return matched[:MAX_SKILLS_SHOWN], missing[:MAX_SKILLS_SHOWN]
+def _reconcile_skills(evidence: MatchEvidence) -> Tuple[List[str], List[str]]:
+    """Report exact skills only from profile-derived deterministic evidence."""
+    return (
+        evidence.matched_skills[:MAX_SKILLS_SHOWN],
+        evidence.missing_skills[:MAX_SKILLS_SHOWN],
+    )
 
 
 def match_job(
