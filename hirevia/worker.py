@@ -5,12 +5,13 @@ import logging
 import os
 import re
 import signal
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from hirevia.config import load_config
-from hirevia.storage.state import JobRepository
+from hirevia.storage.state import JobRepository, resolve_database_path
 from hirevia.sources.telegram_session_lock import AUTH_HANDOFF_TIMEOUT_SECONDS
 from hirevia.web.state import initialize_web_state
 
@@ -40,6 +41,21 @@ class WorkerService:
             logger.error("A Hirevia worker already owns the persistent worker lease")
             return 2
 
+        config = getattr(self.state, "config", None)
+        enabled_sources = (
+            config.sources.get_enabled_sources() if config is not None else []
+        )
+        ai_provider = getattr(getattr(config, "ai", None), "primary", "unknown")
+        logger.info(
+            "Worker started | pid=%d | database=%s | executable=%s | "
+            "environment=%s | sources=%s | ai_provider=%s",
+            self.pid,
+            self.repo.db_path,
+            sys.executable,
+            sys.prefix,
+            ",".join(enabled_sources),
+            ai_provider,
+        )
         exit_status = 0
         self.repo.recover_processing_queue()
         self.repo.recover_worker_commands()
@@ -108,6 +124,9 @@ class WorkerService:
                     )
             self.repo.release_worker_lease(
                 self.pid, "ERROR" if exit_status else "STOPPED"
+            )
+            logger.info(
+                "Worker stopped | pid=%d | exit_status=%d", self.pid, exit_status
             )
         return exit_status
 
@@ -436,8 +455,9 @@ class WorkerService:
 
 async def run_worker() -> int:
     config = load_config()
-    database_path = Path(os.getenv("HIREVIA_DB_PATH", "hirevia.db"))
-    repo = JobRepository(database_path)
+    database_path = resolve_database_path()
+    initialize_database = os.getenv("HIREVIA_WORKER_DB_INITIALIZED") != "1"
+    repo = JobRepository(database_path, initialize=initialize_database)
     from hirevia.cli import _build_ai_matcher
 
     state = initialize_web_state(config, repo, _build_ai_matcher(config))

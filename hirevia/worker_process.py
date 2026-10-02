@@ -19,6 +19,47 @@ class WorkerAlreadyRunning(WorkerProcessError):
     pass
 
 
+def get_process_executable_path(pid: int) -> Optional[str]:
+    """Return the OS executable for a PID without signaling or modifying it."""
+    if pid <= 0:
+        return None
+    if os.name != "nt":
+        try:
+            return str(Path(f"/proc/{pid}/exe").resolve(strict=True))
+        except OSError:
+            return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return None
+    try:
+        executable = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(executable))
+        if not kernel32.QueryFullProcessImageNameW(
+            handle, 0, executable, ctypes.byref(size)
+        ):
+            return None
+        return executable.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 class WorkerProcessController:
     def __init__(
         self,
@@ -141,6 +182,7 @@ class WorkerProcessController:
         database_path = Path(self.repo.db_path).expanduser().resolve()
         child_environment = os.environ.copy()
         child_environment["HIREVIA_DB_PATH"] = str(database_path)
+        child_environment["HIREVIA_WORKER_DB_INITIALIZED"] = "1"
         command = [sys.executable, "-m", "hirevia", "worker"]
         if os.name == "nt":
             base_executable = getattr(sys, "_base_executable", sys.executable)
@@ -196,6 +238,7 @@ class WorkerProcessController:
         runtime = self.repo.get_worker_runtime()
         if child is None and not runtime.get("alive"):
             return {"stopped": True, "already_stopped": True}
+        target_pid = runtime.get("pid") if child is None else None
         if (
             child is not None
             and runtime.get("alive")
@@ -246,7 +289,11 @@ class WorkerProcessController:
                     raise WorkerProcessError(command["error"] or "Worker shutdown failed")
                 if command and command["status"] == "COMPLETED":
                     shutdown_completed = True
-                    if child is None and not current.get("alive"):
+                    if (
+                        child is None
+                        and not current.get("alive")
+                        and (target_pid is None or not self.repo._pid_is_alive(target_pid))
+                    ):
                         return {"stopped": True, "already_stopped": False}
                     if child is not None and child.poll() is not None:
                         await asyncio.to_thread(child.wait)

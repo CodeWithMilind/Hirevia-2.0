@@ -2,7 +2,9 @@
 
 import asyncio
 import os
+import sqlite3
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 from hirevia.config import Config
@@ -11,7 +13,11 @@ from hirevia.core.models import Job
 from hirevia.storage.state import JobRepository
 from hirevia.web import state as web_state
 from hirevia.worker import WorkerService
-from hirevia.worker_process import WorkerProcessController, WorkerProcessError
+from hirevia.worker_process import (
+    WorkerProcessController,
+    WorkerProcessError,
+    get_process_executable_path,
+)
 
 
 class FakeChildProcess:
@@ -41,6 +47,36 @@ class FakeChildProcess:
     def kill(self):
         self.kill_calls += 1
         self.returncode = -9
+
+
+def test_process_executable_lookup_identifies_current_python():
+    executable = get_process_executable_path(os.getpid())
+
+    assert executable is not None
+    assert Path(executable).name.casefold().startswith("python")
+
+
+def test_repository_connections_close_and_wal_checkpoint_cleanly(tmp_path):
+    repo = JobRepository(tmp_path / "wal.db")
+
+    with repo._get_conn() as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        retained_connection = connection
+
+    try:
+        retained_connection.execute("SELECT 1")
+    except sqlite3.ProgrammingError:
+        pass
+    else:
+        raise AssertionError("Repository connection remained open after context exit")
+
+    checkpoint = sqlite3.connect(repo.db_path, timeout=5)
+    try:
+        result = checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        assert result[0] == 0
+        assert checkpoint.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        checkpoint.close()
 
 
 def test_concurrent_controllers_accept_one_verified_lease_owner():
@@ -313,9 +349,10 @@ def test_independent_child_start_command_and_graceful_shutdown(
             await asyncio.sleep(1.2)
             assert repo.get_worker_runtime()["heartbeat_at"] != prior_heartbeat
 
-            stopped = await owner.shutdown_worker(timeout=20)
+            stopper = WorkerProcessController(repo, spawn_enabled=False)
+            stopped = await stopper.shutdown_worker(timeout=20)
             assert stopped == {"stopped": True, "already_stopped": False}
-            assert owner._spawned_process.poll() == 0
+            assert await asyncio.to_thread(owner._spawned_process.wait, 5) == 0
         finally:
             await stop_test_children(controllers)
 

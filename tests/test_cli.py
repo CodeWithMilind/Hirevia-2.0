@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import sys
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -26,14 +27,127 @@ from hirevia.core.models import ApplicationStatus, EmploymentType, Job, ScanStat
 from hirevia.sources.telegram_config import TelegramChannel
 from hirevia.sources.telegram_extract import TgMessage
 from hirevia.sources.telegram_source import TelegramSource
+from hirevia.storage.state import JobRepository, resolve_database_path
 
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch, tmp_path):
-    for var in ("NVIDIA_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "HIREVIA_LOG_LEVEL"):
+    for var in (
+        "NVIDIA_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+        "HIREVIA_LOG_LEVEL", "HIREVIA_DB_PATH",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.chdir(tmp_path)
     yield
+
+
+def test_database_path_uses_environment_unless_overridden(monkeypatch, tmp_path):
+    configured = tmp_path / "data" / "hirevia.db"
+    explicit = tmp_path / "other.db"
+    monkeypatch.setenv("HIREVIA_DB_PATH", str(configured))
+
+    assert resolve_database_path() == configured.resolve()
+    assert resolve_database_path(explicit) == explicit.resolve()
+
+    monkeypatch.delenv("HIREVIA_DB_PATH")
+    (tmp_path / ".env").write_text(
+        f"HIREVIA_DB_PATH={configured}\n", encoding="utf-8"
+    )
+    assert resolve_database_path() == configured.resolve()
+
+
+def test_worker_lifecycle_cli_commands(monkeypatch, tmp_path):
+    class FakeController:
+        def __init__(self):
+            self.repo = SimpleNamespace(db_path=tmp_path / "worker.db")
+
+        async def ensure_running(self, *, spawn_if_missing=None):
+            return {
+                "pid": os.getpid(),
+                "alive": True,
+                "status": "RUNNING",
+                "monitor_status": "STOPPED",
+                "started_at": datetime.utcnow().isoformat(),
+                "already_running": False,
+            }
+
+        async def shutdown_worker(self):
+            return {"stopped": True, "already_stopped": False}
+
+    monkeypatch.setattr(cli_module, "_worker_controller", lambda **kwargs: FakeController())
+    runner = CliRunner()
+
+    started = runner.invoke(cli, ["worker", "start"])
+    status = runner.invoke(cli, ["worker", "status"])
+    stopped = runner.invoke(cli, ["worker", "stop"])
+    restarted = runner.invoke(cli, ["worker", "restart"])
+
+    assert started.exit_code == 0, started.output
+    assert "Worker: RUNNING" in started.output
+    assert "PID:" in started.output
+    assert status.exit_code == 0, status.output
+    assert "Worker: STOPPED" in status.output
+    assert stopped.exit_code == 0, stopped.output
+    assert "Worker is stopped" in stopped.output
+    assert restarted.exit_code == 0, restarted.output
+    assert "Worker: RUNNING" in restarted.output
+
+
+def test_doctor_reports_database_and_api_without_mutating_database(
+    monkeypatch, tmp_path
+):
+    database_path = tmp_path / "doctor.db"
+    JobRepository(database_path)
+    monkeypatch.setenv("HIREVIA_DB_PATH", str(database_path))
+    monkeypatch.setattr(cli_module, "_port_owner", lambda host, port: None)
+    before = database_path.stat()
+
+    result = CliRunner().invoke(cli, ["doctor"])
+
+    after = database_path.stat()
+    assert result.exit_code == 0, result.output
+    assert "Database integrity: ok" in result.output
+    assert "SQLite journal mode: wal" in result.output
+    assert "API: not listening" in result.output
+    assert after.st_size == before.st_size
+    assert after.st_mtime_ns == before.st_mtime_ns
+
+
+def test_doctor_reports_stale_worker_pid_and_port_conflict(monkeypatch, tmp_path):
+    database_path = tmp_path / "stale.db"
+    repo = JobRepository(database_path)
+    assert repo.claim_worker_lease(0xFFFFFFFE)
+    monkeypatch.setenv("HIREVIA_DB_PATH", str(database_path))
+    monkeypatch.setattr(cli_module, "_port_owner", lambda host, port: "other-service")
+
+    result = CliRunner().invoke(cli, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert "stale PID" in result.output
+    assert "API port: occupied by other-service" in result.output
+
+
+def test_port_owner_identifies_hirevia_health_endpoint(monkeypatch):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+
+    class HealthResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"service":"hirevia-web"}'
+
+    monkeypatch.setattr(cli_module, "urlopen", lambda *args, **kwargs: HealthResponse())
+    try:
+        assert cli_module._port_owner("127.0.0.1", port) == "hirevia-web"
+    finally:
+        listener.close()
 
 
 def make_stats():

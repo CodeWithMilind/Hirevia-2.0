@@ -129,13 +129,29 @@ The shared configurable score cutoffs default to P1 at 70+, P2 at 40-69, P3 abov
 
 ## Running
 
-### Start the command center
+### Start Hirevia locally
 
-```bash
-python -m hirevia
+```powershell
+.\.venv\Scripts\python.exe -m hirevia worker start
+.\.venv\Scripts\python.exe -m hirevia worker status
+.\.venv\Scripts\python.exe -m hirevia web
 ```
 
-Open `http://127.0.0.1:8000`. On first setup, authenticate Telegram and wait for channel validation, then explicitly start monitoring. The monitor continues when the browser closes. A previously running monitor is restored after an ordinary service restart; Telegram sessions are preserved except on logout or invalidation. The compatible `python -m hirevia web` command is also available.
+The worker and web API are separate processes. Start the worker explicitly before opening the dashboard so Telegram authentication and monitor controls have a worker to communicate with. The API binds to `127.0.0.1:8000`; open `http://127.0.0.1:8000`. Starting the worker does not start the API, and starting the API does not create or restart a worker.
+
+Stop the API with Ctrl+C in its terminal. Stop the independent worker with:
+
+```powershell
+.\.venv\Scripts\python.exe -m hirevia worker stop
+```
+
+Use `.\.venv\Scripts\python.exe -m hirevia worker restart` for a graceful restart, or `.\.venv\Scripts\python.exe -m hirevia worker` to run it attached to the current terminal. Closing the API terminal leaves an explicitly started background worker running; check it with `worker status` and stop it explicitly when desired. `.\.venv\Scripts\python.exe -m hirevia doctor` reports database integrity, the worker lease and process executable, and whether the configured API port responds.
+
+### Database location
+
+The default remains `hirevia.db` in the project directory for backward compatibility. `HIREVIA_DB_PATH` can be set in the environment or project `.env`; all repository-backed commands resolve it to one absolute path. The current checkout is under OneDrive, where synchronizing a live SQLite database and its WAL sidecars can interfere with file locking and cross-device consistency. A local, non-synchronized location such as `%LOCALAPPDATA%\Hirevia\hirevia.db` is recommended.
+
+Hirevia does not move the database automatically. To migrate, stop the API and worker cleanly, make a verified SQLite backup, copy the backup to the chosen local directory, run `PRAGMA quick_check` and compare job counts on both copies, then configure `HIREVIA_DB_PATH` and verify `worker status`, `doctor`, and dashboard data. Keep the original database and backup unchanged until the new location is verified. Do not copy or delete active `-wal` or `-shm` files by hand.
 
 ### Scan Telegram history
 
@@ -168,9 +184,20 @@ python -m hirevia status
 | `sources` | List configured sources |
 | `monitor` | Continuously process Telegram channel messages without notifications |
 | `web` | Run the Web UI for administration or debugging |
+| `worker` | Run the worker attached to the current terminal |
+| `worker start/status/stop/restart` | Explicitly manage the independent background worker |
+| `doctor` | Check database integrity, worker lease, and API port |
 | `ai status`, `ai test`, `ai set-primary` | Inspect and manage AI providers |
 | `test` | Run self-tests |
 | `version` | Show version |
+
+## Runtime files
+
+- SQLite is deliberately configured for WAL mode. `hirevia.db-wal` and `hirevia.db-shm` may appear while connections are active and disappear after checkpointing/connection close; do not delete them manually.
+- Application logs rotate by size into `hirevia.log.1`, `hirevia.log.2`, and subsequent backups.
+- Configuration edits use temporary `.tmp` files and atomic replacement; the API keeps `.bak` copies. A failed write removes its temporary file.
+- Telegram logout explicitly removes the Telegram `.session` file and its SQLite sidecars. Ordinary worker or API shutdown preserves the session.
+- Python may create `__pycache__` bytecode files during imports. OneDrive may also create transient sync metadata; this investigation did not capture a historical file event, so a specific past creator cannot be attributed from the current filesystem alone.
 
 ## Security
 

@@ -334,18 +334,18 @@ def test_systemd_web_lifespan_never_spawns_or_supervises_worker(
 
     async def run_lifespan():
         async with web_main.lifespan(web_main.app):
-            assert state.worker_controller.spawn_enabled is False
-            assert [call[0] for call in calls] == ["init"]
+            assert state.worker_controller is None
+            assert calls == []
 
     try:
         asyncio.run(run_lifespan())
-        assert [call[0] for call in calls] == ["init"]
+        assert calls == []
     finally:
         web_state._web_state = None
         web_state.WebUIState._instance = None
 
 
-def test_local_web_restarts_reuse_worker_without_stopping_it(monkeypatch, tmp_path):
+def test_local_web_lifespan_does_not_start_or_restart_worker(monkeypatch, tmp_path):
     monkeypatch.delenv("HIREVIA_WORKER_MODE", raising=False)
     monkeypatch.delenv("HIREVIA_WORKER_MANAGED", raising=False)
     web_state._web_state = None
@@ -354,44 +354,25 @@ def test_local_web_restarts_reuse_worker_without_stopping_it(monkeypatch, tmp_pa
         Config(), JobRepository(tmp_path / "local-web.db")
     )
     state.external_worker = True
-    worker = {"alive": False, "spawn_count": 0}
-    controllers = []
+    worker = {"alive": True, "spawn_count": 1}
 
-    class LocalController:
+    class ForbiddenController:
         def __init__(self, repo):
-            self.repo = repo
-            self.spawn_enabled = True
-            self.ensure_calls = 0
-            self.supervisor_started = False
-            controllers.append(self)
+            raise AssertionError("web lifespan must not create a worker controller")
 
-        async def ensure_running(self, *, spawn_if_missing=None):
-            self.ensure_calls += 1
-            if not worker["alive"]:
-                assert spawn_if_missing is True
-                worker["alive"] = True
-                worker["spawn_count"] += 1
-            return {"alive": True, "status": "RUNNING"}
-
-        async def supervise(self, stop_event):
-            self.supervisor_started = True
-            await stop_event.wait()
-
-    monkeypatch.setattr("hirevia.worker_process.WorkerProcessController", LocalController)
+    monkeypatch.setattr("hirevia.worker_process.WorkerProcessController", ForbiddenController)
     monkeypatch.setattr(web_main, "get_web_state", lambda: state)
 
     async def run_web_lifespans():
         for _ in range(2):
             async with web_main.lifespan(web_main.app):
                 await asyncio.sleep(0)
-                assert state.worker_controller.supervisor_started is True
+                assert state.worker_controller is None
                 assert worker["alive"] is True
 
     try:
         asyncio.run(run_web_lifespans())
         assert worker == {"alive": True, "spawn_count": 1}
-        assert len(controllers) == 2
-        assert all(controller.ensure_calls == 1 for controller in controllers)
     finally:
         web_state._web_state = None
         web_state.WebUIState._instance = None

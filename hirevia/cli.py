@@ -8,8 +8,9 @@ import os
 from logging.handlers import RotatingFileHandler
 import re
 import socket
+import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -31,7 +32,7 @@ from hirevia.core.models import CandidateProfile, Job, ScanStats
 from hirevia.core.pipeline import Pipeline, run_single_scan
 from hirevia.core.verification import classify_application_url
 from hirevia.core.freshness import freshness_label
-from hirevia.storage.state import JobRepository
+from hirevia.storage.state import JobRepository, resolve_database_path
 from hirevia.web.state import initialize_web_state
 
 console = Console()
@@ -312,7 +313,7 @@ def _run_web_service(host: Optional[str] = None, port: Optional[int] = None) -> 
             f"Port {port} is already occupied; set HIREVIA_PORT to another port"
         )
 
-    repo = JobRepository(Path(os.getenv("HIREVIA_DB_PATH", "hirevia.db")))
+    repo = JobRepository(resolve_database_path())
     matcher = _build_ai_matcher(config)
     state = initialize_web_state(config, repo, matcher)
     state.external_worker = True
@@ -340,9 +341,12 @@ def web(host: Optional[str], port: Optional[int]) -> None:
     run_service(host, port)
 
 
-@cli.command("worker")
-def worker_service() -> None:
-    """Run the independently supervised Telegram monitor worker."""
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def worker(ctx) -> None:
+    """Manage the independent worker, or run it in the foreground."""
+    if ctx.invoked_subcommand is not None:
+        return
     configure_logging()
     from hirevia.worker import run_worker
 
@@ -354,12 +358,168 @@ def worker_service() -> None:
         raise click.ClickException(f"Worker exited with status {exit_code}")
 
 
+def _worker_controller(*, spawn_enabled: Optional[bool] = None):
+    from hirevia.worker_process import WorkerProcessController
+
+    return WorkerProcessController(
+        JobRepository(resolve_database_path()), spawn_enabled=spawn_enabled
+    )
+
+
+def _worker_uptime(started_at: Optional[str]) -> str:
+    if not started_at:
+        return "unknown"
+    try:
+        started = datetime.fromisoformat(started_at)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        seconds = max(0, int((now - started).total_seconds()))
+    except (TypeError, ValueError):
+        return "unknown"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{days}d {hours:02}:{minutes:02}:{seconds:02}"
+
+
+def _print_worker_status(runtime, db_path: Path) -> None:
+    from hirevia.worker_process import get_process_executable_path
+
+    pid = runtime.get("pid")
+    alive = bool(runtime.get("alive"))
+    console.print(f"Database: {db_path}")
+    console.print(f"Worker: {'RUNNING' if alive else runtime.get('status', 'STOPPED')}")
+    if pid is not None:
+        console.print(f"PID: {pid}")
+        executable = get_process_executable_path(pid) if alive else None
+        console.print(f"Executable: {executable or 'not available'}")
+        if alive:
+            console.print(f"Uptime: {_worker_uptime(runtime.get('started_at'))}")
+        else:
+            console.print("Lease PID is stale; no process was signaled")
+    console.print(f"Monitor: {runtime.get('monitor_status', 'STOPPED')}")
+    if runtime.get("last_error"):
+        console.print(f"Last error: {runtime['last_error']}")
+
+
+@worker.command("start")
+def worker_start() -> None:
+    """Start a background worker explicitly."""
+    configure_logging()
+    controller = _worker_controller()
+    try:
+        runtime = asyncio.run(controller.ensure_running(spawn_if_missing=True))
+    except Exception as error:
+        raise click.ClickException(f"Worker could not start: {error}") from error
+    _print_worker_status(runtime, controller.repo.db_path)
+    if runtime.get("already_running"):
+        console.print("Existing worker retained; no second process was started")
+
+
+@worker.command("status")
+def worker_status() -> None:
+    """Show the database lease and worker process identity."""
+    repo = JobRepository(resolve_database_path())
+    _print_worker_status(repo.get_worker_runtime(), repo.db_path)
+
+
+@worker.command("stop")
+def worker_stop() -> None:
+    """Request graceful worker shutdown through its durable command queue."""
+    controller = _worker_controller(spawn_enabled=False)
+    try:
+        result = asyncio.run(controller.shutdown_worker())
+    except Exception as error:
+        raise click.ClickException(f"Worker did not stop cleanly: {error}") from error
+    console.print("Worker is stopped" if not result.get("already_stopped") else "Worker was already stopped")
+    console.print(f"Database: {controller.repo.db_path}")
+
+
+@worker.command("restart")
+def worker_restart() -> None:
+    """Gracefully stop the worker, then start one replacement."""
+    configure_logging()
+    controller = _worker_controller()
+
+    async def restart():
+        await controller.shutdown_worker()
+        return await controller.ensure_running(spawn_if_missing=True)
+
+    try:
+        runtime = asyncio.run(restart())
+    except Exception as error:
+        raise click.ClickException(f"Worker restart failed: {error}") from error
+    _print_worker_status(runtime, controller.repo.db_path)
+
+
 @cli.command()
-@click.option("--db-path", default="hirevia.db", help="SQLite database path")
+@click.option("--host", default=None, help="API bind address (or HIREVIA_HOST)")
+@click.option("--port", type=int, default=None, help="API port (or HIREVIA_PORT)")
+def doctor(host: Optional[str], port: Optional[int]) -> None:
+    """Read-only checks for the database, worker lease, and local API."""
+    from hirevia.worker_process import get_process_executable_path
+
+    database_path = resolve_database_path()
+    console.print(f"Database: {database_path}")
+    if not database_path.is_file():
+        console.print("Database: MISSING (no file was created)")
+    else:
+        connection = None
+        try:
+            uri = f"{database_path.as_uri()}?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=5)
+            integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            runtime = None
+            if "worker_runtime" in tables:
+                runtime = connection.execute(
+                    "SELECT pid, status, monitor_status, started_at "
+                    "FROM worker_runtime WHERE singleton = 1"
+                ).fetchone()
+            console.print(f"Database integrity: {integrity}")
+            console.print(f"SQLite journal mode: {journal_mode}")
+            if runtime and runtime[0] is not None:
+                pid, status, monitor_status, started_at = runtime
+                alive = JobRepository._pid_is_alive(pid)
+                console.print(
+                    f"Worker lease: PID {pid}, {status}, "
+                    f"{'alive' if alive else 'stale PID'}"
+                )
+                if alive:
+                    console.print(
+                        f"Worker executable: {get_process_executable_path(pid) or 'not available'}"
+                    )
+                console.print(f"Monitor: {monitor_status}; uptime {_worker_uptime(started_at)}")
+            else:
+                console.print("Worker lease: no active worker")
+        except (OSError, sqlite3.Error, TypeError) as error:
+            console.print(f"Database check failed: {type(error).__name__}: {error}")
+        finally:
+            if connection is not None:
+                connection.close()
+
+    host = host or os.getenv("HIREVIA_HOST", "127.0.0.1")
+    port = port or int(os.getenv("HIREVIA_PORT", "8000"))
+    owner = _port_owner(host, port)
+    if owner == "hirevia-web":
+        console.print(f"API: listening at http://{host}:{port}")
+    elif owner is None:
+        console.print(f"API: not listening on {host}:{port} (port is available)")
+    else:
+        console.print(f"API port: occupied by {owner} on {host}:{port}")
+
+
+@cli.command()
+@click.option("--db-path", default=None, help="SQLite database path (or HIREVIA_DB_PATH)")
 @click.option("--interval", default=30, help="Scan interval in minutes")
 @click.option("--no-ai", is_flag=True, help="Run without AI matching")
 @click.option("--verbose", is_flag=True, help="Show per-job and provider diagnostics")
-def start(db_path: str, interval: int, no_ai: bool, verbose: bool):
+def start(db_path: Optional[str], interval: int, no_ai: bool, verbose: bool):
     """Start continuous scanning."""
     configure_logging(verbose)
     console.print("[bold green]Starting Hirevia 2.0...[/bold green]")
@@ -370,13 +530,13 @@ def start(db_path: str, interval: int, no_ai: bool, verbose: bool):
 
     # Get API keys at runtime
     # Initialize components
-    repo = JobRepository(Path(db_path))
+    repo = JobRepository(Path(db_path) if db_path else None)
     ai_matcher = _build_ai_matcher(config, no_ai)
     if not ai_matcher and not no_ai:
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
     console.print("[green]Configuration loaded[/green]")
     console.print(f"Enabled sources: {', '.join(config.sources.get_enabled_sources())}")
-    console.print(f"Database: {db_path}")
+    console.print(f"Database: {repo.db_path}")
     console.print(f"Scan interval: {interval} minutes")
     console.print(f"AI matching: {'on (' + config.nvidia_model + ')' if ai_matcher else 'off'}")
 
@@ -402,7 +562,7 @@ def start(db_path: str, interval: int, no_ai: bool, verbose: bool):
 
 
 @cli.command()
-@click.option("--db-path", default="hirevia.db", help="SQLite database path")
+@click.option("--db-path", default=None, help="SQLite database path (or HIREVIA_DB_PATH)")
 @click.option("--no-ai", is_flag=True, help="Run without AI matching")
 @click.option("--verbose", is_flag=True, help="Show per-job and provider diagnostics")
 @click.option(
@@ -411,7 +571,7 @@ def start(db_path: str, interval: int, no_ai: bool, verbose: bool):
     help="Print normalized Telegram jobs grouped by channel",
 )
 def scan(
-    db_path: str,
+    db_path: Optional[str],
     no_ai: bool,
     verbose: bool,
     diagnostic: bool,
@@ -420,7 +580,7 @@ def scan(
     configure_logging(verbose)
 
     config = load_config()
-    repo = JobRepository(Path(db_path))
+    repo = JobRepository(Path(db_path) if db_path else None)
     ai_matcher = _build_ai_matcher(config, no_ai)
     if not ai_matcher and not no_ai:
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
@@ -450,11 +610,11 @@ def scan(
 
 
 @cli.command()
-@click.option("--db-path", default="hirevia.db", help="SQLite database path")
+@click.option("--db-path", default=None, help="SQLite database path (or HIREVIA_DB_PATH)")
 @click.option("--no-ai", is_flag=True, help="Run without AI matching")
 @click.option("--verbose", is_flag=True, help="Show per-job and provider diagnostics")
 def monitor(
-    db_path: str,
+    db_path: Optional[str],
     no_ai: bool,
     verbose: bool,
 ):
@@ -469,7 +629,7 @@ def monitor(
     for name, source_config in monitor_config.sources.sources.items():
         source_config.enabled = name == "telegram" and source_config.enabled
 
-    repo = JobRepository(Path(db_path))
+    repo = JobRepository(Path(db_path) if db_path else None)
     ai_matcher = _build_ai_matcher(config, no_ai)
     if not ai_matcher and not no_ai:
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
@@ -551,10 +711,10 @@ def monitor(
 
 
 @cli.command()
-@click.option("--db-path", default="hirevia.db", help="SQLite database path")
-def stats(db_path: str):
+@click.option("--db-path", default=None, help="SQLite database path (or HIREVIA_DB_PATH)")
+def stats(db_path: Optional[str]):
     """Show database statistics."""
-    repo = JobRepository(Path(db_path))
+    repo = JobRepository(Path(db_path) if db_path else None)
     stats = repo.get_stats()
 
     console.print("\n[bold]Database Statistics[/bold]")
@@ -593,11 +753,11 @@ def stats(db_path: str):
 
 
 @cli.command()
-@click.option("--db-path", default="hirevia.db", help="SQLite database path")
+@click.option("--db-path", default=None, help="SQLite database path (or HIREVIA_DB_PATH)")
 @click.option("--limit", default=20, help="Number of recent jobs to show")
-def status(db_path: str, limit: int):
+def status(db_path: Optional[str], limit: int):
     """Show recent jobs and their status."""
-    repo = JobRepository(Path(db_path))
+    repo = JobRepository(Path(db_path) if db_path else None)
     jobs = repo.get_recent_jobs(hours=168, limit=limit)
 
     if not jobs:

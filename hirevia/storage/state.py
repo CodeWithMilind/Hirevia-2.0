@@ -163,15 +163,35 @@ END;
 """
 
 
+def resolve_database_path(db_path: Optional[Path] = None) -> Path:
+    """Return the one absolute database path shared by CLI and worker processes."""
+    configured_path = db_path
+    if configured_path is None:
+        configured_path = os.getenv("HIREVIA_DB_PATH")
+    if configured_path is None:
+        try:
+            from dotenv import dotenv_values
+
+            configured_path = dotenv_values(Path.cwd() / ".env").get(
+                "HIREVIA_DB_PATH"
+            )
+        except (ImportError, OSError, UnicodeError):
+            configured_path = None
+    return Path(configured_path or "hirevia.db").expanduser().resolve()
+
+
 class JobRepository:
-    def __init__(self, db_path: Path):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: Optional[Path] = None, *, initialize: bool = True):
+        self.db_path = resolve_database_path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        if initialize:
+            self._init_db()
 
     def _init_db(self):
         with self._get_conn() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(journal_mode).lower() != "wal":
+                conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(SCHEMA)
             conn.executescript(TRIGGERS)
