@@ -28,6 +28,6 @@ ai:
       api_key_env: LLAMACPP_API_KEY
 
 matching:
-  p1_threshold: 85
-  p2_threshold: 65
-  p3_threshold: 40
+  p1_threshold: 70
+  p2_threshold: 40
+  p3_threshold: 1

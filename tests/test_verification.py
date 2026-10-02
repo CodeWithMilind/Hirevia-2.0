@@ -73,15 +73,39 @@ def test_verified_open_application_is_actionable():
 
 
 def test_definitively_missing_application_is_closed_and_unusable():
-    client = FakeHTTPClient(404)
+    client = FakeHTTPClient(404, get_status=404)
 
     status, quality = asyncio.run(verify_application(make_job(), client=client))
 
     assert status is ApplicationStatus.CLOSED
     assert quality.usable is False
+    assert [method for method, _ in client.calls] == ["HEAD", "GET"]
 
 
-@pytest.mark.parametrize("status_code", [401, 403, 429, 503])
+def test_head_404_followed_by_open_get_stays_open():
+    client = FakeHTTPClient(404, get_status=200)
+
+    status, quality = asyncio.run(verify_application(make_job(), client=client))
+
+    assert status is ApplicationStatus.OPEN
+    assert quality.usable is True
+    assert [method for method, _ in client.calls] == ["HEAD", "GET"]
+
+
+def test_generic_host_404_does_not_confirm_expiration():
+    client = FakeHTTPClient(404, get_status=404)
+
+    status, quality = asyncio.run(
+        verify_application(make_job("https://example.com/test-p1"), client=client)
+    )
+
+    assert status is ApplicationStatus.UNKNOWN
+    assert quality.usable is True
+    assert "unrecognised" in quality.reason
+    assert [method for method, _ in client.calls] == ["HEAD", "GET"]
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 429, 451, 503])
 def test_protected_or_temporary_status_is_unknown_without_extra_probe(status_code):
     client = FakeHTTPClient(status_code, get_status=200)
 

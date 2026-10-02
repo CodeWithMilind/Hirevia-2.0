@@ -141,7 +141,8 @@ async def verify_application(
     """Return (ApplicationStatus, UrlQuality) for one job.
 
     Conservative by design: an unreachable or protected page stays UNKNOWN and
-    only a definitive 404/410/451 marks the application CLOSED.
+    a confirmed 404 from a recognised application host or a 410 marks the
+    application CLOSED. Generic 404s and 451 restrictions stay UNKNOWN.
     """
     url = str(job.application_url) if job.application_url else None
     quality = classify_application_url(url)
@@ -163,7 +164,7 @@ async def verify_application(
         try:
             response = await client.head(url)
             status_code = response.status_code
-            if status_code in (405, 500, 501):
+            if status_code in (404, 405, 500, 501):
                 response = await client.get(url)
                 status_code = response.status_code
         except Exception as e:  # timeout / DNS / connection reset: undetermined
@@ -178,9 +179,24 @@ async def verify_application(
             except Exception:
                 pass
 
-    if status_code in (404, 410, 451):
+    if status_code == 410:
         return ApplicationStatus.CLOSED, UrlQuality(
             quality.quality, False, 0, f"application page gone (HTTP {status_code})"
+        )
+    if status_code == 404:
+        if quality.quality in {"ats", "company", "job_board"}:
+            return ApplicationStatus.CLOSED, UrlQuality(
+                quality.quality, False, 0,
+                "application page returned confirmed HTTP 404",
+            )
+        return ApplicationStatus.UNKNOWN, UrlQuality(
+            quality.quality, True, quality.confidence,
+            "HTTP 404 from an unrecognised application host; availability is unconfirmed",
+        )
+    if status_code == 451:
+        return ApplicationStatus.UNKNOWN, UrlQuality(
+            quality.quality, True, quality.confidence,
+            "application page is legally restricted (HTTP 451); availability is unconfirmed",
         )
     if status_code in (401, 403, 429):
         return ApplicationStatus.UNKNOWN, UrlQuality(

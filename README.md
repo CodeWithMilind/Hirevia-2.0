@@ -113,6 +113,20 @@ preferred_locations:
   - Remote
 ```
 
+## Matching Scores
+
+Skill coverage is calculated from unique, role-relevant technical skills found in each job description:
+
+```text
+JD skill coverage = matched JD skills / total relevant JD skills * 100
+```
+
+Additional skills in a candidate profile do not enter the denominator. Aliases such as `ML`/`Machine Learning`, `GenAI`/`Generative AI`, `RESTful API`/`REST API`, `PostgreSQL`/`Postgres`, and retrieval-augmented generation/`RAG` count once. Recognized soft skills do not count as technical coverage. Explicitly optional or preferred skills have half the skill weight of mandatory requirements.
+
+Role-aware extraction uses distinct skill pools for backend engineering, data science, data analysis, and AI engineering. The JD coverage percentage is shown separately from overall compatibility; it does not independently decide whether a job matches. The deterministic score combines skills (45 points), role (18), location (12), experience (10), work mode (8), employment (4), and company (3). When AI assessment is available, the final score is `round(deterministic * (1 - ai_match_weight) + ai_score * ai_match_weight)`; an AI `relevant=false` assessment incurs the existing 12-point penalty, and hard vetoes remain decisive. `match_min_score` independently gates the boolean match decision, and alert eligibility still checks application quality, freshness, and notification score thresholds.
+
+The shared configurable score cutoffs default to P1 at 70+, P2 at 40-69, P3 above 0 and below 40, and Unmatched at 0. They classify both JD coverage and the final overall score. Configure them in `ai.yaml` under `matching` or through `MATCHING_P1_THRESHOLD`, `MATCHING_P2_THRESHOLD`, and `MATCHING_P3_THRESHOLD`. The final priority is calculated from the final overall score, not the AI-provided tier. Alerts, the dashboard, and CLI priority summaries use the final overall verdict; JD coverage is an additional signal.
+
 ## Running
 
 ### Start the command center

@@ -32,8 +32,15 @@ from hirevia.core.models import (
     MatchResult,
     Priority,
 )
+from hirevia.core.classification import (
+    DEFAULT_P1_THRESHOLD,
+    DEFAULT_P2_THRESHOLD,
+    DEFAULT_P3_THRESHOLD,
+    classify_score,
+)
 from hirevia.core.skills import (
     canonical_set,
+    extract_jd_skills,
     find_skills,
     normalize_skill,
     skill_in_text,
@@ -356,6 +363,12 @@ class MatchEvidence:
     missing_skills: List[str] = field(default_factory=list)
     transferable: List[Tuple[str, str]] = field(default_factory=list)
     job_skills: List[str] = field(default_factory=list)
+    jd_skill_coverage: Optional[float] = None
+    jd_skill_weighted_coverage: Optional[float] = None
+    jd_skill_total_count: int = 0
+    jd_skill_matched_count: int = 0
+    missing_mandatory_skills: List[str] = field(default_factory=list)
+    missing_optional_skills: List[str] = field(default_factory=list)
     experience_match: Optional[bool] = None
     location_match: Optional[bool] = None
     role_match: Optional[bool] = None
@@ -400,7 +413,8 @@ def analyze(job: Job, profile: CandidateProfile) -> MatchEvidence:
     evidence.text = text
     evidence.job_skills = job_skills(job)
 
-    _score_skills(profile, text, evidence, getattr(job, "title", ""))
+    jd_text = "\n".join([job.title, job.description or "", *(job.skills or [])])
+    _score_skills(profile, jd_text, evidence, getattr(job, "title", ""))
     _score_role(job, profile, evidence)
     _score_experience(profile, text, evidence)
     _score_location(job, profile, evidence)
@@ -416,6 +430,7 @@ def analyze(job: Job, profile: CandidateProfile) -> MatchEvidence:
 # --------------------------------------------------------------------------
 
 def _profile_skills(profile: CandidateProfile) -> List[str]:
+    """Return the candidate's unique canonical skills for compatibility callers."""
     seen, out = set(), []
     for skill in profile.skills:
         canonical = normalize_skill(skill)
@@ -425,136 +440,51 @@ def _profile_skills(profile: CandidateProfile) -> List[str]:
     return out
 
 
-# Role-specific skill pools keep unrelated profile skills out of a job's
-# denominator. The pools are intersected with skills actually present in the
-# candidate profile, so this does not invent candidate skills.
-ROLE_SKILL_POOLS: Dict[str, List[str]] = {
-    "python_backend": [
-        "Python", "FastAPI", "Flask", "Django", "SQL", "MySQL",
-        "PostgreSQL", "MongoDB", "REST API", "Git", "Docker",
-    ],
-    "ai_ml": [
-        "Python", "Machine Learning", "Deep Learning",
-        "Artificial Intelligence", "TensorFlow", "PyTorch",
-        "NumPy", "Pandas",
-    ],
-    "data_scientist": [
-        "Python", "Machine Learning", "Deep Learning",
-        "Artificial Intelligence", "Data Analysis", "Pandas",
-        "NumPy", "TensorFlow", "PyTorch", "SQL",
-    ],
-    "data_analyst": [
-        "Python", "SQL", "Data Analysis", "Pandas", "NumPy",
-        "Power BI", "Excel",
-    ],
-    "full_stack": [
-        "JavaScript", "React", "Node.js", "Python", "SQL",
-        "MySQL", "PostgreSQL", "MongoDB", "REST API", "Git",
-    ],
-    "devops": ["Python", "AWS", "Azure", "Docker", "Git"],
-    "qa": ["Python", "Selenium", "Testing", "Java", "SQL"],
-}
-
-
-def _role_skill_families(job_title: str) -> List[str]:
-    """Infer relevant skill families from the job title, not its full description."""
-    title = re.sub(r"[^a-z0-9+#.]+", " ", str(job_title or "").lower()).strip()
-    families: List[str] = []
-
-    # Specific data roles must be checked before the broader AI/ML family.
-    if "data analyst" in title or "bi analyst" in title or "business intelligence analyst" in title:
-        families.append("data_analyst")
-    elif "data scientist" in title or "data science" in title:
-        families.append("data_scientist")
-
-    if any(term in title for term in (
-        "machine learning", " ml ", " ai ", "ai engineer",
-        "artificial intelligence", "deep learning", "genai",
-        "generative ai", "llm", "nlp",
-    )):
-        families.append("ai_ml")
-
-    if any(term in title for term in (
-        "backend", "back end", "back-end", "python developer",
-        "api developer", "server side", "server-side",
-    )):
-        families.append("python_backend")
-
-    if any(term in title for term in (
-        "full stack", "fullstack", "full-stack", "frontend",
-        "front end", "front-end", "web developer",
-    )):
-        families.append("full_stack")
-
-    if any(term in title for term in (
-        "devops", "sre", "site reliability", "platform engineer",
-        "cloud engineer", "infrastructure engineer",
-    )):
-        families.append("devops")
-
-    if any(term in title for term in (
-        "qa", "quality assurance", "test engineer", "software tester",
-    )):
-        families.append("qa")
-
-    # Preserve order while removing duplicates.
-    return list(dict.fromkeys(families))
-
-
-def _skills_for_job(profile: CandidateProfile, job_title: str) -> List[str]:
-    """Return only declared profile skills relevant to the detected job family."""
-    all_skills = _profile_skills(profile)
-    families = _role_skill_families(job_title)
-    if not families:
-        # Unknown/generic titles retain the previous all-profile-skills behavior.
-        return all_skills
-
-    relevant = {
-        normalize_skill(skill)
-        for family in families
-        for skill in ROLE_SKILL_POOLS.get(family, [])
-    }
-    return [skill for skill in all_skills if skill in relevant]
-
-
 def _score_skills(
     profile: CandidateProfile,
     text: str,
     evidence: MatchEvidence,
     job_title: str = "",
 ) -> None:
-    wanted = _skills_for_job(profile, job_title)
-    if not wanted:
-        evidence.add("skills", NEUTRAL, "profile declares no skills - skill relevance is neutral")
+    jd_text = "\n".join((job_title or "", text, *evidence.job_skills))
+    requirements = extract_jd_skills(jd_text, job_title)
+    if not requirements:
+        evidence.add("skills", NEUTRAL, "no technical skills stated in the job description")
         return
 
-    matched = find_skills(text, wanted)
-    missing = [skill for skill in wanted if skill not in matched]
+    candidate_skills = canonical_set(profile.skills)
+    wanted = [skill for skill, _ in requirements]
+    matched = [skill for skill in wanted if skill in candidate_skills]
+    missing = [skill for skill in wanted if skill not in candidate_skills]
+    required = [skill for skill, is_mandatory in requirements if is_mandatory]
+    optional = [skill for skill, is_mandatory in requirements if not is_mandatory]
+    missing_required = [skill for skill in required if skill in missing]
+    missing_optional = [skill for skill in optional if skill in missing]
+    evidence.jd_skill_total_count = len(requirements)
+    evidence.jd_skill_matched_count = len(matched)
+    evidence.jd_skill_coverage = len(matched) / len(requirements) * 100
+    total_weight = sum(2 if is_mandatory else 1 for _, is_mandatory in requirements)
+    matched_weight = sum(
+        2 if is_mandatory else 1
+        for skill, is_mandatory in requirements
+        if skill in candidate_skills
+    )
+    evidence.jd_skill_weighted_coverage = matched_weight / total_weight * 100
+    evidence.missing_mandatory_skills = missing_required
+    evidence.missing_optional_skills = missing_optional
     evidence.matched_skills = matched
     evidence.missing_skills = missing[:MAX_SKILLS_SHOWN]
 
     # Transferable evidence: the posting wants something in a family the
     # candidate already works in (job wants Django, candidate has FastAPI).
-    pairs = transferable_matches(missing, evidence.job_skills + matched)
+    pairs = transferable_matches(missing, candidate_skills)
     evidence.transferable = pairs[:6]
 
-    if not matched:
-        share = min(0.35, TRANSFERABLE_CREDIT * len(pairs)) if pairs else 0.0
-        note = (
-            "no profile skill mentioned"
-            if not pairs
-            else "no direct hit, but " + ", ".join(f"{have} ~ {wants}" for wants, have in pairs[:2])
-        )
-        evidence.add("skills", share, note)
-        return
-
-    ratio = len(matched) / len(wanted)
-    strength = max(ratio, min(1.0, len(matched) / 3))  # 3 real hits = full credit
     bonus = TRANSFERABLE_CREDIT * min(1.0, len(pairs) / 2)
     evidence.add(
         "skills",
-        min(1.0, strength + bonus),
-        f"{len(matched)}/{len(wanted)} profile skills mentioned: {', '.join(matched[:6])}"
+        min(1.0, evidence.jd_skill_weighted_coverage / 100 + bonus),
+        f"{len(matched)}/{len(wanted)} JD skills matched ({evidence.jd_skill_coverage:.1f}% coverage)"
         + (f" (+{len(pairs)} transferable)" if pairs else ""),
     )
 
@@ -870,13 +800,13 @@ def _education_signal(profile: CandidateProfile, text: str, evidence: MatchEvide
 # --------------------------------------------------------------------------
 
 def priority_for(score: int, config=None) -> Priority:
-    p1 = getattr(config, "priority_p1_min_score", 80)
-    p2 = getattr(config, "priority_p2_min_score", 62)
-    if score >= p1:
-        return Priority.P1
-    if score >= p2:
-        return Priority.P2
-    return Priority.P3
+    classification = classify_score(
+        score,
+        getattr(config, "priority_p1_min_score", DEFAULT_P1_THRESHOLD),
+        getattr(config, "priority_p2_min_score", DEFAULT_P2_THRESHOLD),
+        getattr(config, "priority_p3_min_score", DEFAULT_P3_THRESHOLD),
+    )
+    return Priority.P3 if classification == "Unmatched" else Priority(classification)
 
 
 def combine(
@@ -936,14 +866,7 @@ def combine(
         score if score is not None else deterministic, config
     )
     if status != "ok" and priority is Priority.P1:
-        priority = Priority.P2  # no model confirmation -> never the top banner
-    elif status == "ok":
-        # The model's own tier acts as a ceiling, never a floor: maths may say
-        # P1, but if the model called it P3 we do not escalate it to P1.
-        rank = {Priority.P1: 1, Priority.P2: 2, Priority.P3: 3}
-        if rank[ai.priority] > rank[priority]:
-            priority = ai.priority
-
+        priority = Priority.P2  # an unconfirmed assessment cannot receive the top banner
     matched, missing = _reconcile_skills(evidence, ai if status == "ok" else None)
 
     reason = evidence.reason()
@@ -955,6 +878,14 @@ def combine(
     raw_model = (ai.raw_data or {}).get("model") if ai is not None else None
     model = ai_model or (str(raw_model) if raw_model else None)
     signals: Dict[str, Any] = dict(evidence.signals)
+    signals["jd_skill_coverage"] = {
+        "matched": evidence.jd_skill_matched_count,
+        "total": evidence.jd_skill_total_count,
+        "percentage": evidence.jd_skill_coverage,
+        "weighted_percentage": evidence.jd_skill_weighted_coverage,
+        "missing_mandatory": evidence.missing_mandatory_skills,
+        "missing_optional": evidence.missing_optional_skills,
+    }
     signals["total_deterministic"] = deterministic
     signals["weighting"] = {"ai": round(ai_weight, 2), "deterministic": round(1 - ai_weight, 2)}
     signals["transferable"] = [f"{have} ~ {wants}" for wants, have in evidence.transferable]
@@ -1040,6 +971,9 @@ def evidence_prompt_block(evidence: MatchEvidence) -> str:
         f"location_score: {location_score}/{WEIGHTS['location']}",
         f"your_skills_mentioned_in_posting: {', '.join(evidence.matched_skills) or 'none'}",
         f"your_skills_not_mentioned: {', '.join(evidence.missing_skills[:10]) or 'none'}",
+        f"jd_skill_coverage: {evidence.jd_skill_matched_count}/{evidence.jd_skill_total_count} "
+        f"({evidence.jd_skill_coverage if evidence.jd_skill_coverage is not None else 'unscored'}%)",
+        f"missing_mandatory_skills: {', '.join(evidence.missing_mandatory_skills[:10]) or 'none'}",
         f"skills_named_in_posting: {', '.join(evidence.job_skills[:12]) or 'not detectable'}",
         f"work_mode: {evidence.remote_mode or 'unstated'}",
         "transferable_evidence: "

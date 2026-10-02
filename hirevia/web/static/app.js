@@ -98,10 +98,13 @@ function jobCard(job) {
   card.append(details);
 
   const side = node("div", "job-side");
-  const scoreLabel = job.matching_method === "yaml_keyword"
-    ? typeof job.match_score === "number" ? `${job.match_score.toFixed(1)}% keyword match` : "Unscored · no keywords"
-    : typeof job.match_score === "number" ? `${job.match_score}% legacy assessment` : `${job.assessment_status || "unscored"} assessment`;
+  const scoreLabel = typeof job.match_score === "number"
+    ? `${job.match_score}% overall match`
+    : `${job.assessment_status || "unscored"} assessment`;
   side.append(node("span", "match-score", scoreLabel));
+  if (typeof job.keyword_match_percentage === "number") {
+    side.append(node("span", "match-status", `JD skills ${job.keyword_match_percentage.toFixed(1)}%`));
+  }
   if (["unmatched", "pending", "retrying", "failed"].includes(job.match_status)) {
     side.append(node("span", `match-status ${job.match_status}`, job.match_status));
   }
@@ -236,6 +239,8 @@ function showJob(job) {
     ["Match status", job.match_status], ["Priority", job.match_priority],
     ["Matching method", job.matching_method],
     ["Keyword match", typeof job.keyword_match_percentage === "number" ? `${job.keyword_match_percentage.toFixed(1)}%` : "Unscored"],
+    ["Weighted JD skill fit", typeof job.keyword_weighted_match_percentage === "number" ? `${job.keyword_weighted_match_percentage.toFixed(1)}%` : "Unscored"],
+    ["JD coverage class", job.keyword_priority],
     ["Matched keyword count", `${job.matched_keyword_count} / ${job.total_keyword_count}`],
     ["Assessment status", job.assessment_status],
     ["Final score", typeof job.match_score === "number" ? `${job.match_score}%` : "—"],
@@ -262,7 +267,9 @@ function showJob(job) {
   }
   for (const [label, values] of [
     ["Matched keywords", job.matched_keywords],
-    ["Unmatched configured keywords", job.unmatched_keywords],
+    ["Missing JD skills", job.unmatched_keywords],
+    ["Missing mandatory JD skills", job.missing_mandatory_keywords],
+    ["Missing optional JD skills", job.missing_optional_keywords],
     ["Matched skills", job.matched_skills],
     ["Missing skills", job.missing_skills],
     ["AI rejection reasons", job.ai_rejection_reasons],
@@ -371,7 +378,6 @@ async function loadTelegram() {
 }
 
 async function initializeTelegramStartup() {
-  setActiveView("telegram", false);
   await loadTelegram();
 }
 

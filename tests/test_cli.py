@@ -228,7 +228,7 @@ def test_scan_prints_jobs_sequentially_after_processing(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     ("score", "expected"),
-    [(81, "P1"), (80, "P2"), (51, "P2"), (50, "P3"), (21, "P3"), (20, "No Priority")],
+    [(81, "P1"), (80, "P1"), (51, "P2"), (50, "P2"), (40, "P2"), (39, "P3"), (1, "P3"), (0, "Unmatched")],
 )
 def test_ai_progress_priority_boundaries(capsys, score, expected):
     from hirevia.cli import _make_ai_progress_reporter
@@ -561,6 +561,7 @@ def test_status_shows_freshness_and_link_verdict(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert "Fresh" in result.output and "Link" in result.output
+    assert "Match %" in result.output and "AI Score" not in result.output
     assert "fresh" in result.output and "ats" in result.output
     assert "88%" in result.output
 

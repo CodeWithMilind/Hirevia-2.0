@@ -89,6 +89,9 @@ class Pipeline:
         self.registry = SourceRegistry(config)
         self.profile = load_profile(self.config.profile_path)
         self.keyword_configuration = load_keyword_configuration(self.config.profile_path)
+        self.keyword_configuration.matching.p1_threshold = self.config.priority_p1_min_score
+        self.keyword_configuration.matching.p2_threshold = self.config.priority_p2_min_score
+        self.keyword_configuration.matching.p3_threshold = self.config.priority_p3_min_score
         self.stats = ScanStats()
         self.stats.ai_provider = getattr(ai_matcher, "provider_name", "disabled") if ai_matcher else "disabled"
         self._matcher_takes_evidence = _accepts_evidence(ai_matcher)
@@ -335,7 +338,9 @@ class Pipeline:
     async def _process_job(self, job: Job, index: int = 1, total: int = 1) -> None:
         tag = f"[{index}/{total}]"
         resume_assessment = False
-        keyword_result = match_keywords(job, self.keyword_configuration)
+        keyword_result = match_keywords(
+            job, self.keyword_configuration, candidate_skills=self.profile.skills
+        )
         job.raw_data["keyword_match"] = keyword_result.model_dump(mode="json")
 
         # Stage 3: dedup. Fingerprint catches the same posting reached through
@@ -398,7 +403,7 @@ class Pipeline:
             "%s Keyword diagnostics title=%r matched_keywords=%s matched_keyword_count=%d "
             "total_keyword_count=%d keyword_match_percentage=%s role_match=%s "
             "location_match=%s experience_compatibility=%s employment_type_match=%s "
-            "final_score=%s final_classification=%s",
+            "jd_skill_coverage=%s jd_coverage_classification=%s",
             PREFIX,
             job.title,
             keyword_result.matched_keywords,

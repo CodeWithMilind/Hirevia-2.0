@@ -44,13 +44,11 @@ def _keyword_result(job: Job) -> Optional[Dict[str, Any]]:
 
 
 def _display_priority(job: Job):
-    result = _keyword_result(job)
-    return result.get("priority") if result is not None else job.verdict().get("priority")
+    return job.verdict().get("priority")
 
 
 def _display_score(job: Job):
-    result = _keyword_result(job)
-    return result.get("match_percentage") if result is not None else job.verdict().get("match_score")
+    return job.verdict().get("match_score")
 
 
 def _match_fields(job: Job) -> Dict[str, Any]:
@@ -73,19 +71,14 @@ def _match_fields(job: Job) -> Dict[str, Any]:
                 "ok": "completed",
                 "failed": "failed",
             }.get(result.get("ai_status"), "unscored")
-    if has_keyword_result:
-        if keyword_result.get("status") == "unscored":
-            match_status = "unscored"
-        elif keyword_result.get("priority") == "Unmatched":
-            match_status = "unmatched"
-        else:
-            match_status = "matched"
-    elif matched is True:
+    if matched is True:
         match_status = "matched"
     elif matched is False:
         match_status = "unmatched"
     elif assessment_status in {"pending", "retrying", "failed"}:
         match_status = assessment_status
+    elif has_keyword_result and keyword_result.get("status") == "unscored":
+        match_status = "unscored"
     elif assessment_status == "not_required":
         match_status = "unmatched"
     else:
@@ -94,15 +87,18 @@ def _match_fields(job: Job) -> Dict[str, Any]:
         "ai_decision": job.ai_decision,
         "match_result": job.match_result,
         "match_status": match_status,
-        "match_score": keyword_result.get("match_percentage") if has_keyword_result else verdict.get("match_score"),
-        "match_priority": keyword_result.get("priority") if has_keyword_result else verdict.get("priority"),
+        "match_score": verdict.get("match_score"),
+        "match_priority": verdict.get("priority"),
         "keyword_match_result": keyword_result if has_keyword_result else None,
         "keyword_match_percentage": keyword_result.get("match_percentage") if has_keyword_result else None,
+        "keyword_weighted_match_percentage": keyword_result.get("weighted_match_percentage") if has_keyword_result else None,
         "keyword_priority": keyword_result.get("priority") if has_keyword_result else None,
         "matched_keywords": keyword_result.get("matched_keywords", []) if has_keyword_result else [],
         "unmatched_keywords": keyword_result.get("unmatched_keywords", []) if has_keyword_result else [],
         "matched_keyword_count": keyword_result.get("matched_keyword_count", 0) if has_keyword_result else 0,
         "total_keyword_count": keyword_result.get("total_keyword_count", 0) if has_keyword_result else 0,
+        "missing_mandatory_keywords": keyword_result.get("missing_mandatory_keywords", []) if has_keyword_result else [],
+        "missing_optional_keywords": keyword_result.get("missing_optional_keywords", []) if has_keyword_result else [],
         "matching_method": keyword_result.get("matching_method") if has_keyword_result else None,
         "deterministic_score": result.get("deterministic_score"),
         "ai_score": result.get("ai_score"),
@@ -911,14 +907,7 @@ class WebUIState:
             jobs = [j for j in jobs if str(_display_priority(j) or "").upper() == priority]
 
         if match_status == "unmatched":
-            jobs = [
-                j for j in jobs
-                if (
-                    _keyword_result(j).get("priority") == "Unmatched"
-                    if _keyword_result(j) is not None
-                    else j.verdict().get("match", j.verdict().get("relevant")) is False
-                )
-            ]
+            jobs = [j for j in jobs if j.verdict().get("match", j.verdict().get("relevant")) is False]
         
         if min_match is not None:
             jobs = [j for j in jobs if (_display_score(j) or 0) >= min_match]
@@ -1018,14 +1007,6 @@ class WebUIState:
         counts = {"ALL": 0, "P1": 0, "P2": 0, "P3": 0, "UNMATCHED": 0}
         for job in self.repo.get_active_jobs(hours=24, limit=1000):
             counts["ALL"] += 1
-            keyword_result = _keyword_result(job)
-            if keyword_result is not None:
-                priority = str(keyword_result.get("priority") or "").upper()
-                if priority == "UNMATCHED":
-                    counts["UNMATCHED"] += 1
-                elif priority in counts:
-                    counts[priority] += 1
-                continue
             verdict = job.verdict()
             if verdict.get("match", verdict.get("relevant")) is False:
                 counts["UNMATCHED"] += 1

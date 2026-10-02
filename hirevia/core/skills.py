@@ -21,10 +21,10 @@ SKILL_ALIASES: Dict[str, List[str]] = {
     "FastAPI": ["fastapi", "fast api", "fast api framework"],
     "Flask": ["flask", "flask framework"],
     "Django": ["django", "django framework", "django rest framework", "drf"],
-    "REST API": ["rest api", "rest APIs", "restful", "restful api", "rest", "web services", "api development"],
+    "REST API": ["rest api", "rest APIs", "restful", "restful api", "restful API", "rest", "web services", "api development"],
     "GraphQL": ["graphql", "graph ql"],
     "SQL": ["sql", "sql queries", "query writing"],
-    "PostgreSQL": ["postgresql", "postgres", "postgre sql"],
+    "Postgres": ["postgresql", "postgres", "postgre sql"],
     "MySQL": ["mysql", "my sql"],
     "MongoDB": ["mongodb", "mongo db", "mongo"],
     "Redis": ["redis"],
@@ -50,17 +50,20 @@ SKILL_ALIASES: Dict[str, List[str]] = {
     "Matplotlib": ["matplotlib", "plotting"],
     "Seaborn": ["seaborn"],
     "Natural Language Processing": ["natural language processing", "nlp", "text processing", "text mining"],
-    "Large Language Models": ["large language models", "llm", "llms", "genai", "gen ai", "generative ai", "gpt",
-                              "chatgpt", "openai api", "prompt engineering"],
+    "Large Language Models": ["large language models", "llm", "llms", "gpt", "chatgpt", "openai api", "prompt engineering"],
+    "Generative AI": ["generative ai", "genai", "gen ai"],
     "RAG": ["rag", "retrieval augmented generation", "retrieval-augmented generation"],
     "Vector Database": ["vector db", "vector database", "vector search", "pinecone", "faiss", "weaviate", "chroma"],
     "Embeddings": ["embeddings", "sentence embeddings", "word embeddings"],
     "LangChain": ["langchain", "llamaindex", "llama index", "crewai"],
     "Computer Vision": ["computer vision", "opencv", "image processing"],
     "Statistics": ["statistics", "statistical analysis"],
+    "Model Evaluation": ["model evaluation", "model validation", "model performance evaluation"],
+    "AI Agents": ["ai agents", "agentic ai", "autonomous agents"],
+    "Databases": ["database", "databases", "database systems", "database management"],
     "Probability": ["probability", "probability theory", "bayesian"],
     "Data Analysis": ["data analysis", "data analytics", "exploratory data analysis", "eda"],
-    "Data Visualization": ["data visualization", "data visualisation", "data viz"],
+    "Data Visualization": ["data visualization", "data visualisation", "data viz", "visualization", "visualisation"],
     "Power BI": ["power bi", "powerbi"],
     "Tableau": ["tableau"],
     "Excel": ["excel", "ms excel", "google sheets"],
@@ -123,7 +126,7 @@ SKILL_FAMILIES: Dict[str, Set[str]] = {
     "js_stack": {"JavaScript", "TypeScript", "React", "Next.js", "Node.js", "MERN", "MEAN"},
     "data_tooling": {"Pandas", "NumPy", "Matplotlib", "Seaborn", "Jupyter", "Excel", "Apache Spark", "Airflow", "ETL",
                     "Data Visualization", "Power BI", "Tableau"},
-    "database": {"SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "SQLite"},
+    "database": {"SQL", "Postgres", "MySQL", "MongoDB", "Redis", "SQLite"},
     "cloud": {"AWS", "GCP", "Azure"},
     "devops": {"Docker", "Kubernetes", "CI/CD", "Terraform", "Linux", "Bash", "Nginx", "Git"},
     "messaging": {"RabbitMQ", "Kafka", "Redis"},
@@ -182,6 +185,42 @@ def skill_variants(skill: str) -> List[str]:
 _TOKEN_BEFORE = r"(?<![A-Za-z0-9+#.])"
 _TOKEN_AFTER = r"(?![A-Za-z0-9+#])"
 
+_ROLE_SKILL_POOLS: Dict[str, Set[str]] = {
+    "python_backend": {
+        "Python", "FastAPI", "Flask", "Django", "REST API", "SQL", "Databases",
+        "MySQL", "Postgres", "MongoDB", "Redis", "Docker", "Git",
+    },
+    "data_scientist": {
+        "Python", "Pandas", "NumPy", "Statistics", "Machine Learning",
+        "Model Evaluation", "Scikit-learn", "SQL", "Data Analysis", "Deep Learning",
+    },
+    "data_analyst": {
+        "SQL", "Excel", "Power BI", "Pandas", "Data Visualization", "Statistics",
+        "Tableau", "Data Analysis",
+    },
+    "ai_engineer": {
+        "Python", "Machine Learning", "Large Language Models", "Generative AI", "RAG", "LangChain",
+        "Embeddings", "Vector Database", "AI Agents", "Natural Language Processing",
+        "Deep Learning", "TensorFlow", "PyTorch", "Scikit-learn",
+    },
+}
+
+_ROLE_TERMS: Dict[str, Tuple[str, ...]] = {
+    "python_backend": ("python backend", "python developer", "python engineer", "backend developer", "back end developer", "backend engineer", "back end engineer", "api developer"),
+    "data_scientist": ("data scientist", "data science"),
+    "data_analyst": ("data analyst", "business intelligence analyst", "bi analyst"),
+    "ai_engineer": ("ai engineer", "artificial intelligence engineer", "machine learning engineer", "ml engineer"),
+}
+
+_OPTIONAL_REQUIREMENT_RE = re.compile(
+    r"nice[- ]to[- ]have|preferred|preferably|desirable|optional|bonus|a plus|good to have|would be an advantage",
+    re.IGNORECASE,
+)
+_MANDATORY_REQUIREMENT_RE = re.compile(
+    r"required|requirements?|must[- ]have|must|required to|mandatory|essential|minimum|proficien(?:t|cy)|strong experience",
+    re.IGNORECASE,
+)
+
 _PATTERN_CACHE: Dict[str, "re.Pattern"] = {}
 
 
@@ -210,6 +249,51 @@ def skill_in_text(skill: str, text: str) -> bool:
     if not text or not normalize_skill(skill):
         return False
     return bool(_pattern(skill).search(text))
+
+
+def extract_jd_skills(text: str, job_title: str = "") -> List[Tuple[str, bool]]:
+    """Return unique technical skills mentioned in the JD and whether required.
+
+    Explicit optional/preferred language marks a skill optional; otherwise a
+    mentioned technical skill is treated as required. Recognized soft skills
+    are excluded from coverage.
+    """
+    title = str(job_title or "").casefold()
+    family = next(
+        (name for name, terms in _ROLE_TERMS.items() if any(term in title for term in terms)),
+        None,
+    )
+    pool = _ROLE_SKILL_POOLS.get(family) if family else None
+    candidates = [
+        skill for skill in SKILL_ALIASES
+        if pool is None or normalize_skill(skill) in pool
+    ]
+    excluded = {"communication"}
+    found: List[Tuple[str, bool]] = []
+    seen: Set[str] = set()
+    search_text = re.sub(r"(?<=\w)[-–](?=\w)", " ", text or "")
+    for skill in candidates:
+        canonical = normalize_skill(skill)
+        if not canonical or canonical in seen or canonical.casefold() in excluded:
+            continue
+        seen.add(canonical)
+        matches = list(_pattern(canonical).finditer(search_text))
+        if not matches:
+            continue
+        mandatory = True
+        for match in matches:
+            prefix = search_text[max(0, match.start() - 150):match.start()]
+            suffix = search_text[match.end():match.end() + 50]
+            boundary = re.search(r"[,.;\n]", suffix)
+            if boundary:
+                suffix = suffix[:boundary.start()]
+            optional = list(_OPTIONAL_REQUIREMENT_RE.finditer(prefix + " " + suffix))
+            required = list(_MANDATORY_REQUIREMENT_RE.finditer(prefix + " " + suffix))
+            if optional and (not required or optional[-1].start() > required[-1].start()):
+                mandatory = False
+                break
+        found.append((canonical, mandatory))
+    return found
 
 
 def find_skills(text: str, candidates: Sequence[str], cap: int = 30) -> List[str]:
@@ -258,9 +342,9 @@ def transferable_matches(missing: Sequence[str], present: Sequence[str]) -> List
 
 
 def skill_overlap(job_skills: Sequence[str], profile_skills: Sequence[str]) -> float:
-    """Fraction (0..1) of the profile skills that the job asks for."""
-    wanted = canonical_set(profile_skills)
-    if not wanted:
+    """Fraction (0..1) of the JD skills present in the candidate profile."""
+    required = canonical_set(job_skills)
+    if not required:
         return 0.0
-    offered = canonical_set(job_skills)
-    return len(wanted & offered) / len(wanted)
+    candidate = canonical_set(profile_skills)
+    return len(required & candidate) / len(required)

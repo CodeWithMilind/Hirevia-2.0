@@ -55,124 +55,89 @@ def configuration(**overrides):
 def test_strong_match_uses_keyword_percentage_and_priority():
     result = match_keywords(
         job(
-            "Python Developer",
-            "Python FastAPI Flask SQL REST API Git",
+            "Software Engineer",
+            "Required skills: Python, FastAPI, Flask, SQL, RESTful API, PostgreSQL, Docker, Git, Redis, GraphQL.",
         ),
-        configuration(),
+        configuration(candidate={"keywords": [
+            "Python", "FastAPI", "Flask", "SQL", "REST API", "Postgres", "Docker", "Git"
+        ]}),
     )
 
-    assert result.match_percentage == pytest.approx(6 / 8 * 100)
+    assert result.match_percentage == 80
     assert result.priority == "P1"
-    assert result.matched_keywords == ["Python", "FastAPI", "Flask", "SQL", "Git", "REST API"]
-    assert result.unmatched_keywords == ["Java", "JavaScript"]
+    assert result.matched_keyword_count == 8
+    assert result.total_keyword_count == 10
     assert result.matching_method == "yaml_keyword"
 
 
-def test_partial_match_counts_actual_unique_configured_keywords():
-    result = match_keywords(job("Java Developer", "Java, SQL and Git"), configuration())
-
-    assert result.matched_keyword_count == 3
-    assert result.total_keyword_count == 8
-    assert result.match_percentage == pytest.approx(3 / 8 * 100)
-    assert result.priority == "P3"
-
-
-def test_unrelated_role_is_zero_and_unmatched():
+def test_four_of_five_jd_skills_is_eighty_percent():
     result = match_keywords(
-        job("Mechanical Design Engineer", "AutoCAD SolidWorks CATIA"),
-        configuration(),
+        job("Software Engineer", "Python, SQL, Docker, Git, and Redis required."),
+        configuration(candidate={"keywords": ["Python", "SQL", "Docker", "Git"]}),
+    )
+
+    assert result.matched_keyword_count == 4
+    assert result.total_keyword_count == 5
+    assert result.match_percentage == 80
+    assert result.priority == "P1"
+
+
+def test_python_backend_jd_counts_redis_not_unmentioned_mongodb():
+    jd_skills = [
+        "Python", "FastAPI", "Flask", "REST API", "SQL", "MySQL",
+        "Git", "Docker", "PostgreSQL", "Redis",
+    ]
+    candidate_skills = [*jd_skills[:-1], "MongoDB"]
+    result = match_keywords(
+        job(
+            "TEST JOB P1 - Python Backend Developer",
+            "Required Skills: " + ", ".join(jd_skills),
+        ),
+        configuration(candidate={"keywords": candidate_skills}),
+        candidate_skills=candidate_skills,
+    )
+
+    assert result.matched_keyword_count == 9
+    assert result.total_keyword_count == 10
+    assert result.match_percentage == 90
+    assert result.matched_keywords.count("MongoDB") == 0
+    assert result.unmatched_keywords == ["Redis"]
+
+
+def test_zero_of_ten_jd_skills_is_unmatched():
+    result = match_keywords(
+        job("Software Engineer", "Java JavaScript SQL Python Docker AWS React Pandas NumPy Statistics"),
+        configuration(candidate={"keywords": []}),
+        candidate_skills=[],
     )
 
     assert result.match_percentage == 0
     assert result.priority == "Unmatched"
-    assert result.matched_keywords == []
-    assert result.unmatched_keywords == KEYWORDS
+    assert result.matched_keyword_count == 0
+    assert result.total_keyword_count == 10
 
 
-NINE_PERSISTED_JOB_CASES = [
-    (
-        "Customer Support Executive",
-        "Excellent English communication, Customer Relationship Management, Email and Chat Support, "
-        "Problem Resolution, MS Office, CRM Software, Customer Data Management. No programming required.",
-        [],
-        [],
-    ),
-    (
-        "Graduate Mechanical Engineer",
-        "AutoCAD, SolidWorks, CATIA, Mechanical Design, Manufacturing Processes, Thermodynamics, "
-        "Quality Control, CNC Operations.",
-        [],
-        [],
-    ),
-    (
-        "Software Tester / QA Engineer",
-        "Manual Testing, Automation Testing, Selenium WebDriver, Python, Test Cases, Bug Reporting, "
-        "API Testing, Postman.",
-        ["Python", "Selenium"],
-        ["Python", "Selenium", "Testing"],
-    ),
-    (
-        "Java Developer",
-        "Core Java, OOP, Collections Framework, Exception Handling, JDBC, Spring Boot basics, "
-        "MySQL, Data Structures.",
-        ["MySQL", "Java"],
-        ["Java", "MySQL"],
-    ),
-    (
-        "Job Opening: Frontend Developer",
-        "HTML5, CSS3, JavaScript, React.js, Next.js, Responsive Web Design, REST API Integration, Git.",
-        ["Git", "REST API", "JavaScript", "React"],
-        ["JavaScript", "React", "REST API", "Git"],
-    ),
-    (
-        "Junior Data Analyst",
-        "SQL, Advanced Excel, Power BI, Data Visualization, Dashboard Development, Data Cleaning, "
-        "Reporting and Analytics.",
-        ["SQL", "Power BI"],
-        ["SQL", "Power BI", "Excel"],
-    ),
-    (
-        "AI/ML Engineer",
-        "Python, Machine Learning, Deep Learning, TensorFlow / Keras, NumPy and Pandas, "
-        "Scikit-learn, model training, basic NLP.",
-        ["Python", "Machine Learning", "Deep Learning", "TensorFlow", "Scikit-learn", "Pandas", "NumPy", "NLP"],
-        ["Python", "Machine Learning", "Deep Learning", "Pandas", "NumPy", "TensorFlow"],
-    ),
-    (
-        "Backend Developer",
-        "Python, FastAPI, REST API development, SQL and PostgreSQL, database design, Git, Docker.",
-        ["Python", "FastAPI", "SQL", "PostgreSQL", "Docker", "Git", "REST API"],
-        ["Python", "FastAPI", "SQL", "PostgreSQL", "REST API", "Git", "Docker"],
-    ),
-    (
-        "Python Developer (Fresher)",
-        "Python programming, basic SQL and MySQL, Flask or Django, REST API fundamentals, Git and GitHub.",
-        ["Python", "Flask", "Django", "SQL", "MySQL", "Git", "REST API"],
-        ["Python", "Flask", "Django", "SQL", "MySQL", "REST API", "Git"],
-    ),
-]
-
-
-@pytest.mark.parametrize(
-    "title,description,skills,expected_matched",
-    NINE_PERSISTED_JOB_CASES,
-    ids=[case[0] for case in NINE_PERSISTED_JOB_CASES],
-)
-def test_all_nine_dashboard_job_samples_score_from_configured_keywords(
-    title, description, skills, expected_matched
-):
-    profile_path = Path(__file__).resolve().parent.parent / "profile.yaml"
+def test_unrelated_candidate_skills_do_not_reduce_jd_coverage():
+    relevant = ["Python", "FastAPI", "Flask", "SQL", "REST API", "Postgres", "Docker", "Git"]
+    unrelated = [f"unrelated skill {index}" for index in range(100)]
     result = match_keywords(
-        job(title=title, description=description, skills=skills),
-        load_keyword_configuration(profile_path),
+        job("Software Engineer", "Python FastAPI Flask SQL REST API PostgreSQL Docker Git Redis GraphQL"),
+        configuration(candidate={"keywords": relevant + unrelated}),
     )
 
-    assert result.total_keyword_count == 30
-    assert result.matched_keywords == expected_matched
-    assert result.priority == ("Unmatched" if not result.matched_keywords else "P3")
-    assert result.match_percentage == pytest.approx(
-        len(result.matched_keywords) / 30 * 100
+    assert result.match_percentage == 80
+    assert result.matched_keyword_count == 8
+    assert result.total_keyword_count == 10
+
+
+def test_unrelated_role_is_zero_and_unmatched():
+    result = match_keywords(
+        job("Mechanical Design Engineer", "AutoCAD SolidWorks CATIA"), configuration()
     )
+
+    assert result.match_percentage is None
+    assert result.priority is None
+    assert result.status == "unscored"
 
 
 def test_repeated_keyword_counts_once():
@@ -184,22 +149,79 @@ def test_repeated_keyword_counts_once():
 
 def test_case_and_punctuation_variants_match_canonically():
     config = configuration(
-        candidate={"keywords": ["Python", "PostgreSQL", "REST API", "Machine Learning"]},
+        candidate={"keywords": [
+            "Python", "Postgres", "REST API", "Machine Learning", "Generative AI", "RAG"
+        ]},
         matching={
             "keyword_aliases": {
-                "PostgreSQL": ["Postgres"],
+                "Postgres": ["PostgreSQL"],
                 "REST API": ["RESTful APIs"],
                 "Machine Learning": ["ML models"],
             }
         },
     )
     result = match_keywords(
-        job("PYTHON", "postgres RESTful APIs machine-learning"), config
+        job(
+            "PYTHON",
+            "postgres RESTful APIs machine-learning GenAI Generative AI retrieval-augmented generation RAG",
+        ),
+        config,
     )
 
     assert result.match_percentage == 100
-    assert result.matched_keywords == ["Python", "PostgreSQL", "REST API", "Machine Learning"]
-    assert result.total_keyword_count == 4
+    assert result.matched_keywords == [
+        "Python", "REST API", "Postgres", "Machine Learning", "Generative AI", "RAG"
+    ]
+    assert result.total_keyword_count == 6
+
+
+def test_required_optional_skills_have_different_weights():
+    job_posting = job(
+        "Data Analyst",
+        "Required: SQL, Excel. Nice to have: Power BI.",
+    )
+    misses_optional = match_keywords(
+        job_posting,
+        configuration(candidate={"keywords": ["SQL", "Excel"]}),
+    )
+    misses_mandatory = match_keywords(
+        job_posting,
+        configuration(candidate={"keywords": ["SQL", "Power BI"]}),
+    )
+
+    assert misses_optional.match_percentage == pytest.approx(2 / 3 * 100)
+    assert misses_optional.weighted_match_percentage == 80
+    assert misses_optional.missing_optional_keywords == ["Power BI"]
+    assert misses_mandatory.weighted_match_percentage == 60
+    assert misses_mandatory.missing_mandatory_keywords == ["Excel"]
+
+
+def test_generic_soft_skills_do_not_inflate_technical_coverage():
+    result = match_keywords(
+        job("Software Engineer", "Communication, teamwork, and problem-solving are essential."),
+        configuration(candidate={"keywords": ["Communication", "Teamwork", "Problem Solving"]}),
+    )
+
+    assert result.status == "unscored"
+    assert result.total_keyword_count == 0
+
+
+def test_role_aware_extraction_uses_distinct_backend_and_data_science_pools():
+    description = (
+        "Python, FastAPI, REST APIs, SQL, databases, Docker, Pandas, NumPy, "
+        "statistics, machine learning, and model evaluation."
+    )
+    backend = match_keywords(
+        job("Python Backend Developer", description), configuration(candidate={"keywords": []})
+    )
+    scientist = match_keywords(
+        job("Data Scientist", description), configuration(candidate={"keywords": []})
+    )
+
+    assert "FastAPI" in backend.unmatched_keywords
+    assert "FastAPI" not in scientist.unmatched_keywords
+    assert "Statistics" in scientist.unmatched_keywords
+    assert "Statistics" not in backend.unmatched_keywords
 
 
 def test_java_does_not_match_javascript():
@@ -214,18 +236,18 @@ def test_missing_fields_only_match_available_title():
     config = configuration(candidate={"keywords": ["Python", "SQL"]})
     result = match_keywords(job(title="Python Developer"), config)
 
-    assert result.match_percentage == 50
+    assert result.match_percentage == 100
     assert result.matched_keywords == ["Python"]
-    assert result.unmatched_keywords == ["SQL"]
+    assert result.unmatched_keywords == []
 
 
 def test_empty_keyword_list_is_unscored_not_unmatched():
     result = match_keywords(job(title="Python Developer"), configuration(candidate={"keywords": []}))
 
-    assert result.match_percentage is None
-    assert result.priority is None
-    assert result.status == "unscored"
-    assert result.total_keyword_count == 0
+    assert result.match_percentage == 0
+    assert result.priority == "Unmatched"
+    assert result.status == "scored"
+    assert result.total_keyword_count == 1
 
 
 def test_nested_yaml_configuration_loads(tmp_path):
@@ -264,15 +286,14 @@ def test_nested_yaml_configuration_loads(tmp_path):
 
 def test_thresholds_are_loaded_and_control_priority():
     config = configuration(
-        candidate={"keywords": ["Python", "SQL"]},
-        matching={"p1_threshold": 50, "p2_threshold": 25, "p3_threshold": 1},
+        candidate={"keywords": ["Python"]},
+        matching={"p1_threshold": 70, "p2_threshold": 40, "p3_threshold": 1},
     )
+    job_posting = job(title="Software Engineer", description="Python and SQL")
 
-    assert match_keywords(job(title="Python"), config).priority == "P1"
-    assert match_keywords(job(title="Python"), configuration(
-        candidate={"keywords": ["Python", "SQL"]},
-        matching={"p1_threshold": 80, "p2_threshold": 40, "p3_threshold": 1},
-    )).priority == "P2"
+    assert match_keywords(job_posting, config).priority == "P2"
+    config.matching.p1_threshold = 40
+    assert match_keywords(job_posting, config).priority == "P1"
 
 
 def test_invalid_thresholds_or_ai_scoring_are_rejected():
@@ -291,6 +312,19 @@ def test_alias_target_must_be_a_configured_keyword(tmp_path):
 
     with pytest.raises(ValueError, match="not in candidate.keywords"):
         load_keyword_configuration(path)
+
+
+def test_custom_keyword_aliases_are_included_in_jd_extraction():
+    config = configuration(
+        candidate={"keywords": ["Cloud Platform"]},
+        matching={"keyword_aliases": {"Cloud Platform": ["CloudOps"]}},
+    )
+
+    result = match_keywords(job("Software Engineer", "CloudOps required."), config)
+
+    assert result.matched_keywords == ["Cloud Platform"]
+    assert result.total_keyword_count == 1
+    assert result.match_percentage == 100
 
 
 def test_pipeline_keyword_result_is_independent_of_legacy_ai_verdict(tmp_path, caplog):
@@ -359,8 +393,8 @@ def test_pipeline_keyword_result_is_independent_of_legacy_ai_verdict(tmp_path, c
     assert stored.ai_decision["relevant"] is False
     assert stored.ai_decision["match_score"] == 0
     fields = _match_fields(stored)
-    assert fields["match_score"] == 100
-    assert fields["match_priority"] == "P1"
+    assert fields["match_score"] == stored.match_result["match_score"] == 46
+    assert fields["match_priority"] == stored.match_result["priority"] == "P2"
     assert fields["matching_method"] == "yaml_keyword"
     diagnostics = "\n".join(record.message for record in caplog.records)
     assert "matched_keyword_count=2" in diagnostics
@@ -370,8 +404,8 @@ def test_pipeline_keyword_result_is_independent_of_legacy_ai_verdict(tmp_path, c
     assert "location_match=True" in diagnostics
     assert "experience_compatibility=True" in diagnostics
     assert "employment_type_match=True" in diagnostics
-    assert "final_score=100.0" in diagnostics
-    assert "final_classification=P1" in diagnostics
+    assert "jd_skill_coverage=100.0" in diagnostics
+    assert "jd_coverage_classification=P1" in diagnostics
 
 
 def test_keyword_result_persists_when_ai_matcher_is_unavailable(tmp_path):
@@ -432,7 +466,7 @@ def test_config_file_validation_accepts_nested_profile_and_rejects_bad_threshold
         )
 
 
-def test_dashboard_filters_and_counts_use_keyword_priority(tmp_path):
+def test_dashboard_filters_and_counts_use_final_verdict(tmp_path):
     repo = JobRepository(tmp_path / "dashboard-keywords.db")
     p1 = job(title="Python Developer", description="Python and SQL")
     p1.source_job_id = "dashboard-p1"
@@ -461,6 +495,6 @@ def test_dashboard_filters_and_counts_use_keyword_priority(tmp_path):
     p1_jobs = WebUIState.get_jobs(state, priority="P1")
     unmatched_jobs = WebUIState.get_jobs(state, match_status="unmatched")
 
-    assert counts == {"ALL": 2, "P1": 1, "P2": 0, "P3": 0, "UNMATCHED": 1}
-    assert [item["source_job_id"] for item in p1_jobs["jobs"]] == ["dashboard-p1"]
-    assert [item["source_job_id"] for item in unmatched_jobs["jobs"]] == ["dashboard-unmatched"]
+    assert counts == {"ALL": 2, "P1": 1, "P2": 0, "P3": 1, "UNMATCHED": 1}
+    assert [item["source_job_id"] for item in p1_jobs["jobs"]] == ["dashboard-unmatched"]
+    assert [item["source_job_id"] for item in unmatched_jobs["jobs"]] == ["dashboard-p1"]

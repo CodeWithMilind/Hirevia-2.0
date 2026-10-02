@@ -194,7 +194,7 @@ def test_fresh_telegram_job_completes_pipeline_and_deduplicates(monkeypatch, tmp
     assert "Role: Backend Developer" in payload["text"]
     assert "Company: Acme Corp" in payload["text"]
     assert "Matched: Python, FastAPI" in payload["text"]
-    assert "Missing: Docker" in payload["text"]
+    assert "Missing: Docker" not in payload["text"]
     assert "Python and FastAPI match" in payload["text"]
     assert f"Apply: {APPLICATION_URL}" in payload["text"]
     assert "Source: acme_jobs" in payload["text"]

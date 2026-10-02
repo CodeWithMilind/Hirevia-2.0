@@ -1,14 +1,28 @@
+
 candidate:
   experience_level: fresher
   max_experience_years: 1
 
   preferred_roles:
     - Python Developer
+    - Python Automation Developer
     - Backend Developer
+    - Backend Engineer
+    - API Developer
+    - Software Engineer
+    - Junior Software Developer
     - AI Engineer
+    - Applied AI Engineer
+    - AI/ML Engineer
+    - Generative AI Engineer
+    - GenAI Engineer
+    - LLM Engineer
+    - RAG Engineer
     - Machine Learning Engineer
+    - ML Engineer
     - Data Scientist
     - Data Analyst
+    - Junior Data Analyst
 
   role_categories:
     - software_development
@@ -21,67 +35,210 @@ candidate:
   preferred_locations:
     - Pune
     - Remote
+    - Work from Home
+    - India
 
   employment_types:
     - Full-time
     - Internship
 
   keywords:
+    # Programming
     - Python
+    - SQL
+    - C
+    - C++
+    - Java
+
+    # Backend development
     - FastAPI
     - Flask
-    - Django
-    - Java
-    - C++
-    - JavaScript
-    - React
-    - Node.js
-    - SQL
-    - MySQL
-    - PostgreSQL
-    - MongoDB
     - REST API
-    - Git
-    - Machine Learning
-    - Deep Learning
-    - Artificial Intelligence
-    - Data Analysis
+    - API Development
+    - API Integration
+    - Swagger
+    - OpenAPI
+    - Backend Development
+    - JSON
+
+    # Databases
+    - MySQL
+    - MongoDB
+    - SQLite
+    - PostgreSQL
+    - SQL Queries
+    - Database Management
+
+    # Python libraries
     - Pandas
     - NumPy
-    - TensorFlow
-    - PyTorch
+    - Matplotlib
+    - Seaborn
+    - Scikit-learn
+    - Requests
+    - BeautifulSoup
+
+    # Python automation and scraping
+    - Python Automation
+    - Web Scraping
+    - Selenium
+    - Data Collection
+    - Data Processing
+    - Automation
+    - Workflow Automation
+
+    # Data science and analytics
+    - Data Analysis
+    - Data Analytics
+    - Exploratory Data Analysis
+    - EDA
+    - Data Cleaning
+    - Data Preprocessing
+    - Data Visualization
+    - Statistical Analysis
+    - Statistics
+    - Feature Engineering
+    - Feature Selection
+    - Missing Value Analysis
+    - Outlier Analysis
+    - Data Transformation
+    - Predictive Analytics
+    - Analytical Reporting
+
+    # Machine learning
+    - Machine Learning
+    - Supervised Learning
+    - Regression
+    - Classification
+    - Clustering
+    - Decision Trees
+    - Random Forest
+    - Logistic Regression
+    - KNN
+    - XGBoost
+    - CatBoost
+    - SMOTE
+    - Model Evaluation
+    - Cross-validation
+    - Precision
+    - Recall
+    - F1-score
+    - ROC-AUC
+    - MAE
+    - RMSE
+    - R2 Score
+
+    # Generative AI and LLM
+    - Artificial Intelligence
+    - Generative AI
+    - LLM
+    - Large Language Models
+    - OpenAI API
+    - LangChain
+    - RAG
+    - Retrieval Augmented Generation
+    - Prompt Engineering
+    - AI Agents
+    - Agentic AI
+    - CrewAI
+    - LangGraph
+    - Ollama
+    - FAISS
+    - ChromaDB
+    - Vector Databases
+    - Embeddings
+    - Semantic Search
+    - Document Processing
+    - PDF Chatbot
+
+    # Visualization and reporting
     - Power BI
     - Excel
-    - AWS
-    - Azure
-    - Docker
-    - Selenium
-    - Testing
+    - Automated EDA
+    - Statistical Summaries
 
-matching:
-  p1_threshold: 70
-  p2_threshold: 40
-  p3_threshold: 1
-  fields_to_match:
-    - title
-    - description
-    - skills
-  use_ai_for_scoring: false
-  keyword_aliases:
-    PostgreSQL:
-      - Postgres
-    REST API:
-      - RESTful API
-      - RESTful APIs
-      - REST APIs
-    Machine Learning:
-      - Machine-learning
-      - ML
-      - ML models
-    JavaScript:
-      - JS
-    Node.js:
-      - NodeJS
-      - Node JS
-    Power BI:
-      - PowerBI
+    # Developer tools
+    - Git
+    - GitHub
+    - Docker
+    - Postman
+    - Jupyter Notebook
+    - VS Code
+    - n8n
+
+  matching:
+    p1_threshold: 70
+    p2_threshold: 40
+    p3_threshold: 1
+
+    fields_to_match:
+      - title
+      - description
+      - skills
+
+    use_ai_for_scoring: false
+
+    keyword_aliases:
+      PostgreSQL:
+        - Postgres
+
+      REST API:
+        - REST APIs
+        - RESTful API
+        - RESTful APIs
+
+      Scikit-learn:
+        - sklearn
+        - Scikit learn
+        - ScikitLearn
+
+      Machine Learning:
+        - ML
+        - Machine-learning
+        - ML models
+
+      Generative AI:
+        - GenAI
+        - Generative Artificial Intelligence
+
+      Large Language Models:
+        - LLM
+        - LLMs
+
+      Retrieval Augmented Generation:
+        - RAG
+        - Retrieval-Augmented Generation
+
+      JavaScript:
+        - JS
+
+      Power BI:
+        - PowerBI
+
+      OpenAI API:
+        - OpenAI
+
+      LangChain:
+        - Lang Chain
+
+      LangGraph:
+        - Lang Graph
+
+      CrewAI:
+        - Crew AI
+
+      ChromaDB:
+        - Chroma
+
+      Exploratory Data Analysis:
+        - EDA
+
+      Cross-validation:
+        - Cross Validation
+        - K-fold Cross Validation
+
+      FastAPI:
+        - Fast API
+
+      BeautifulSoup:
+        - Beautiful Soup

@@ -49,6 +49,12 @@ class Notifier(ABC):
             f"Location: {job.location}",
             f"Experience: {job.experience or 'Not specified'}",
         ]
+        keyword_result = (job.raw_data or {}).get("keyword_match") or {}
+        coverage = keyword_result.get("match_percentage")
+        total_skills = keyword_result.get("total_keyword_count")
+        matched_skills = keyword_result.get("matched_keyword_count")
+        if isinstance(coverage, (int, float)) and total_skills:
+            lines.append(f"JD skill coverage: {coverage:.1f}% ({matched_skills}/{total_skills})")
 
         employment_type = getattr(job.employment_type, "value", job.employment_type)
         if employment_type:

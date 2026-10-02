@@ -1,18 +1,27 @@
+
 roles:
   - Python Developer
+  - Python Automation Developer
   - Backend Developer
+  - Backend Engineer
+  - API Developer
+  - Software Engineer
+  - Junior Software Developer
   - AI Engineer
+  - Applied AI Engineer
+  - AI/ML Engineer
+  - Generative AI Engineer
+  - GenAI Engineer
+  - LLM Engineer
+  - RAG Engineer
+  - Machine Learning Engineer
   - ML Engineer
   - Data Scientist
-  - Software Engineer
-  - Full Stack Developer
+  - Data Analyst
+  - Junior Data Analyst
 
 locations:
   - Pune
-  - Mumbai
-  - Bangalore
-  - Hyderabad
-  - Delhi
   - Remote
   - India
   - Work from Home
@@ -22,40 +31,109 @@ experience:
   fresher: true
 
 skills:
+  # Programming
   - Python
+  - SQL
+  - C
+  - C++
+  - Java
+
+  # Backend
   - FastAPI
   - Flask
-  - Django
-  - SQL
-  - PostgreSQL
+  - REST API
+  - API Development
+  - API Integration
+  - Swagger
+  - OpenAPI
+
+  # Databases
   - MySQL
   - MongoDB
-  - Redis
-  - Docker
-  - Kubernetes
-  - AWS
-  - GCP
-  - Azure
-  - Machine Learning
-  - Deep Learning
-  - TensorFlow
-  - PyTorch
-  - Scikit-learn
+  - SQLite
+  - PostgreSQL
+
+  # Python libraries
   - Pandas
   - NumPy
-  - Selenium
-  - BeautifulSoup
+  - Matplotlib
+  - Seaborn
+  - Scikit-learn
   - Requests
-  - AsyncIO
+  - BeautifulSoup
+
+  # Automation
+  - Selenium
+  - Python Automation
+  - Web Scraping
+  - Data Collection
+  - Workflow Automation
+
+  # Data analytics
+  - Data Analysis
+  - Data Analytics
+  - EDA
+  - Exploratory Data Analysis
+  - Data Cleaning
+  - Data Preprocessing
+  - Data Visualization
+  - Statistical Analysis
+  - Statistics
+  - Feature Engineering
+  - Feature Selection
+  - Predictive Analytics
+
+  # Machine learning
+  - Machine Learning
+  - Regression
+  - Classification
+  - Clustering
+  - Decision Trees
+  - Random Forest
+  - Logistic Regression
+  - KNN
+  - XGBoost
+  - CatBoost
+  - SMOTE
+  - Model Evaluation
+  - Cross-validation
+  - Precision
+  - Recall
+  - F1-score
+  - ROC-AUC
+
+  # Generative AI
+  - Artificial Intelligence
+  - Generative AI
+  - LLM
+  - OpenAI API
+  - LangChain
+  - RAG
+  - Prompt Engineering
+  - AI Agents
+  - CrewAI
+  - LangGraph
+  - Ollama
+  - FAISS
+  - ChromaDB
+  - Vector Databases
+  - Embeddings
+  - Semantic Search
+
+  # Tools
+  - Power BI
+  - Excel
   - Git
-  - CI/CD
-  - REST API
-  - GraphQL
+  - GitHub
+  - Docker
+  - Postman
+  - Jupyter Notebook
+  - VS Code
+  - n8n
 
 employment:
   - full_time
   - internship
-  - contract
 
 exclude_keywords:
   - senior

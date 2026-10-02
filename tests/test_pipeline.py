@@ -242,7 +242,7 @@ def test_completed_assessment_persists_structured_ai_evidence(repo):
     assert stored.match_result["ai_score"] == 82
     assert stored.match_result["deterministic_score"] == analyze(job, pipeline.profile).score
     assert stored.match_result["matched_skills"] == ["Python", "FastAPI"]
-    assert stored.match_result["missing_skills"] == ["SQL"]
+    assert stored.match_result["missing_skills"] == []
     assert stored.match_result["fresher_eligible"] is True
     assert "responsibilities fit" in stored.match_result["reason"]
 
@@ -909,7 +909,11 @@ def test_p3_below_threshold_is_not_alerted(repo):
     marginal = FakeMatcher(default=AIResponse(relevant=True, priority=Priority.P3, match_score=61,
                                              reasons=["partial skill overlap"]))
     notifier = FakeNotifier()
-    stats = run(build_pipeline([source], repo, marginal, notifier, notify_min_match_score=80))
+    stats = run(build_pipeline(
+        [source], repo, marginal, notifier, notify_min_match_score=80,
+        priority_p1_min_score=95, priority_p2_min_score=90, priority_p3_min_score=40,
+        match_min_score=45,
+    ))
 
     assert notifier.sent == []
     assert stats.jobs_skipped_notification == 1 and stats.jobs_notified == 0
@@ -925,8 +929,11 @@ def test_p3_above_threshold_is_alerted(repo):
     strong = FakeMatcher(default=AIResponse(relevant=True, priority=Priority.P3, match_score=88,
                                            reasons=["strong score"]))
     notifier = FakeNotifier()
-    stats = run(build_pipeline([source], repo, strong, notifier,
-                               notify_min_match_score=80, ai_match_weight=1.0))
+    stats = run(build_pipeline(
+        [source], repo, strong, notifier, notify_min_match_score=80,
+        ai_match_weight=1.0, priority_p1_min_score=95,
+        priority_p2_min_score=90, priority_p3_min_score=40,
+    ))
 
     assert notifier.sent == ["Backend Developer"] and stats.jobs_notified == 1
 

@@ -25,6 +25,7 @@ from hirevia.ai.client import AIError
 from hirevia.ai.matcher import AIMatcher
 from hirevia.ai.providers import build_ai_provider_router, provider_status
 from hirevia.config import Config, load_config
+from hirevia.core.classification import classify_score
 from hirevia.core.matching import analyze
 from hirevia.core.models import CandidateProfile, Job, ScanStats
 from hirevia.core.pipeline import Pipeline, run_single_scan
@@ -424,6 +425,7 @@ def scan(
     if not ai_matcher and not no_ai:
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
     ai_progress_reporter = None if diagnostic else _make_ai_progress_reporter(
+        config,
         notifications_enabled=False
     )
 
@@ -472,6 +474,7 @@ def monitor(
     if not ai_matcher and not no_ai:
         console.print("[yellow]No configured AI provider credentials - using deterministic scoring[/yellow]")
     progress_reporter = _make_ai_progress_reporter(
+        monitor_config,
         notifications_enabled=False,
         normal_monitor=not verbose,
     )
@@ -610,7 +613,7 @@ def status(db_path: str, limit: int):
     table.add_column("Status", style="magenta", max_width=10)
     table.add_column("Fresh", style="white", max_width=12)
     table.add_column("Link", style="white", max_width=11)
-    table.add_column("AI Score", style="white", max_width=8)
+    table.add_column("Match %", style="white", max_width=8)
 
     for job in jobs:
         # The hybrid verdict is the score that matters; ai_decision rows written
@@ -1034,6 +1037,7 @@ def _print_stats(stats: ScanStats, include_top_opportunities: bool = True):
 
 
 def _make_ai_progress_reporter(
+    config: Optional[Config] = None,
     notifications_enabled: bool = False,
     normal_monitor: bool = False,
 ):
@@ -1042,13 +1046,12 @@ def _make_ai_progress_reporter(
     def review_priority(score):
         if score is None:
             return "No Priority"
-        if score > 80:
-            return "P1"
-        if score > 50:
-            return "P2"
-        if score > 20:
-            return "P3"
-        return "No Priority"
+        return classify_score(
+            score,
+            getattr(config, "priority_p1_min_score", 70),
+            getattr(config, "priority_p2_min_score", 40),
+            getattr(config, "priority_p3_min_score", 1),
+        )
 
     def normalized_work_mode(job):
         raw_data = getattr(job, "raw_data", None) or {}

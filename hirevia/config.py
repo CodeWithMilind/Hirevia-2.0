@@ -7,6 +7,12 @@ from typing import Any, Dict, List, Literal, Optional
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
+from hirevia.core.classification import (
+    DEFAULT_P1_THRESHOLD,
+    DEFAULT_P2_THRESHOLD,
+    DEFAULT_P3_THRESHOLD,
+)
+
 try:  # .env is loaded once, here, so every env var (NVIDIA_MODEL included)
     from dotenv import load_dotenv  # is present before load_config() runs
 except ImportError:  # pragma: no cover - dotenv is in requirements.txt
@@ -146,9 +152,9 @@ class Config(BaseModel):
     # Deliberately lower than notify_min_match_score: relevant != interrupt-worthy.
     match_min_score: int = 55
     # Deterministic priority thresholds (clear, no arbitrary buckets).
-    priority_p1_min_score: int = Field(default=85, ge=0, le=100)
-    priority_p2_min_score: int = Field(default=65, ge=0, le=100)
-    priority_p3_min_score: int = Field(default=40, ge=0, le=100)
+    priority_p1_min_score: int = Field(default=DEFAULT_P1_THRESHOLD, ge=1, le=100)
+    priority_p2_min_score: int = Field(default=DEFAULT_P2_THRESHOLD, ge=1, le=99)
+    priority_p3_min_score: int = Field(default=DEFAULT_P3_THRESHOLD, ge=0, le=98)
     # Weight of the AI verdict in the final score; the rest is deterministic
     # evidence. AI_MATCH_WEIGHT=0 makes matching purely deterministic.
     ai_match_weight: float = 0.40
@@ -275,13 +281,13 @@ def load_config(
         notify_min_match_score=int(os.getenv("NOTIFY_MIN_MATCH_SCORE", "80")),
         notify_max_age_hours=int(os.getenv("NOTIFY_MAX_AGE_HOURS", "72")),
         priority_p1_min_score=_env_int(
-            "MATCHING_P1_THRESHOLD", int(matching_data.get("p1_threshold", 85))
+            "MATCHING_P1_THRESHOLD", int(matching_data.get("p1_threshold", DEFAULT_P1_THRESHOLD))
         ),
         priority_p2_min_score=_env_int(
-            "MATCHING_P2_THRESHOLD", int(matching_data.get("p2_threshold", 65))
+            "MATCHING_P2_THRESHOLD", int(matching_data.get("p2_threshold", DEFAULT_P2_THRESHOLD))
         ),
         priority_p3_min_score=_env_int(
-            "MATCHING_P3_THRESHOLD", int(matching_data.get("p3_threshold", 40))
+            "MATCHING_P3_THRESHOLD", int(matching_data.get("p3_threshold", DEFAULT_P3_THRESHOLD))
         ),
     )
 

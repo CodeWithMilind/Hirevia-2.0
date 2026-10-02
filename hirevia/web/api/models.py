@@ -6,6 +6,12 @@ from enum import Enum
 
 from pydantic import BaseModel, Field, HttpUrl, SecretStr, model_validator
 
+from hirevia.core.classification import (
+    DEFAULT_P1_THRESHOLD,
+    DEFAULT_P2_THRESHOLD,
+    DEFAULT_P3_THRESHOLD,
+)
+
 
 class SystemStatus(str, Enum):
     RUNNING = "RUNNING"
@@ -150,11 +156,14 @@ class JobResponse(BaseModel):
     match_result: Optional[Dict[str, Any]] = None
     keyword_match_result: Optional[Dict[str, Any]] = None
     keyword_match_percentage: Optional[float] = None
+    keyword_weighted_match_percentage: Optional[float] = None
     keyword_priority: Optional[str] = None
     matched_keywords: List[str] = Field(default_factory=list)
     unmatched_keywords: List[str] = Field(default_factory=list)
     matched_keyword_count: int = 0
     total_keyword_count: int = 0
+    missing_mandatory_keywords: List[str] = Field(default_factory=list)
+    missing_optional_keywords: List[str] = Field(default_factory=list)
     matching_method: Optional[str] = None
     deterministic_score: Optional[int] = None
     ai_score: Optional[int] = None
@@ -208,9 +217,9 @@ class AISettingsRequest(BaseModel):
     model: str
     base_url: Optional[str] = None
     timeout_seconds: int = Field(default=20, ge=1, le=300)
-    p1_threshold: int = Field(default=85, ge=0, le=100)
-    p2_threshold: int = Field(default=65, ge=0, le=100)
-    p3_threshold: int = Field(default=40, ge=0, le=100)
+    p1_threshold: int = Field(default=DEFAULT_P1_THRESHOLD, ge=1, le=100)
+    p2_threshold: int = Field(default=DEFAULT_P2_THRESHOLD, ge=1, le=99)
+    p3_threshold: int = Field(default=DEFAULT_P3_THRESHOLD, ge=0, le=98)
     api_key: Optional[SecretStr] = None
 
     @model_validator(mode="after")

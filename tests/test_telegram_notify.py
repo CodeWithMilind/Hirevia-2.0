@@ -16,6 +16,7 @@ import pytest
 from hirevia.core.models import AIResponse, Job, MatchResult, Priority
 from hirevia.notifications import telegram as tg
 from hirevia.notifications.telegram import TelegramNotifier, _retry_after
+from hirevia.web.state import _match_fields
 
 
 class FakeResponse:
@@ -235,6 +236,40 @@ def test_canonical_verdict_is_used_without_exposing_ai_private_text(monkeypatch)
     assert "P2 - Job Match (84%)" in text
     assert "Python and FastAPI match your profile." in text
     assert "PRIVATE_CHAIN_OF_THOUGHT" not in text
+
+
+def test_telegram_and_dashboard_share_final_score_and_show_jd_coverage(monkeypatch):
+    notifier = build(monkeypatch, [])
+    verdict = MatchResult(
+        match=True,
+        match_score=62,
+        priority=Priority.P2,
+        reason="Role and experience fit; some JD skills are missing.",
+        ai_status="ok",
+        deterministic_score=58,
+        ai_score=68,
+    )
+    job = make_job(
+        match_result=verdict.model_dump(mode="json"),
+        raw_data={
+            "keyword_match": {
+                "matching_method": "yaml_keyword",
+                "match_percentage": 80,
+                "matched_keyword_count": 8,
+                "total_keyword_count": 10,
+                "priority": "P1",
+            }
+        },
+    )
+
+    fields = _match_fields(job)
+    message = notifier.format_message(job, verdict)
+
+    assert fields["match_score"] == 62
+    assert fields["match_priority"] == "P2"
+    assert fields["keyword_match_percentage"] == 80
+    assert "P2 - Job Match (62%)" in message
+    assert "JD skill coverage: 80.0% (8/10)" in message
 
 
 def test_hard_veto_reason_is_rendered_as_a_veto_not_a_normal_match(monkeypatch):

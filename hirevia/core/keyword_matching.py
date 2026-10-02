@@ -4,12 +4,19 @@ import os
 import re
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Sequence
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from hirevia.core.classification import (
+    DEFAULT_P1_THRESHOLD,
+    DEFAULT_P2_THRESHOLD,
+    DEFAULT_P3_THRESHOLD,
+    classify_score,
+)
 from hirevia.core.models import Job
+from hirevia.core.skills import extract_jd_skills, normalize_skill
 
 
 MatchField = Literal["title", "description", "skills"]
@@ -31,9 +38,9 @@ class CandidateKeywordPreferences(BaseModel):
 class KeywordMatchingPreferences(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    p1_threshold: int = Field(default=70, ge=1, le=100)
-    p2_threshold: int = Field(default=40, ge=1, le=99)
-    p3_threshold: int = Field(default=1, ge=0, le=98)
+    p1_threshold: int = Field(default=DEFAULT_P1_THRESHOLD, ge=1, le=100)
+    p2_threshold: int = Field(default=DEFAULT_P2_THRESHOLD, ge=1, le=99)
+    p3_threshold: int = Field(default=DEFAULT_P3_THRESHOLD, ge=0, le=98)
     fields_to_match: List[MatchField] = Field(
         default_factory=lambda: ["title", "description", "skills"]
     )
@@ -67,6 +74,11 @@ class KeywordMatchResult(BaseModel):
     unmatched_keywords: List[str] = Field(default_factory=list)
     matched_keyword_count: int
     total_keyword_count: int
+    weighted_match_percentage: Optional[float] = None
+    mandatory_keywords: List[str] = Field(default_factory=list)
+    optional_keywords: List[str] = Field(default_factory=list)
+    missing_mandatory_keywords: List[str] = Field(default_factory=list)
+    missing_optional_keywords: List[str] = Field(default_factory=list)
     matching_method: Literal["yaml_keyword"] = "yaml_keyword"
     status: Literal["scored", "unscored"] = "scored"
 
@@ -151,7 +163,7 @@ def _canonical_keywords(configuration: KeywordConfiguration) -> List[str]:
 
     canonical_by_key = {
         _normalize_phrase(keyword): alias_to_canonical.get(
-            _normalize_phrase(keyword), keyword.strip()
+            _normalize_phrase(keyword), normalize_skill(keyword)
         )
         for keyword in configuration.candidate.keywords
         if _normalize_phrase(keyword)
@@ -160,7 +172,7 @@ def _canonical_keywords(configuration: KeywordConfiguration) -> List[str]:
     seen = set()
     for keyword in configuration.candidate.keywords:
         key = _normalize_phrase(keyword)
-        canonical = canonical_by_key.get(key, keyword.strip())
+        canonical = canonical_by_key.get(key, normalize_skill(keyword))
         canonical_key = _normalize_phrase(canonical)
         if canonical_key and canonical_key not in seen:
             seen.add(canonical_key)
@@ -168,120 +180,56 @@ def _canonical_keywords(configuration: KeywordConfiguration) -> List[str]:
     return keywords
 
 
-def _keyword_forms(keyword: str, configuration: KeywordConfiguration) -> List[str]:
-    forms = [keyword]
-    for canonical, aliases in configuration.matching.keyword_aliases.items():
-        if _normalize_phrase(canonical) == _normalize_phrase(keyword):
-            forms.extend(aliases)
-    unique = []
-    seen = set()
-    for form in forms:
-        normalized = _normalize_phrase(form)
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            unique.append(normalized)
-    return unique
-
-
-def _contains_keyword(text: str, forms: List[str]) -> bool:
-    for form in forms:
-        pattern = re.compile(
-            rf"(?<![a-z0-9+#]){re.escape(form)}(?![a-z0-9+#])",
-            re.IGNORECASE,
-        )
-        if pattern.search(text):
-            return True
-    return False
-
-
 def classify_keyword_priority(
     percentage: float, configuration: KeywordConfiguration
 ) -> KeywordPriority:
     """Classify a percentage using the configured, non-overlapping cutoffs."""
-    if percentage <= 0:
-        return "Unmatched"
     thresholds = configuration.matching
-    if percentage >= thresholds.p1_threshold:
-        return "P1"
-    if percentage >= thresholds.p2_threshold:
-        return "P2"
-    if percentage >= thresholds.p3_threshold:
-        return "P3"
-    return "Unmatched"
+    return classify_score(
+        percentage,
+        thresholds.p1_threshold,
+        thresholds.p2_threshold,
+        thresholds.p3_threshold,
+    )
 
 
 
-# Role-specific skill pools prevent unrelated candidate skills from diluting
-# the percentage. A pool is intersected with candidate.keywords, so only
-# skills the candidate actually listed can contribute to the denominator.
-_ROLE_FAMILIES = {
-    "python": ("python developer", "python engineer"),
-    "backend": ("backend developer", "back end developer", "backend engineer", "back end engineer"),
-    "ai_ml": ("ai engineer", "ai ml", "artificial intelligence", "machine learning", "ml engineer", "deep learning", "data scientist"),
-    "data_analyst": ("data analyst", "business intelligence analyst", "bi analyst"),
-    "frontend": ("frontend developer", "front end developer", "react developer", "ui developer"),
-    "java": ("java developer", "java engineer"),
-    "cloud": ("cloud engineer", "devops engineer", "site reliability engineer", "sre"),
-    "qa": ("qa engineer", "quality assurance", "software tester", "test engineer"),
-}
-
-_ROLE_SKILL_POOLS = {
-    "python": {"python", "django", "flask", "fastapi", "rest api", "sql", "mysql"},
-    "backend": {"python", "fastapi", "flask", "django", "rest api", "sql", "mysql", "postgresql", "mongodb", "docker"},
-    "ai_ml": {"python", "machine learning", "deep learning", "pandas", "numpy", "tensorflow", "pytorch"},
-    "data_analyst": {"python", "sql", "pandas", "numpy", "excel", "power bi", "statistics"},
-    "frontend": {"javascript", "react", "html", "css", "rest api", "git"},
-    "java": {"java", "spring boot", "sql", "mysql", "rest api", "git"},
-    "cloud": {"aws", "azure", "docker", "linux", "python", "ci cd"},
-    "qa": {"selenium", "testing", "python", "java", "sql", "api testing"},
-}
-
-
-def _role_family(value: str) -> Optional[str]:
-    """Map a job/profile role label to a broad, stable role family."""
-    normalized = f" {_normalize_phrase(value)} "
-    for family, labels in _ROLE_FAMILIES.items():
-        for label in labels:
-            if f" {_normalize_phrase(label)} " in normalized:
-                return family
-    return None
-
-
-def _role_relevant_keywords(
+def match_keywords(
     job: Job,
     configuration: KeywordConfiguration,
-    keywords: List[str],
-) -> List[str]:
-    """Use a role-specific denominator only when the role is a preferred role.
+    candidate_skills: Optional[Sequence[str]] = None,
+) -> KeywordMatchResult:
+    """Score the candidate against distinct technical skills mentioned in the JD."""
+    candidate_keywords = list(candidate_skills) if candidate_skills is not None else _canonical_keywords(configuration)
+    candidate_set = {normalize_skill(keyword) for keyword in candidate_keywords if normalize_skill(keyword)}
 
-    Unknown or non-preferred roles retain the full candidate keyword set. This
-    avoids inflating scores for unrelated jobs while preventing unrelated
-    skills from diluting a role the candidate explicitly wants.
-    """
-    job_family = _role_family(getattr(job, "title", "") or "")
-    if not job_family:
-        return keywords
-
-    preferred_families = {
-        family
-        for role in configuration.candidate.preferred_roles
-        if (family := _role_family(role))
-    }
-    if job_family not in preferred_families:
-        return keywords
-
-    allowed = _ROLE_SKILL_POOLS.get(job_family, set())
-    relevant = [
-        keyword for keyword in keywords
-        if _normalize_phrase(keyword) in allowed
-    ]
-    return relevant or keywords
-
-def match_keywords(job: Job, configuration: KeywordConfiguration) -> KeywordMatchResult:
-    """Match role-relevant canonical keywords once against the selected job fields."""
-    all_keywords = _canonical_keywords(configuration)
-    keywords = _role_relevant_keywords(job, configuration, all_keywords)
-    if not keywords:
+    content_parts: List[str] = []
+    for field_name in configuration.matching.fields_to_match:
+        value = getattr(job, field_name, None)
+        if field_name == "skills":
+            content_parts.extend(str(item) for item in value or [] if str(item).strip())
+        elif isinstance(value, str) and value.strip():
+            content_parts.append(value)
+    content = "\n".join(content_parts)
+    requirements = extract_jd_skills(content, getattr(job, "title", ""))
+    extracted_keys = {normalize_skill(skill) for skill, _ in requirements}
+    normalized_content = _normalize_phrase(content)
+    for canonical, aliases in configuration.matching.keyword_aliases.items():
+        skill = normalize_skill(canonical)
+        if skill in extracted_keys or skill not in candidate_set:
+            continue
+        forms = [canonical, *aliases]
+        if any(
+            re.search(
+                rf"(?<![a-z0-9+#]){re.escape(_normalize_phrase(form))}(?![a-z0-9+#])",
+                normalized_content,
+            )
+            for form in forms
+            if _normalize_phrase(form)
+        ):
+            requirements.append((skill, True))
+            extracted_keys.add(skill)
+    if not requirements:
         return KeywordMatchResult(
             match_percentage=None,
             priority=None,
@@ -291,31 +239,26 @@ def match_keywords(job: Job, configuration: KeywordConfiguration) -> KeywordMatc
             total_keyword_count=0,
             status="unscored",
         )
-
-    content_parts: List[str] = []
-    for field_name in configuration.matching.fields_to_match:
-        value = getattr(job, field_name, None)
-        if field_name == "skills":
-            content_parts.extend(str(item) for item in value or [] if str(item).strip())
-        elif isinstance(value, str) and value.strip():
-            content_parts.append(value)
-    content = _normalize_phrase(" ".join(content_parts))
-
-    matched = [
-        keyword
-        for keyword in keywords
-        if _contains_keyword(content, _keyword_forms(keyword, configuration))
-    ]
-    matched_keys = {_normalize_phrase(keyword) for keyword in matched}
-    unmatched = [
-        keyword for keyword in keywords if _normalize_phrase(keyword) not in matched_keys
-    ]
-    percentage = len(matched) / len(keywords) * 100
+    matched = [skill for skill, _ in requirements if skill in candidate_set]
+    missing = [skill for skill, _ in requirements if skill not in candidate_set]
+    mandatory = [skill for skill, required in requirements if required]
+    optional = [skill for skill, required in requirements if not required]
+    missing_mandatory = [skill for skill in mandatory if skill in missing]
+    missing_optional = [skill for skill in optional if skill in missing]
+    percentage = len(matched) / len(requirements) * 100
+    total_weight = sum(2 if required else 1 for _, required in requirements)
+    matched_weight = sum(2 if required else 1 for skill, required in requirements if skill in candidate_set)
+    weighted_percentage = matched_weight / total_weight * 100
     return KeywordMatchResult(
         match_percentage=percentage,
         priority=classify_keyword_priority(percentage, configuration),
         matched_keywords=matched,
-        unmatched_keywords=unmatched,
+        unmatched_keywords=missing,
         matched_keyword_count=len(matched),
-        total_keyword_count=len(keywords),
+        total_keyword_count=len(requirements),
+        weighted_match_percentage=weighted_percentage,
+        mandatory_keywords=mandatory,
+        optional_keywords=optional,
+        missing_mandatory_keywords=missing_mandatory,
+        missing_optional_keywords=missing_optional,
     )

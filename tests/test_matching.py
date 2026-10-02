@@ -9,14 +9,14 @@ The tests here pin the scoring CONTRACT, not incidental numbers:
   * a stated veto outranks any score, and the model cannot talk past it;
   * the AI contributes a bounded share of the final score, so an
     over-confident model can never manufacture relevance on its own;
-  * the model's priority tier is a ceiling, never a floor.
+    * final tiers follow the configured score thresholds, while hard vetoes win.
 """
 
 import pytest
 from pydantic import ValidationError
 
 from hirevia.config import Config
-from hirevia.core.matching import WEIGHTS, analyze, combine, match_job, parse_experience
+from hirevia.core.matching import MatchEvidence, WEIGHTS, analyze, combine, match_job, parse_experience
 from hirevia.core.models import (
     AIResponse,
     CandidateProfile,
@@ -25,6 +25,7 @@ from hirevia.core.models import (
     MatchResult,
     Priority,
 )
+from hirevia.core.skills import skill_overlap
 
 
 # --- helpers ------------------------------------------------------------------
@@ -33,9 +34,9 @@ from hirevia.core.models import (
 def test_priority_threshold_defaults_and_order_validation():
     config = Config()
 
-    assert config.priority_p1_min_score == 85
-    assert config.priority_p2_min_score == 65
-    assert config.priority_p3_min_score == 40
+    assert config.priority_p1_min_score == 70
+    assert config.priority_p2_min_score == 40
+    assert config.priority_p3_min_score == 1
     with pytest.raises(ValidationError):
         Config(priority_p1_min_score=60, priority_p2_min_score=70, priority_p3_min_score=40)
     with pytest.raises(ValidationError):
@@ -79,6 +80,13 @@ def test_weights_sum_to_one_hundred():
     assert sum(WEIGHTS.values()) == 100
 
 
+def test_skill_overlap_uses_jd_skills_as_the_denominator():
+    jd_skills = ["Python", "FastAPI", "Flask", "SQL", "REST API", "Postgres", "Docker", "Git", "Redis", "GraphQL"]
+    candidate_skills = jd_skills[:8] + [f"unrelated {index}" for index in range(100)]
+
+    assert skill_overlap(jd_skills, candidate_skills) == 0.8
+
+
 # --- neutral, not rejected ----------------------------------------------------
 
 
@@ -103,11 +111,15 @@ def test_missing_location_is_neutral_not_a_rejection():
 
 
 def test_empty_profile_scores_neutral_everywhere():
-    """No skills/roles/locations configured => every dimension is NEUTRAL."""
+    """Unstated preferences stay neutral; stated JD skills are uncovered."""
     profile = CandidateProfile()
     evidence = analyze(make_job(), profile)
 
     for name in ("skills", "role", "location", "employment", "company"):
+        if name == "skills":
+            assert evidence.signals[name]["score"] == 0
+            assert evidence.jd_skill_coverage == 0
+            continue
         assert evidence.signals[name]["score"] == pytest.approx(
             WEIGHTS[name] * 0.6, abs=0.01
         ), f"{name} should be neutral, not zero"
@@ -120,18 +132,41 @@ def test_empty_profile_scores_neutral_everywhere():
 
 def test_strong_skill_match_scores_well():
     profile = make_profile()
-    job = make_job(description="Python, FastAPI, SQL and machine learning. 0-1 years.")
+    job = make_job(description="Python, FastAPI, and SQL. 0-1 years.")
     evidence = analyze(job, profile)
 
-    assert len(evidence.matched_skills) >= 4
+    assert evidence.matched_skills == ["Python", "FastAPI", "SQL"]
+    assert evidence.jd_skill_coverage == 100
     assert evidence.signals["skills"]["score"] == pytest.approx(WEIGHTS["skills"], abs=1.0)
     assert evidence.missing_skills == []
+
+
+def test_python_backend_reports_redis_missing_and_mongodb_transferable_only():
+    profile = make_profile(skills=[
+        "Python", "FastAPI", "Flask", "REST API", "SQL", "MySQL",
+        "Git", "Docker", "PostgreSQL", "MongoDB",
+    ])
+    job = make_job(
+        title="TEST JOB P1 - Python Backend Developer",
+        description=(
+            "Required Skills: Python, FastAPI, Flask, REST API, SQL, MySQL, "
+            "Git, Docker, PostgreSQL, Redis."
+        ),
+    )
+    evidence = analyze(job, profile)
+
+    assert evidence.jd_skill_total_count == 10
+    assert evidence.jd_skill_matched_count == 9
+    assert evidence.jd_skill_coverage == 90
+    assert evidence.missing_skills == ["Redis"]
+    assert "Redis" not in evidence.matched_skills
+    assert ("Redis", "MongoDB") in evidence.transferable
 
 
 def test_weak_skill_overlap_scores_low():
     profile = make_profile()
     job = make_job(title="Sales Executive",
-                   description="Sales and marketing role. 0-1 years.")
+                   description="Java, Kubernetes, and AWS required.")
     evidence = analyze(job, profile)
 
     assert evidence.matched_skills == []
@@ -141,7 +176,7 @@ def test_weak_skill_overlap_scores_low():
 def test_skill_aliases_normalise_to_the_canonical_name():
     """'ML' in a posting must match a profile asking for Machine Learning."""
     profile = make_profile(skills=["Machine Learning"])
-    job = make_job(description="Work on ML models. 0-1 years.")
+    job = make_job(title="AI Engineer", description="Work on ML models. 0-1 years.")
     evidence = analyze(job, profile)
 
     assert evidence.matched_skills == ["Machine Learning"]
@@ -149,7 +184,7 @@ def test_skill_aliases_normalise_to_the_canonical_name():
 
 def test_nlp_alias_resolves_to_canonical_name():
     profile = make_profile(skills=["Natural Language Processing"])
-    job = make_job(description="NLP research work. 0-1 years.")
+    job = make_job(title="AI Engineer", description="NLP research work. 0-1 years.")
     evidence = analyze(job, profile)
 
     assert evidence.matched_skills == ["Natural Language Processing"]
@@ -302,7 +337,7 @@ def test_strong_deterministic_match_is_reduced_by_a_weak_ai_verdict():
     assert evidence.score >= 80
     assert result.match_score == expected
     assert result.match is False
-    assert result.priority is Priority.P3
+    assert result.priority is Priority.P2
 
 
 def test_weak_deterministic_match_is_not_rescued_by_a_strong_ai_verdict():
@@ -312,12 +347,16 @@ def test_weak_deterministic_match_is_not_rescued_by_a_strong_ai_verdict():
     )
     ai = AIResponse(relevant=True, priority=Priority.P1, match_score=100, reason="strong fit")
 
+    evidence = analyze(
+        make_job(title="Sales Executive", location="Mumbai", description="Java Kubernetes AWS"),
+        make_profile(),
+    )
     result = combine(evidence, None, ai)
 
     assert evidence.score < 30
     assert result.match_score == round(evidence.score * 0.6 + 100 * 0.4)
     assert result.match is False
-    assert result.priority is Priority.P3
+    assert result.priority is Priority.P2
 
 
 @pytest.mark.parametrize(
@@ -366,7 +405,8 @@ def test_match_result_rejects_out_of_range_source_scores(score_fields):
 
 def test_missing_skills_remain_visible_without_becoming_a_hard_veto():
     profile = make_profile(skills=["Python", "FastAPI", "SQL"])
-    evidence = analyze(make_job(description="Python role. 0-1 years."), profile)
+    profile = make_profile(skills=["Python"])
+    evidence = analyze(make_job(description="Python, FastAPI and SQL role. 0-1 years."), profile)
 
     result = combine(evidence, None, AIResponse(
         relevant=True, priority=Priority.P2, match_score=70, reason="partial fit"
@@ -389,8 +429,8 @@ def test_over_confident_model_cannot_manufacture_relevance():
     assert result.priority is not Priority.P1 or result.match_score < 80
 
 
-def test_ai_priority_is_a_ceiling_never_a_floor():
-    """Maths says P1, the model says P3 => the verdict stays P3."""
+def test_ai_priority_does_not_override_the_shared_score_classification():
+    """A model-provided tier cannot contradict the configured score bucket."""
     profile = CandidateProfile()
     evidence = analyze(make_job(), profile)
     config = type("Cfg", (), {"ai_match_weight": 1.0, "match_min_score": 55,
@@ -401,7 +441,30 @@ def test_ai_priority_is_a_ceiling_never_a_floor():
     result = combine(evidence, config, ai)
 
     assert result.match_score == 95       # pure AI score at weight 1.0
-    assert result.priority is Priority.P3
+    assert result.priority is Priority.P1
+
+
+def test_final_priority_uses_blended_score_not_ai_priority():
+    evidence = MatchEvidence()
+    evidence.signals["skills"] = {"weight": 45, "score": 99, "note": "fixture"}
+    config = type("Cfg", (), {
+        "ai_match_weight": 0.4,
+        "match_min_score": 55,
+        "priority_p1_min_score": 85,
+        "priority_p2_min_score": 65,
+        "priority_p3_min_score": 40,
+    })()
+    ai = AIResponse(
+        relevant=True, priority=Priority.P2, match_score=90, reason="good fit"
+    )
+
+    result = combine(evidence, config, ai)
+
+    assert result.deterministic_score == 99
+    assert result.ai_score == 90
+    assert result.ai_priority is Priority.P2
+    assert result.match_score == 95
+    assert result.priority is Priority.P1
 
 
 def test_hard_reject_outranks_the_ai():

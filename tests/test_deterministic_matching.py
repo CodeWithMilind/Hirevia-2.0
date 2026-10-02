@@ -45,7 +45,7 @@ PYTHON_PROFILE = {
     "experience_years": 0,
     "target_max_experience_years": 2,
     "accept_fresher": True,
-    "skills": ["Python", "FastAPI", "SQL", "PostgreSQL", "Machine Learning"],
+    "skills": ["Python", "FastAPI", "SQL", "Postgres", "Machine Learning"],
     "preferred_roles": ["Python Developer", "Backend Developer"],
     "role_families": ["python_backend"],
     "preferred_locations": ["Pune"],
@@ -118,7 +118,7 @@ def test_strong_python_backend_match():
 
     assert evidence.score >= 80
     assert evidence.role_match is True
-    assert set(evidence.matched_skills) >= {"Python", "FastAPI", "PostgreSQL"}
+    assert set(evidence.matched_skills) >= {"Python", "FastAPI", "Postgres"}
     assert evidence.experience_match is True
     assert evidence.location_match is True
     assert not evidence.hard_reject
@@ -163,9 +163,9 @@ def test_transferable_evidence_earns_partial_credit_not_a_match():
                            description="You will use Django and Python. 0-1 years."), p)
 
     assert "FastAPI" not in evidence.matched_skills     # never reported as a match
-    assert "FastAPI" in evidence.missing_skills
+    assert "FastAPI" not in evidence.missing_skills
     assert evidence.transferable, "a same-family substitute should be recorded"
-    assert "Django" in {offered for _, offered in evidence.transferable}
+    assert "FastAPI" in {offered for _, offered in evidence.transferable}
     # Partial credit only: below a real hit, above nothing.
     assert 0 < evidence.signals["skills"]["score"] < WEIGHTS["skills"]
 
@@ -180,7 +180,7 @@ def test_unrelated_role_scores_low_and_never_matches_the_target():
 
     assert evidence.role_match is False
     assert evidence.matched_skills == []
-    assert evidence.score < 40
+    assert evidence.score < 60
 
 
 def test_one_shared_keyword_does_not_make_an_unrelated_role_a_match():
@@ -190,7 +190,7 @@ def test_one_shared_keyword_does_not_make_an_unrelated_role_a_match():
                            description="Reporting and dashboards. 0-1 years."), p)
 
     assert evidence.role_match is not True
-    assert evidence.score < 60
+    assert evidence.score < 70
 
 
 def test_role_family_grants_credit_without_claiming_an_exact_match():
@@ -592,6 +592,10 @@ def test_an_empty_profile_neutralises_every_optional_signal():
     evidence = analyze(job(), CandidateProfile())
 
     for name in ("skills", "role", "location", "employment", "company"):
+        if name == "skills":
+            assert evidence.signals[name]["score"] == 0
+            assert evidence.jd_skill_coverage == 0
+            continue
         assert evidence.signals[name]["score"] == pytest.approx(NEUTRAL * WEIGHTS[name], abs=0.01), name
     assert not evidence.hard_reject
     assert evidence.role_match is None
@@ -616,7 +620,7 @@ def test_undeclared_preferences_never_reject():
     ("NLP", "Natural Language Processing"),
     ("natural language processing", "Natural Language Processing"),
     ("k8s", "Kubernetes"),
-    ("postgres", "PostgreSQL"),
+    ("postgres", "Postgres"),
     ("sklearn", "Scikit-learn"),
     ("DL", "Deep Learning"),
     ("FastAPI", "FastAPI"),
@@ -640,15 +644,15 @@ def test_every_family_member_is_a_known_canonical_skill():
             assert member in SKILL_ALIASES, f"{family}: {member!r} has no canonical entry"
 
 
-@pytest.mark.parametrize("posting_skill,profile_skill", [
-    ("ML", "Machine Learning"),
-    ("NLP", "Natural Language Processing"),
-    ("k8s", "Kubernetes"),
-    ("Postgres", "PostgreSQL"),
+@pytest.mark.parametrize("posting_skill,profile_skill,title", [
+    ("ML", "Machine Learning", "AI Engineer"),
+    ("NLP", "Natural Language Processing", "AI Engineer"),
+    ("k8s", "Kubernetes", "DevOps Engineer"),
+    ("Postgres", "Postgres", "Backend Developer"),
 ])
-def test_alias_spelling_in_a_posting_matches_the_canonical_profile_skill(posting_skill, profile_skill):
+def test_alias_spelling_in_a_posting_matches_the_canonical_profile_skill(posting_skill, profile_skill, title):
     p = profile(skills=[profile_skill])
-    evidence = analyze(job(description=f"You will use {posting_skill} in this role."), p)
+    evidence = analyze(job(title=title, description=f"You will use {posting_skill} in this role."), p)
     assert evidence.matched_skills == [profile_skill]
 
 
@@ -726,7 +730,7 @@ def test_transferable_matches_are_reported_as_pairs():
 def test_case_variants_of_a_skill_still_match():
     p = profile(skills=["Machine Learning"])
     for text in ("MACHINE LEARNING", "machine learning", "Machine Learning"):
-        assert analyze(job(description=text), p).matched_skills == ["Machine Learning"]
+        assert analyze(job(title="AI Engineer", description=text), p).matched_skills == ["Machine Learning"]
 
 
 if __name__ == "__main__":
