@@ -196,8 +196,19 @@ def test_transient_and_unavailable_primary_failures_fall_back(failure):
     assert router.last_provider == "groq" and router.last_model == "groq-model"
 
 
-@pytest.mark.parametrize("failure", [AIAuthError("invalid key"), AIError("invalid request")])
-def test_auth_and_configuration_errors_do_not_fall_back(failure):
+def test_auth_failure_uses_an_explicitly_configured_fallback():
+    primary = FakeProvider(AIAuthError("invalid key"))
+    fallback = FakeProvider(VALID_RESULT)
+    router = AIProviderRouter(
+        {"nvidia": primary, "groq": fallback}, "nvidia", ["groq"]
+    )
+
+    assert invoke(router) == VALID_RESULT
+    assert primary.calls == fallback.calls == 1
+
+
+def test_unclassified_provider_error_does_not_fall_back():
+    failure = AIError("invalid request")
     primary = FakeProvider(failure)
     fallback = FakeProvider(VALID_RESULT)
     router = AIProviderRouter({"nvidia": primary, "groq": fallback}, "nvidia", ["groq"])
@@ -272,11 +283,37 @@ def test_primary_provider_loads_from_environment(monkeypatch, tmp_path):
     assert router.fallback == ["nvidia", "groq", "ollama"]
 
 
-def test_invalid_primary_endpoint_does_not_silently_use_fallback(monkeypatch):
+def test_production_builder_constructs_and_uses_configured_fallback(monkeypatch):
+    config = Config()
+    config.ai.primary = "llamacpp"
+    config.ai.fallback = ["nvidia"]
+    config.ai.providers["llamacpp"].model = "local-model"
+    config.ai.providers["llamacpp"].requires_api_key = False
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    built = {}
+
+    def fake_client(**kwargs):
+        name = kwargs["provider_name"]
+        outcomes = [AIServerError("local model unavailable")] if name == "llamacpp" else [VALID_RESULT]
+        provider = FakeProvider(*outcomes, model=kwargs["model"])
+        built[name] = provider
+        return provider
+
+    monkeypatch.setattr("hirevia.ai.providers.OpenAICompatibleClient", fake_client)
+    router = build_ai_provider_router(config)
+
+    assert router.fallback == ["nvidia"]
+    assert set(router.providers) == {"llamacpp", "nvidia"}
+    assert invoke(router) == VALID_RESULT
+    assert built["llamacpp"].calls == built["nvidia"].calls == 1
+
+
+def test_invalid_primary_endpoint_errors_when_no_fallback_is_configured(monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "nv-test-key")
     monkeypatch.setenv("GROQ_API_KEY", "groq-test-key")
     config = Config()
     config.ai.primary = "nvidia"
+    config.ai.fallback = []
     config.nvidia_base_url = "not-a-url"
     router = build_ai_provider_router(config)
 

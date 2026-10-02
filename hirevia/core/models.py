@@ -197,9 +197,9 @@ class CandidateProfile(BaseModel):
 
 
 class AIResponse(BaseModel):
-    relevant: bool
-    priority: Priority
-    match_score: int = Field(ge=0, le=100)
+    relevant: Optional[bool] = None
+    priority: Optional[Priority] = None
+    match_score: Optional[int] = Field(default=None, ge=0, le=100)
     reasons: List[str] = Field(default_factory=list)
     # Which model produced this decision + the raw payload, for traceability.
     raw_data: Dict[str, Any] = Field(default_factory=dict)
@@ -217,6 +217,8 @@ class AIResponse(BaseModel):
     role_match: Optional[bool] = None
     education_match: Optional[bool] = None
     employment_match: Optional[bool] = None
+    fresher_eligible: Optional[bool] = None
+    rejection_reasons: List[str] = Field(default_factory=list)
 
     @property
     def status(self) -> str:
@@ -232,49 +234,80 @@ class AIResponse(BaseModel):
         "yes" vs true). Anything unusable degrades to a safe default instead of
         raising, so a malformed AI answer can never break a scan.
         """
-        data = data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            raise ValueError("AI response must be a JSON object")
 
-        priority = _priority_from(data.get("priority"), data.get("confidence_level"))
-        score = _score_from(data.get("match_score", data.get("score", data.get("similarity"))))
-        reasons = _reasons_from(data.get("reasons", data.get("reason", data.get("why"))))
+        raw_relevant = next((data[key] for key in ("match", "relevant", "is_match", "is_relevant") if key in data), None)
+        if not isinstance(raw_relevant, bool):
+            raise ValueError("AI response is missing a boolean match decision")
+        raw_score = next((data[key] for key in ("match_score", "score", "similarity") if key in data), None)
+        if isinstance(raw_score, bool) or not isinstance(raw_score, int) or not 0 <= raw_score <= 100:
+            raise ValueError("AI response must contain an integer match score from 0 to 100")
+        raw_priority = data.get("priority", data.get("confidence_level"))
+        if not isinstance(raw_priority, str) or raw_priority.strip().lower() not in _PRIORITY_ALIASES:
+            raise ValueError("AI response must contain a valid priority")
+        priority = _PRIORITY_ALIASES[raw_priority.strip().lower()]
+        raw_reason = data.get("reason", data.get("explanation", data.get("summary")))
+        if raw_reason is None:
+            raw_reason = data.get("reasons", data.get("why"))
+            if isinstance(raw_reason, list):
+                raw_reason = next((item for item in raw_reason if isinstance(item, str) and item.strip()), None)
+        if not isinstance(raw_reason, str) or not raw_reason.strip():
+            raise ValueError("AI response must contain a non-empty explanation")
 
-        relevant = _bool_from(
-            data.get("relevant", data.get("match", data.get("is_match", data.get("is_relevant"))))
-        )
-        if relevant is None:  # no explicit verdict -> infer from the score
-            relevant = score >= 60
+        raw_reasons = data.get("reasons", raw_reason)
+        if not isinstance(raw_reasons, str) and not (
+            isinstance(raw_reasons, list)
+            and all(isinstance(item, str) for item in raw_reasons)
+        ):
+            raise ValueError("AI response field reasons must be a string or an array of strings")
+        reasons = _reasons_from(raw_reasons)
+        matched_skills = data.get("matched_skills", data.get("skills_matched", []))
+        missing_skills = data.get("missing_skills", data.get("skills_missing", []))
+        rejection_reasons = data.get("rejection_reasons", [])
+        for field_name, value in (
+            ("matched_skills", matched_skills),
+            ("missing_skills", missing_skills),
+            ("rejection_reasons", rejection_reasons),
+        ):
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise ValueError(f"AI response field {field_name} must be an array of strings")
 
-        explanation = data.get("explanation") or data.get("summary") or ""
-        reason = str(data.get("reason") or "").strip() if isinstance(data.get("reason"), str) else ""
+        optional_bools = {}
+        for field_name in (
+            "experience_match", "location_match", "role_match", "education_match",
+            "employment_match", "fresher_eligible",
+        ):
+            value = data.get(field_name)
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"AI response field {field_name} must be a boolean")
+            optional_bools[field_name] = value
 
         return cls(
-            relevant=relevant,
+            relevant=raw_relevant,
             priority=priority,
-            match_score=score,
+            match_score=raw_score,
             reasons=reasons,
-            reason=(reason or str(explanation)).strip()[:400],
-            matched_skills=_skill_list_from(data.get("matched_skills", data.get("skills_matched"))),
-            missing_skills=_skill_list_from(data.get("missing_skills", data.get("skills_missing"))),
-            experience_match=_bool_from(data.get("experience_match")),
-            location_match=_bool_from(data.get("location_match")),
-            role_match=_bool_from(data.get("role_match")),
-            education_match=_bool_from(data.get("education_match")),
-            employment_match=_bool_from(data.get("employment_match")),
+            reason=raw_reason.strip()[:400],
+            matched_skills=_skill_list_from(matched_skills),
+            missing_skills=_skill_list_from(missing_skills),
+            rejection_reasons=rejection_reasons,
+            **optional_bools,
         )
 
     @classmethod
     def failure(cls, error: object) -> "AIResponse":
         """The documented fallback when AI matching is unavailable.
 
-        Fail-open but LOW priority: the job is kept for review/storage, it is
-        never escalated to a P1 alert just because the AI could not answer.
+        A failure carries no model decision or score; the job is retained for
+        retry/manual review without manufacturing an AI result.
         """
         message = str(error).replace("\n", " ")[:180] if error is not None else "unknown error"
         return cls(
-            relevant=True,
-            priority=Priority.P3,
-            match_score=50,
-            reasons=[f"AI unavailable - kept for manual review ({message})"],
+            relevant=None,
+            priority=None,
+            match_score=None,
+            reasons=[],
             degraded=True,
             error=message,
         )
@@ -397,9 +430,10 @@ class FilterResult(BaseModel):
 # --------------------------------------------------------------------------
 
 class MatchResult(BaseModel):
-    match: bool = False
-    match_score: int = Field(default=0, ge=0, le=100)
+    match: Optional[bool] = None
+    match_score: Optional[int] = Field(default=None, ge=0, le=100)
     priority: Priority = Priority.P3
+    assessment_status: str = "completed"
     reason: str = ""
     # A hard rule vetoed this job (see MatchEvidence.reject_reasons). The score
     # is already capped for those, but the flag keeps the *why* visible to the
@@ -417,9 +451,11 @@ class MatchResult(BaseModel):
     role_match: Optional[bool] = None
     education_match: Optional[bool] = None
     employment_match: Optional[bool] = None
+    fresher_eligible: Optional[bool] = None
+    ai_rejection_reasons: List[str] = Field(default_factory=list)
 
     # Traceability: which model answered, and what it answered with.
-    ai_status: str = "skipped"            # ok | failed | skipped
+    ai_status: str = "skipped"            # compatibility: ok | failed | skipped
     ai_model: Optional[str] = None
     ai_score: Optional[int] = Field(default=None, ge=0, le=100)
     ai_priority: Optional[Priority] = None
@@ -473,6 +509,8 @@ class MatchResult(BaseModel):
             role_match=self.role_match,
             education_match=self.education_match,
             employment_match=self.employment_match,
+            fresher_eligible=self.fresher_eligible,
+            rejection_reasons=self.ai_rejection_reasons,
         )
 
 

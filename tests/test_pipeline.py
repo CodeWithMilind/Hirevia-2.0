@@ -135,7 +135,7 @@ def run(pipeline):
     return asyncio.run(pipeline.run_scan())
 
 
-# --- happy path + cost gate ---------------------------------------------------
+# --- happy path + assessment eligibility ------------------------------------
 
 def test_scan_alerts_only_the_apply_ready_job(repo):
     good = make_job("Backend Developer", apply="https://boards.greenhouse.io/acme/jobs/1")
@@ -156,22 +156,24 @@ def test_scan_alerts_only_the_apply_ready_job(repo):
     assert stats.jobs_found == 3
     assert (stats.messages_checked, stats.jobs_detected, stats.jobs_normalized) == (40, 12, 3)
     assert stats.jobs_new == 3  # alerted, unusable-link, and unmatched jobs
-    assert stats.jobs_ai_matched == 1
+    assert stats.jobs_ai_matched == 2
     assert stats.jobs_ai_rejected == 1
     assert stats.jobs_link_rejected == 1
     assert stats.jobs_notified == 1
     assert stats.jobs_failed == 0
     assert stats.errors == []
 
-    # The channel-only post never reached the model: the link gate saves money.
-    assert "DevOps Engineer" not in matcher.calls
-    assert {"Backend Developer", "Sales Executive"} == set(matcher.calls)
+    # Application-link quality controls alerting, not model assessment.
+    assert set(matcher.calls) == {
+        "Backend Developer", "DevOps Engineer", "Sales Executive"
+    }
 
     # The unusable-link job is history, not a lead: stored, never notified.
     stored = repo.get_by_source_id("telegram", "jobs_alpha-2")
     assert stored is not None and stored.notified_at is None
     assert stored.raw_data["application_url_quality"] == "social"
     assert stored.raw_data["application_url_usable"] is False
+    assert stored.match_result["ai_status"] == "ok"
 
     unmatched = repo.get_by_source_id("telegram", "jobs_beta-3")
     assert unmatched is not None and unmatched.notified_at is None
@@ -208,6 +210,41 @@ def test_ai_rejected_job_is_persisted_without_becoming_notification_eligible(rep
     assert stats.jobs_new == 1 and stats.jobs_below_match == 1
     assert stats.jobs_notification_eligible == 0
     assert notifier.sent == []
+
+
+def test_completed_assessment_persists_structured_ai_evidence(repo):
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/structured")
+    matcher = FakeMatcher(default=AIResponse(
+        relevant=True,
+        priority=Priority.P2,
+        match_score=82,
+        reason="The backend responsibilities fit the candidate profile.",
+        matched_skills=["Python", "FastAPI"],
+        missing_skills=["SQL"],
+        experience_match=True,
+        role_match=True,
+        location_match=True,
+        employment_match=True,
+        fresher_eligible=True,
+    ))
+    pipeline = build_pipeline([FakeSource([job])], repo, matcher, ai_match_weight=1.0)
+    pipeline.profile = CandidateProfile(
+        candidate_type="fresher",
+        skills=["Python", "FastAPI", "SQL"],
+        preferred_roles=["Backend Developer"],
+        preferred_locations=["Remote"],
+    )
+
+    run(pipeline)
+
+    stored = repo.get_by_source_id(job.source, job.source_job_id)
+    assert stored.match_result["assessment_status"] == "completed"
+    assert stored.match_result["ai_score"] == 82
+    assert stored.match_result["deterministic_score"] == analyze(job, pipeline.profile).score
+    assert stored.match_result["matched_skills"] == ["Python", "FastAPI"]
+    assert stored.match_result["missing_skills"] == ["SQL"]
+    assert stored.match_result["fresher_eligible"] is True
+    assert "responsibilities fit" in stored.match_result["reason"]
 
 
 def test_retry_after_persistence_reuses_the_same_telegram_job_record(repo):
@@ -296,7 +333,7 @@ def test_ai_provider_failures_are_visible_in_scan_logs(repo, caplog):
     assert "AI provider failed for 'Backend Developer' (mock provider timeout)" in caplog.text
 
 
-def test_missing_application_url_is_stored_but_never_matched_or_alerted(repo):
+def test_missing_application_url_is_assessed_but_never_alerted(repo):
     job = make_job(apply=None)
     matcher = FakeMatcher()
     notifier = FakeNotifier()
@@ -304,14 +341,16 @@ def test_missing_application_url_is_stored_but_never_matched_or_alerted(repo):
     stats = run(build_pipeline([FakeSource([job])], repo, matcher, notifier))
 
     assert stats.jobs_link_rejected == 1
-    assert matcher.calls == []
+    assert matcher.calls == [job.title]
     assert notifier.sent == []
     stored = repo.get_by_source_id(job.source, job.source_job_id)
     assert stored is not None
     assert stored.raw_data["application_url_usable"] is False
+    assert stored.match_result["ai_status"] == "ok"
+    assert stored.ai_decision["relevant"] is True
 
 
-def test_deterministic_only_job_is_reported_as_ai_skipped(repo):
+def test_unconfigured_ai_job_is_persisted_as_retrying(repo):
     job = make_job(apply="https://jobs.lever.co/acme/backend")
     pipeline = build_pipeline([FakeSource([job])], repo)
     events = []
@@ -319,13 +358,15 @@ def test_deterministic_only_job_is_reported_as_ai_skipped(repo):
 
     stats = run(pipeline)
 
-    assert [event for event, _ in events] == ["start", "processing", "skipped", "job_complete"]
+    assert [event for event, _ in events] == ["start", "processing", "job_complete"]
     assert events[1][1]["job"].source_job_id == job.source_job_id
-    assert events[2][1]["job"].source_job_id == job.source_job_id
-    assert events[2][1]["rule_score"] == analyze(job, pipeline.profile).score
-    assert events[3][1]["status"] == "AI SKIPPED"
-    assert events[3][1]["score"] == events[2][1]["rule_score"]
+    assert events[2][1]["status"] == "AI RETRYING"
+    assert events[2][1]["score"] is None
     assert stats.jobs_rule_scored == 1
+    stored = repo.get_by_source_id(job.source, job.source_job_id)
+    assert stored.match_result["assessment_status"] == "retrying"
+    assert stored.match_result["deterministic_score"] == analyze(job, pipeline.profile).score
+    assert stored.match_result["match"] is None and stored.match_result["ai_score"] is None
 
 
 def test_collector_cursor_commits_after_successful_pipeline_run(repo):
@@ -342,7 +383,7 @@ def test_collector_cursor_commits_after_successful_pipeline_run(repo):
         make_job(apply="https://jobs.lever.co/acme/backend")
     ])
 
-    stats = run(build_pipeline([source], repo))
+    stats = run(build_pipeline([source], repo, FakeMatcher()))
 
     assert stats.jobs_failed == 0
     assert source.commits == 1
@@ -533,7 +574,7 @@ def test_ai_progress_is_printable_before_matcher_wait_and_completes_after_pipeli
     assert first_complete < second_processing
 
 
-def test_hard_reject_and_clear_role_miss_never_reach_ai_but_ambiguous_does(repo):
+def test_profile_hard_reject_and_clear_role_miss_still_reach_ai(repo):
     senior = make_job(
         "Senior Java Architect", apply="https://jobs.lever.co/acme/senior",
         message_id=21,
@@ -570,15 +611,12 @@ def test_hard_reject_and_clear_role_miss_never_reach_ai_but_ambiguous_does(repo)
 
     stats = run(pipeline)
 
-    assert set(matcher.calls) == {strong.title, ambiguous.title}
-    assert stats.jobs_filtered == 1
-    assert stats.jobs_hard_filter_passed == 3
-    assert stats.jobs_rule_scored == 3
-    assert stats.jobs_matching_attempted == 2
-    assert stats.jobs_ai_skipped == 1
-    assert stats.jobs_hard_filter_passed == 3
-    assert stats.jobs_rule_scored == 3
-    assert stats.jobs_ai_skipped == 1
+    assert set(matcher.calls) == {job.title for job in jobs}
+    assert stats.jobs_filtered == 0
+    assert stats.jobs_hard_filter_passed == 4
+    assert stats.jobs_rule_scored == 4
+    assert stats.jobs_matching_attempted == 4
+    assert stats.jobs_ai_skipped == 0
     assert len(jobs) == 4
 
 
@@ -754,9 +792,93 @@ def test_ai_outage_keeps_telegram_job_queued_for_retry(repo):
     assert stats.ai_failures == 1
     assert stats.jobs_failed == 1
     assert notifier.sent == []
-    assert repo.get_active_jobs() == []
+    stored = repo.get_by_source_id("telegram", "jobs_alpha-1")
+    assert stored is not None
+    assert stored.match_result["assessment_status"] == "retrying"
+    assert stored.match_result["match"] is None and stored.match_result["ai_score"] is None
     assert repo.get_telegram_queue_status()["queued"] == 1
     assert any("AI degraded" in err for err in stats.errors)
+
+
+def test_assessment_retry_exhaustion_is_failed_not_unmatched(repo):
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/retry-limit")
+    source = FakeSource([job])
+    matcher = FakeMatcher(default=AIResponse.failure(RuntimeError("provider down")))
+    pipeline = build_pipeline([source], repo, matcher)
+    pipeline.config.ai.assessment_max_attempts = 2
+
+    first = run(pipeline)
+    assert first.jobs_failed == 1
+    with repo._get_conn() as connection:
+        connection.execute("UPDATE processing_queue SET available_at = datetime('now', '-1 second')")
+        connection.commit()
+
+    second = run(pipeline)
+
+    stored = repo.get_by_source_id(job.source, job.source_job_id)
+    assert second.jobs_failed == 1
+    assert stored.match_result["assessment_status"] == "failed"
+    assert stored.match_result["match"] is None
+    assert stored.match_result["match_score"] is None
+    assert stored.match_result["ai_score"] is None
+    assert repo.get_telegram_queue_status()["queued"] == 0
+    with repo._get_conn() as connection:
+        assert connection.execute("SELECT status FROM processing_queue").fetchone()[0] == "FAILED"
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+
+
+def test_pending_assessment_resumes_after_worker_restart_without_duplicate(repo):
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/restart")
+    source = FakeSource([job])
+    failed = FakeMatcher(default=AIResponse.failure(RuntimeError("temporary outage")))
+    first = run(build_pipeline([source], repo, failed))
+    assert first.jobs_failed == 1
+
+    with repo._get_conn() as connection:
+        connection.execute("UPDATE processing_queue SET status = 'PROCESSING'")
+        connection.execute(
+            "UPDATE telegram_message_history SET status = 'PROCESSING'"
+        )
+        connection.commit()
+    assert repo.recover_processing_queue() == 1
+
+    recovered = FakeMatcher()
+    second = run(build_pipeline([source], repo, recovered))
+
+    stored = repo.get_by_source_id(job.source, job.source_job_id)
+    assert second.jobs_failed == 0
+    assert recovered.calls == [job.title]
+    assert stored.match_result["assessment_status"] == "completed"
+    with repo._get_conn() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+
+
+def test_legacy_skipped_telegram_job_is_backfilled_without_duplicate(repo):
+    job = make_job(apply="https://boards.greenhouse.io/acme/jobs/legacy")
+    job.match_result = {
+        "match": False,
+        "match_score": 31,
+        "priority": "P3",
+        "ai_status": "skipped",
+        "ai_score": None,
+        "deterministic_score": 31,
+    }
+    repo.upsert_job(job)
+    repo.record_telegram_message("jobs_alpha", "1")
+    repo.mark_telegram_message_processed("jobs_alpha", "1")
+    matcher = FakeMatcher()
+    notifier = FakeNotifier()
+
+    stats = run(build_pipeline([FakeSource([])], repo, matcher, notifier))
+
+    stored = repo.get_by_source_id(job.source, job.source_job_id)
+    assert matcher.calls == [job.title]
+    assert stored.match_result["assessment_status"] == "completed"
+    assert stored.match_result["ai_score"] == 92
+    assert stats.jobs_new == 0
+    assert notifier.sent == [job.title]
+    with repo._get_conn() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
 
 
 def test_p3_below_threshold_is_not_alerted(repo):
@@ -799,7 +921,7 @@ def test_p2_with_a_canonical_match_is_alerted(repo):
     assert notifier.sent == ["Backend Developer"]
 
 
-def test_high_ai_and_deterministic_scores_cannot_override_a_hard_veto(repo):
+def test_profile_hard_veto_is_assessed_but_still_controls_final_decision(repo):
     job = make_job(apply="https://boards.greenhouse.io/acme/jobs/81")
     job.description = "Python FastAPI. Requires 8+ years of experience."
     matcher = FakeMatcher(default=AIResponse(
@@ -818,10 +940,14 @@ def test_high_ai_and_deterministic_scores_cannot_override_a_hard_veto(repo):
     )
     stats = run(pipeline)
 
-    assert stats.jobs_filtered == 1
-    assert stats.jobs_matching_attempted == 0
-    assert matcher.calls == []
+    assert stats.jobs_filtered == 0
+    assert stats.jobs_matching_attempted == 1
+    assert matcher.calls == [job.title]
     assert notifier.sent == []
+    stored = repo.get_by_source_id(job.source, job.source_job_id)
+    assert stored is not None
+    assert stored.match_result["hard_reject"] is True
+    assert stored.match_result["ai_status"] == "ok"
 
 
 def test_future_timezone_aware_posting_does_not_crash_eligibility(repo):
@@ -894,9 +1020,11 @@ def test_ai_disabled_stores_without_alerting(repo):
     notifier = FakeNotifier()
     stats = run(build_pipeline([source], repo, None, notifier))
 
-    # No ranking means no ranking-based decision to alert on.
     assert stats.jobs_notified == 0 and stats.jobs_new == 1
-    assert notifier.sent == [] and stats.jobs_skipped_notification == 1
+    assert notifier.sent == [] and stats.jobs_failed == 1
+    stored = repo.get_by_source_id("telegram", "jobs_alpha-1")
+    assert stored.match_result["assessment_status"] == "retrying"
+    assert stored.match_result["match"] is None
 
 
 @pytest.mark.parametrize(

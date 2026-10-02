@@ -793,19 +793,28 @@ def combine(
     ai_weight = min(max(float(getattr(config, "ai_match_weight", 0.4)), 0.0), 1.0)
     min_score = int(getattr(config, "match_min_score", 55))
     min_score = max(min_score, int(getattr(config, "priority_p3_min_score", 40)))
-    failed_cap = int(getattr(config, "ai_failed_score_cap", 70))
 
+    valid_ai = bool(
+        ai is not None
+        and not ai.degraded
+        and ai.relevant is not None
+        and ai.match_score is not None
+        and ai.priority is not None
+    )
     if ai is None:
         status = "skipped"
-    elif ai.degraded:
+        assessment_status = "pending"
+    elif not valid_ai:
         status = "failed"
+        assessment_status = "failed"
     else:
         status = "ok"
+        assessment_status = "completed"
 
     ai_score = ai.match_score if (ai is not None and status == "ok") else None
     notes: List[str] = []
 
-    if evidence.hard_reject:
+    if evidence.hard_reject and status == "ok":
         # A stated veto outranks any score: a rejected job is never presented as
         # a near-match, and the AI cannot talk its way past it.
         score = min(deterministic, REJECTED_SCORE_CAP)
@@ -818,17 +827,17 @@ def combine(
             notes.append("AI judged this not relevant")
         score = int(min(100, max(0, round(blended))))
         match = score >= min_score
-    elif status == "failed":
-        # No AI judgement: keep the deterministic result, but never present a
-        # degraded verdict as high confidence.
-        score = min(int(round(deterministic * 0.9)), failed_cap)
-        match = score >= min_score
-        notes.append(f"AI unavailable - deterministic evidence only ({ai.error or 'unknown error'})")
     else:
-        score = deterministic
-        match = score >= min_score
+        # Without a completed assessment there is evidence, but no final score
+        # or match decision. Keep deterministic evidence in its own field.
+        score = None
+        match = None
+        if status == "failed":
+            notes.append(f"AI unavailable ({ai.error or 'unknown error'})")
 
-    priority = Priority.P3 if evidence.hard_reject else priority_for(score, config)
+    priority = Priority.P3 if evidence.hard_reject else priority_for(
+        score if score is not None else deterministic, config
+    )
     if status != "ok" and priority is Priority.P1:
         priority = Priority.P2  # no model confirmation -> never the top banner
     elif status == "ok":
@@ -865,6 +874,7 @@ def combine(
         match=match,
         match_score=score,
         priority=priority,
+        assessment_status=assessment_status,
         reason=reason[:500],
         matched_skills=matched,
         missing_skills=missing,
@@ -873,6 +883,8 @@ def combine(
         role_match=evidence.role_match,
         education_match=evidence.education_match,
         employment_match=evidence.employment_match,
+        fresher_eligible=ai.fresher_eligible if (ai is not None and status == "ok") else None,
+        ai_rejection_reasons=ai.rejection_reasons if (ai is not None and status == "ok") else [],
         ai_status=status,
         ai_model=model,
         ai_score=ai_score,

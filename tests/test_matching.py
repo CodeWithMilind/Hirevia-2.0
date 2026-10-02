@@ -419,8 +419,8 @@ def test_hard_reject_outranks_the_ai():
     assert "rejected" in result.reason.lower()
 
 
-def test_ai_failure_is_capped_and_flagged_degraded():
-    """Provider down => deterministic only, score capped, never a strong match."""
+def test_ai_failure_is_scoreless_and_flagged_degraded():
+    """Provider down => preserve evidence without inventing a final decision."""
     profile = make_profile()
     evidence = analyze(make_job(), profile)
     ai = AIResponse.failure(RuntimeError("model down"))
@@ -429,19 +429,22 @@ def test_ai_failure_is_capped_and_flagged_degraded():
 
     assert result.ai_status == "failed"
     assert result.degraded
-    assert result.match_score <= 70           # ai_failed_score_cap
+    assert result.match_score is None
+    assert result.match is None
     assert result.priority is not Priority.P1
     assert "AI unavailable" in result.reason
 
 
-def test_ai_skipped_is_marked_and_never_reaches_p1():
+def test_ai_pending_has_no_final_match_or_score():
     profile = make_profile()
     evidence = analyze(make_job(), profile)
 
     result = combine(evidence, None, None)
 
     assert result.ai_status == "skipped"
-    assert result.match_score == evidence.score
+    assert result.assessment_status == "pending"
+    assert result.match_score is None
+    assert result.match is None
     assert result.priority is not Priority.P1
 
 

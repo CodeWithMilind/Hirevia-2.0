@@ -45,17 +45,37 @@ def _match_fields(job: Job) -> Dict[str, Any]:
     result = job.match_result or {}
     verdict = job.verdict()
     matched = verdict.get("match", verdict.get("relevant"))
+    assessment_status = result.get("assessment_status")
+    if assessment_status is None:
+        assessment_status = {
+            "ok": "completed",
+            "failed": "failed",
+            "skipped": "pending",
+        }.get(result.get("ai_status"), "pending" if not result else "completed")
+    if matched is True:
+        match_status = "matched"
+    elif matched is False:
+        match_status = "unmatched"
+    elif assessment_status in {"pending", "retrying", "failed"}:
+        match_status = assessment_status
+    elif assessment_status == "not_required":
+        match_status = "unmatched"
+    else:
+        match_status = "unscored"
     return {
         "ai_decision": job.ai_decision,
         "match_result": job.match_result,
-        "match_status": "matched" if matched is True else "unmatched" if matched is False else "unscored",
+        "match_status": match_status,
         "match_score": verdict.get("match_score"),
         "match_priority": verdict.get("priority"),
         "deterministic_score": result.get("deterministic_score"),
         "ai_score": result.get("ai_score"),
         "ai_status": result.get("ai_status"),
+        "assessment_status": assessment_status,
         "matched_skills": result.get("matched_skills") or [],
         "missing_skills": result.get("missing_skills") or [],
+        "fresher_eligible": result.get("fresher_eligible"),
+        "ai_rejection_reasons": result.get("ai_rejection_reasons") or [],
         "match_reason": result.get("reason") or "",
         # The UI must be able to tell "the model was down" and "a hard rule
         # vetoed this" apart from an ordinary low score - all three look the
@@ -600,7 +620,7 @@ class WebUIState:
         deadline = asyncio.get_running_loop().time() + 12
         while asyncio.get_running_loop().time() < deadline:
             runtime = self._sync_external_worker_status()
-            if runtime.get("monitor_status") == "RUNNING":
+            if runtime.get("monitor_status") in {"RUNNING", "SCANNING", "RECONNECTING"}:
                 self.add_activity("Independent monitor worker started")
                 return True
             if runtime.get("monitor_status") in {"AUTH_REQUIRED", "ERROR"}:
@@ -614,7 +634,7 @@ class WebUIState:
             await asyncio.sleep(0.1)
         self.repo.set_source_state("system", "monitor_desired", "stopped")
         self.monitor_state = "ERROR"
-        self.monitor_start_error = "Monitor worker did not report RUNNING"
+        self.monitor_start_error = "Monitor worker did not report an active state"
         return False
     
     async def stop_scanner(self, persist_desired: bool = True):

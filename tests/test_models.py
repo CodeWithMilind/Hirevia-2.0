@@ -85,30 +85,30 @@ def test_ai_response_from_json():
     assert len(response.reasons) == 2
 
 
-def test_ai_response_invalid_priority():
+def test_ai_response_invalid_priority_is_rejected():
     data = {
         "relevant": True,
         "priority": "INVALID",
         "match_score": 50,
         "reasons": [],
     }
-    response = AIResponse.from_json(data)
-    assert response.priority == Priority.P3  # Default
+    with pytest.raises(ValueError, match="valid priority"):
+        AIResponse.from_json(data)
 
 
-def test_ai_response_score_clamping():
+def test_ai_response_out_of_range_score_is_rejected():
     data = {
         "relevant": True,
         "priority": "P1",
         "match_score": 150,
         "reasons": [],
     }
-    response = AIResponse.from_json(data)
-    assert response.match_score == 100
+    with pytest.raises(ValueError, match="integer match score"):
+        AIResponse.from_json(data)
 
     data["match_score"] = -10
-    response = AIResponse.from_json(data)
-    assert response.match_score == 0
+    with pytest.raises(ValueError, match="integer match score"):
+        AIResponse.from_json(data)
 
 
 def test_filter_result():

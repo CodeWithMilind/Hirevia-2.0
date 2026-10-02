@@ -3,6 +3,7 @@ ai:
   primary: llamacpp
   timeout_seconds: 20
   max_retries: 1
+  assessment_max_attempts: 3
   cooldown_seconds: 120
   providers:
     nvidia:

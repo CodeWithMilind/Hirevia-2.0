@@ -938,6 +938,58 @@ class JobRepository:
             conn.commit()
         return True
 
+    def enqueue_existing_assessment(self, job: Job) -> bool:
+        """Requeue one persisted job for assessment without creating a job row."""
+        if job.source != "telegram":
+            return False
+        channel_id = str(job.raw_data.get("source_channel") or "unknown")
+        message_id = str(job.raw_data.get("source_message_id") or job.source_job_id)
+        identity = self._telegram_message_identity(channel_id, message_id)
+        source_timestamp = job.posted_at.isoformat() if job.posted_at else None
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO telegram_message_history
+                    (message_identity, channel_id, message_id, source_timestamp)
+                VALUES (?, ?, ?, ?)
+                """,
+                (identity, channel_id, message_id, source_timestamp),
+            )
+            history = conn.execute(
+                "SELECT status FROM telegram_message_history WHERE message_identity = ?",
+                (identity,),
+            ).fetchone()
+            queued = conn.execute(
+                "SELECT status FROM processing_queue WHERE message_identity = ?",
+                (identity,),
+            ).fetchone()
+            if (
+                history is None
+                or history["status"] in {"EXPIRED", "PROCESSING", "QUEUED"}
+                or (queued is not None and queued["status"] != "QUEUED")
+            ):
+                conn.commit()
+                return False
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO processing_queue
+                    (message_identity, payload, status, source_timestamp)
+                VALUES (?, ?, 'QUEUED', ?)
+                """,
+                (identity, job.model_dump_json(), source_timestamp),
+            )
+            inserted = conn.execute(
+                "SELECT changes()"
+            ).fetchone()[0] > 0
+            if inserted:
+                conn.execute(
+                    "UPDATE telegram_message_history SET status = 'QUEUED' WHERE message_identity = ?",
+                    (identity,),
+                )
+            conn.commit()
+            return inserted
+
     def recover_processing_queue(self) -> int:
         """Return interrupted claims to the queue after an application restart."""
         with self._get_conn() as conn:
@@ -1010,6 +1062,36 @@ class JobRepository:
             conn.execute(
                 "DELETE FROM processing_queue WHERE message_identity = ?",
                 (message_identity,),
+            )
+            conn.commit()
+
+    def telegram_job_attempts(self, message_identity: str) -> int:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM processing_queue WHERE message_identity = ?",
+                (message_identity,),
+            ).fetchone()
+        return int(row["attempts"]) if row else 0
+
+    def fail_telegram_job(self, message_identity: str, error: str) -> None:
+        """Retain an exhausted item for history without making it claimable."""
+        safe_error = str(error)[:300]
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE processing_queue
+                SET status = 'FAILED', processing_started_at = NULL, last_error = ?
+                WHERE message_identity = ?
+                """,
+                (safe_error, message_identity),
+            )
+            conn.execute(
+                """
+                UPDATE telegram_message_history
+                SET status = 'FAILED', last_error = ?
+                WHERE message_identity = ? AND status != 'EXPIRED'
+                """,
+                (safe_error, message_identity),
             )
             conn.commit()
 

@@ -107,9 +107,10 @@ class AIProviderRouter:
                 if name in self.configuration_errors:
                     self.last_provider = name
                     self.last_model = None
-                    raise AIConfigurationError(
+                    last_error = AIConfigurationError(
                         f"AI provider {name} has invalid endpoint configuration"
                     )
+                    continue
                 logger.debug("[AI] provider %s is not configured; skipping", name)
                 continue
             cooldown_until = self._cooldown_until.get(name, 0.0)
@@ -145,8 +146,9 @@ class AIProviderRouter:
                     self._warned_cooldown.add(name)
                 else:
                     logger.debug("[AI] provider %s remains unavailable", name)
-            except AIAuthError:
-                raise
+            except AIAuthError as error:
+                last_error = error
+                logger.warning("[AI] provider %s authentication failed; trying fallback", name)
             except AIError:
                 raise
             except Exception as error:  # defensive boundary for injected/third-party providers
@@ -169,8 +171,8 @@ def build_ai_provider_router(
     configuration_errors: Dict[str, str] = {}
     if not settings.enabled:
         return AIProviderRouter(providers, settings.primary, [], settings.cooldown_seconds)
-    for name in (settings.primary,):
-        if name == settings.primary and primary_provider is not None:
+    for name in dict.fromkeys([settings.primary, *settings.fallback]):
+        if name == "nvidia" and primary_provider is not None:
             providers[name] = primary_provider
             continue
         spec = settings.providers.get(name)
@@ -206,7 +208,7 @@ def build_ai_provider_router(
     return AIProviderRouter(
         providers,
         primary=settings.primary,
-        fallback=[],
+        fallback=settings.fallback,
         cooldown_seconds=settings.cooldown_seconds,
         configuration_errors=configuration_errors,
     )

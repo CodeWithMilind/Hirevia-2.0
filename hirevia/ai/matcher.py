@@ -39,6 +39,8 @@ MATCH_RESPONSE_SCHEMA = {
         "role_match": {"type": "boolean"},
         "education_match": {"type": "boolean"},
         "employment_match": {"type": "boolean"},
+        "fresher_eligible": {"type": "boolean"},
+        "rejection_reasons": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["match", "match_score", "priority", "reason"],
     "additionalProperties": True,

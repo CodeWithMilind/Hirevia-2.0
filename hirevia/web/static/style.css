@@ -105,6 +105,8 @@ p { margin: 5px 0 0; color: var(--muted); }
 .match-score { color: var(--green); font: 12px var(--mono); }
 .match-status { color: var(--muted); font: 10px var(--mono); text-transform: uppercase; }
 .match-status.unmatched { color: var(--yellow); }
+.match-status.pending, .match-status.retrying { color: var(--blue); }
+.match-status.failed { color: var(--red); }
 .application-state { color: var(--muted); font-size: 10px; text-transform: capitalize; }
 .job-actions { display: flex; gap: 5px; margin-top: 3px; }
 .text-action { padding: 3px 5px; border: 0; background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; }

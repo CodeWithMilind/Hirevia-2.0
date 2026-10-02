@@ -97,8 +97,10 @@ function jobCard(job) {
   card.append(details);
 
   const side = node("div", "job-side");
-  side.append(node("span", "match-score", typeof job.match_score === "number" ? `${job.match_score}% match` : "Not scored"));
-  if (job.match_status === "unmatched") side.append(node("span", "match-status unmatched", "Unmatched"));
+  side.append(node("span", "match-score", typeof job.match_score === "number" ? `${job.match_score}% match` : `${job.assessment_status || "pending"} assessment`));
+  if (["unmatched", "pending", "retrying", "failed"].includes(job.match_status)) {
+    side.append(node("span", `match-status ${job.match_status}`, job.match_status));
+  }
   side.append(node("span", "application-state", job.application_status || "unknown"));
   const actions = node("div", "job-actions");
   const view = node("button", "text-action", "View");
@@ -259,7 +261,12 @@ function showJob(job) {
   body.replaceChildren();
   const facts = [
     ["Company", job.company], ["Location", job.location], ["Experience", job.experience],
-    ["Match status", job.match_status], ["Priority", job.match_priority], ["Match score", typeof job.match_score === "number" ? `${job.match_score}%` : "Not scored"],
+    ["Match status", job.match_status], ["Priority", job.match_priority],
+    ["Assessment status", job.assessment_status],
+    ["Final score", typeof job.match_score === "number" ? `${job.match_score}%` : "—"],
+    ["Deterministic score", typeof job.deterministic_score === "number" ? `${job.deterministic_score}%` : "—"],
+    ["AI match score", typeof job.ai_score === "number" ? `${job.ai_score}%` : "—"],
+    ["Fresher eligible", typeof job.fresher_eligible === "boolean" ? (job.fresher_eligible ? "Yes" : "No") : "—"],
     ["Application status", job.application_status], ["Source", job.source], ["Detected", relativeTime(job.detected_at)],
     ["Freshness", relativeTime(job.detected_at)], ["Expires", expiresLabel(job.expires_at)],
   ];
@@ -278,20 +285,20 @@ function showJob(job) {
     body.append(node("h3", "", "Match details"));
     body.append(node("p", "", job.match_reason));
   }
-  const scores = [
-    ["Deterministic score", verdict.deterministic_score],
-    ["AI score", verdict.ai_score],
-    ["AI assessment", verdict.ai_status],
-  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
-  if (scores.length) {
-    body.append(node("h3", "", "Scoring evidence"));
-    const scoreGrid = node("div", "system-grid");
-    scores.forEach(([label, value]) => {
-      const row = node("div", "system-row");
-      row.append(node("span", "", label), node("strong", "", typeof value === "number" && label !== "AI assessment" ? `${value}%` : value));
-      scoreGrid.append(row);
-    });
-    body.append(scoreGrid);
+  for (const [label, values] of [
+    ["Matched skills", job.matched_skills],
+    ["Missing skills", job.missing_skills],
+    ["AI rejection reasons", job.ai_rejection_reasons],
+    ["Hard-filter rejection reasons", verdict.reject_reasons],
+  ]) {
+    if (Array.isArray(values) && values.length) {
+      body.append(node("h3", "", label));
+      body.append(node("p", "", values.join(", ")));
+    }
+  }
+  if (job.ai_error) {
+    body.append(node("h3", "", "Assessment error"));
+    body.append(node("p", "", job.ai_error));
   }
   for (const [label, url] of [["Original posting", job.url], ["Application link", job.application_url]]) {
     if (!url) continue;

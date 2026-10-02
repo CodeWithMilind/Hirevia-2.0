@@ -107,6 +107,7 @@ class AIConfig(BaseModel):
     fallback: List[str] = Field(default_factory=lambda: ["nvidia", "groq", "ollama", "llamacpp"])
     timeout_seconds: int = Field(default=20, ge=1, le=300)
     max_retries: int = Field(default=1, ge=0, le=3)
+    assessment_max_attempts: int = Field(default=3, ge=1, le=10)
     cooldown_seconds: int = Field(default=120, ge=1, le=300)
     providers: Dict[str, AIProviderConfig] = Field(default_factory=_default_ai_providers)
 

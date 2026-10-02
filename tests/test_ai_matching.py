@@ -489,7 +489,7 @@ def test_dead_model_name_is_not_retried_because_a_retry_cannot_help():
     assert response.degraded is True
     assert "unavailable" in response.error.lower()
     assert len(fake.calls) == 1                  # fail fast, keep the scan moving
-    assert response.priority is Priority.P3      # never promoted on a broken model
+    assert response.match_score is None and response.priority is None
 
 
 def test_a_wrong_key_fails_fast_and_points_at_the_key(sleep_log):
@@ -521,16 +521,15 @@ def test_only_the_required_fields_are_enough():
     assert response.role_match is None
 
 
-def test_an_empty_object_is_an_answer_not_a_crash():
+def test_an_empty_object_is_rejected_as_an_incomplete_assessment():
     matcher, _ = make_matcher(completion("{}"))
 
     response = ask(matcher)
 
-    assert response.degraded is False            # the model did answer, uselessly
-    assert response.match_score == 0
-    assert response.priority is Priority.P3
-    assert response.relevant is False
-    assert response.reason == "" and response.reasons == []
+    assert response.degraded is True
+    assert response.match_score is None
+    assert response.priority is None
+    assert response.relevant is None
 
 
 @pytest.mark.parametrize("content", ["null", "[]", "\"P1\"", "3"])
@@ -550,51 +549,23 @@ def test_a_bare_true_answer_is_refused_rather_than_guessed():
 # --- 9. invalid score ---------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "raw, expected",
-    [
-        (900, 100),          # out of range high -> clamped
-        (-5, 0),             # out of range low -> clamped
-        ("85", 85),          # numeric string
-        ("85%", 85),         # unit the model likes to append
-        ("eighty", 0),       # no digits at all
-        (0.87, 87),          # 0-1 scale, scaled back up
-        (True, 0),           # a boolean is not a score
-        (None, 0),
-        ([], 0),
-    ],
-)
-def test_any_shape_of_score_arrives_inside_0_and_100(raw, expected):
+@pytest.mark.parametrize("raw", [900, -5, "85", "85%", "eighty", 0.87, True, None, []])
+def test_invalid_score_shapes_degrade_without_a_score(raw):
     payload = dict(VALID_PAYLOAD, match_score=raw)
     matcher, _ = make_matcher(completion(json.dumps(payload)))
 
     response = ask(matcher)
 
-    assert response.degraded is False            # the answer is still usable
-    assert 0 <= response.match_score <= 100
-    assert response.match_score == expected
-
-    verdict = combine(analyze(make_job(), make_profile()), make_config(), response)
-    assert 0 <= verdict.match_score <= 100       # and so is the blended verdict
+    assert response.degraded is True
+    assert response.match_score is None
+    assert response.relevant is None
 
 
 # --- 10. invalid priority -----------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "raw, expected",
-    [
-        ("P2", Priority.P2),
-        ("high", Priority.P1),                   # common alias
-        ("medium", Priority.P2),
-        ("P9", Priority.P3),                     # tier that does not exist
-        ("urgent-ish", Priority.P3),
-        ("", Priority.P3),
-        (None, Priority.P3),
-        (5, Priority.P3),                        # a number is not a tier
-    ],
-)
-def test_any_shape_of_priority_arrives_as_a_real_tier(raw, expected):
+@pytest.mark.parametrize("raw, expected", [("P2", Priority.P2), ("high", Priority.P1), ("medium", Priority.P2)])
+def test_known_priority_aliases_are_normalized(raw, expected):
     payload = dict(VALID_PAYLOAD, priority=raw)
     matcher, _ = make_matcher(completion(json.dumps(payload)))
 
@@ -604,10 +575,24 @@ def test_any_shape_of_priority_arrives_as_a_real_tier(raw, expected):
     assert isinstance(response.priority, Priority)
 
 
+@pytest.mark.parametrize("raw", ["P9", "urgent-ish", "", None, 5])
+def test_invalid_priority_values_degrade_without_a_priority(raw):
+    payload = dict(VALID_PAYLOAD, priority=raw)
+    matcher, _ = make_matcher(completion(json.dumps(payload)))
+
+    response = ask(matcher)
+
+    assert response.degraded is True
+    assert response.priority is None
+    assert response.match_score is None
+
+
 # --- 11. NVIDIA_MODEL configuration -------------------------------------------
 
 
 def test_nvidia_model_env_var_reaches_the_request(monkeypatch):
+    monkeypatch.setenv("AI_PRIMARY_PROVIDER", "nvidia")
+    monkeypatch.setenv("AI_FALLBACK_PROVIDERS", "")
     monkeypatch.setenv("NVIDIA_MODEL", "deepseek-ai/deepseek-v3.2")
     config = load_config()
     matcher, fake = make_matcher(completion(VALID_JSON), config=config)
@@ -902,12 +887,10 @@ def test_nonsense_values_cannot_produce_an_invalid_match_result():
     response = ask(matcher)
     verdict = combine(analyze(make_job(), make_profile()), make_config(), response)
 
-    assert isinstance(verdict.priority, Priority)
-    assert 0 <= verdict.match_score <= 100
-    # the model cannot claim a skill the posting never mentions
-    assert "Kubernetes" not in verdict.matched_skills
-    assert "Python" in verdict.matched_skills
-    assert verdict.ai_status == "ok"
+    assert response.degraded is True
+    assert verdict.assessment_status == "failed"
+    assert verdict.match is None and verdict.match_score is None
+    assert verdict.ai_score is None
 
 
 def test_a_failed_model_still_produces_a_usable_deterministic_verdict(sleep_log):
@@ -921,7 +904,7 @@ def test_a_failed_model_still_produces_a_usable_deterministic_verdict(sleep_log)
 
     assert verdict.ai_status == "failed" and verdict.degraded
     assert verdict.ai_score is None and verdict.ai_error
-    assert verdict.match_score <= make_config().ai_failed_score_cap
+    assert verdict.match_score is None and verdict.match is None
     assert verdict.priority is not Priority.P1        # never the top banner on AI-down
     assert "AI unavailable" in verdict.reason
     assert verdict.to_ai_response().match_score == verdict.match_score

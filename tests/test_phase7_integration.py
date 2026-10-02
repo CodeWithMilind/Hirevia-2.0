@@ -143,6 +143,7 @@ def build_pipeline(monkeypatch, tmp_path, job, ai_outcome=AI_PAYLOAD,
                    telegram_responses=None, verifier_status=ApplicationStatus.OPEN,
                    verifier_usable=True, max_age_hours=72):
     config = Config()
+    config.ai.primary = "nvidia"
     config.ai.fallback = []
     config.verify_application_urls = True
     config.notify_max_age_hours = max_age_hours
@@ -312,7 +313,7 @@ def test_actionability_and_failure_cases_complete_without_false_alerts(
 
     stats = run(pipeline)
 
-    assert stats.jobs_failed == (1 if case == "ai-failure" else 0)
+    assert stats.jobs_failed == (1 if case in {"ai-failure", "malformed-ai"} else 0)
     if case == "unknown-verification":
         assert stats.jobs_notified == 1
         assert len(telegram.calls) == 1
@@ -322,10 +323,12 @@ def test_actionability_and_failure_cases_complete_without_false_alerts(
 
     if case == "missing-link":
         assert job.application_url is None
-        assert fake_ai.calls == []
+        assert fake_ai.calls
         assert verifier.calls == []
+        stored = repo.get_by_source_id(job.source, job.source_job_id)
+        assert stored.match_result["assessment_status"] == "completed"
     elif case == "malformed-link":
-        assert fake_ai.calls == []
+        assert fake_ai.calls
         assert verifier.calls == []
         stored = repo.get_by_source_id(job.source, job.source_job_id)
         assert stored is not None
@@ -333,17 +336,24 @@ def test_actionability_and_failure_cases_complete_without_false_alerts(
         assert stored.raw_data["invalid_application_url"] == "not a URL"
         assert stored.raw_data["application_url_usable"] is False
     elif case == "hard-veto":
-        assert fake_ai.calls == []
-        assert stats.jobs_filtered == 1
+        assert fake_ai.calls
+        assert stats.jobs_filtered == 0
         assert verifier.calls == []
+        stored = repo.get_by_source_id(job.source, job.source_job_id)
+        assert stored.match_result["assessment_status"] == "completed"
+        assert stored.match_result["hard_reject"] is True
     elif case == "ai-failure":
         assert stats.jobs_failed == 1
-        assert repo.get_by_source_id(job.source, job.source_job_id) is None
+        stored = repo.get_by_source_id(job.source, job.source_job_id)
+        assert stored.match_result["assessment_status"] == "retrying"
+        assert stored.match_result["match"] is None
         assert repo.get_telegram_queue_status()["queued"] == 1
         assert telegram.calls == []
     elif case == "malformed-ai":
         assert fake_ai.calls
-        assert stats.jobs_failed == 0
+        stored = repo.get_by_source_id(job.source, job.source_job_id)
+        assert stored.match_result["assessment_status"] == "retrying"
+        assert stored.match_result["ai_score"] is None
         assert telegram.calls == []
     elif case == "closed":
         assert verifier.calls == [APPLICATION_URL]

@@ -516,6 +516,49 @@ def test_unmatched_p3_below_match_threshold_is_visible_in_jobs_and_filter(tmp_pa
         web_state.WebUIState._instance = None
 
 
+@pytest.mark.parametrize("assessment_status", ["pending", "retrying", "failed"])
+def test_dashboard_distinguishes_incomplete_assessments_from_unmatched(
+    tmp_path, assessment_status
+):
+    repo = JobRepository(tmp_path / f"assessment-{assessment_status}.db")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    job = Job(
+        source="telegram",
+        source_job_id=assessment_status,
+        title="Backend Developer",
+        company="Example",
+        location="Remote",
+        description="Python role",
+        url=f"https://t.me/jobs_alpha/{assessment_status}",
+        match_result={
+            "assessment_status": assessment_status,
+            "match": None,
+            "match_score": None,
+            "priority": "P3",
+            "ai_status": "failed" if assessment_status == "failed" else "skipped",
+            "ai_score": None,
+            "deterministic_score": 31,
+        },
+    )
+    repo.upsert_job(job)
+
+    try:
+        state = web_state.initialize_web_state(Config(), repo)
+        response = state.get_jobs()
+        assert response["jobs"][0]["assessment_status"] == assessment_status
+        assert response["jobs"][0]["match_status"] == assessment_status
+        assert response["jobs"][0]["match_score"] is None
+        assert response["jobs"][0]["deterministic_score"] == 31
+        assert state.get_jobs(match_status="unmatched")["total"] == 0
+        assert state.get_job_counts() == {
+            "ALL": 1, "P1": 0, "P2": 0, "P3": 1, "UNMATCHED": 0,
+        }
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
+
+
 def test_yaml_validation_rejects_invalid_yaml():
     with pytest.raises(HTTPException) as error:
         routes._validate_yaml("filters.yaml", "roles: [unterminated")
@@ -825,6 +868,64 @@ def test_monitor_desired_state_defaults_stopped_and_recovers_only_when_requested
         assert running is True
         assert state.monitor_state == "STOPPED"
         assert start_calls == [False]
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
+
+
+@pytest.mark.parametrize("monitor_status", ["RUNNING", "SCANNING", "RECONNECTING"])
+def test_external_monitor_start_keeps_desired_state_for_active_worker_status(
+    monkeypatch, tmp_path, monitor_status
+):
+    config = Config()
+    config.sources.sources["telegram"].enabled = False
+    state = web_state.initialize_web_state(
+        config, JobRepository(tmp_path / f"monitor-start-{monitor_status}.db")
+    )
+    state.external_worker = True
+    runtime = {
+        "alive": True,
+        "status": "RUNNING",
+        "monitor_status": "STOPPED",
+    }
+
+    def sync_worker_status():
+        state.worker_alive = runtime["alive"]
+        state.monitor_state = runtime["monitor_status"]
+        state.is_running = runtime["monitor_status"] in {
+            "RUNNING", "SCANNING", "RECONNECTING"
+        }
+        state.is_scanning = runtime["monitor_status"] == "SCANNING"
+        return runtime
+
+    async def acknowledge_start(command, arguments=None, *, timeout=20.0):
+        assert command == "START"
+        runtime["monitor_status"] = monitor_status
+        return {"running": True}
+
+    monkeypatch.setattr(state, "_sync_external_worker_status", sync_worker_status)
+    monkeypatch.setattr(state, "_send_worker_command", acknowledge_start)
+
+    async def start_and_advance_past_timeout():
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        started_at = clock[0]
+        monkeypatch.setattr(loop, "time", lambda: clock[0])
+
+        async def advance_clock(delay):
+            clock[0] += delay
+
+        monkeypatch.setattr(web_state.asyncio, "sleep", advance_clock)
+        started = await state.start_scanner()
+        clock[0] += 13
+
+        assert started is True
+        assert runtime["monitor_status"] == monitor_status
+        assert clock[0] - started_at > 12
+        assert state.repo.get_source_state("system", "monitor_desired") == "running"
+
+    try:
+        asyncio.run(start_and_advance_past_timeout())
     finally:
         web_state._web_state = None
         web_state.WebUIState._instance = None

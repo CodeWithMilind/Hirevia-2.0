@@ -6,9 +6,8 @@ Stage order (each stage logs one line so a scan is auditable end to end):
     2. collect from enabled sources    (per-source failures are isolated)
     3. deduplicate                      (fingerprint, then source id)
     4. deterministic filters            (filters.yaml - hard vetoes)
-    5. matching                         (5a cheap link gate, 5b hybrid match:
-                                         deterministic profile evidence +
-                                         AI judgement -> one MatchResult)
+    5. matching                         (deterministic evidence + required AI
+                                         judgement -> one MatchResult)
     6. application link verification, storage, notification
 
 Failure policy: one bad job never stops a scan and one dead source never stops
@@ -154,6 +153,7 @@ class Pipeline:
                     self.stats.jobs_duplicate += 1
             self.stats.jobs_expired += self.repo.expire_jobs()
             self.repo.expire_pending_telegram_jobs()
+            self._queue_existing_assessments()
             claimed_telegram_jobs = self.repo.claim_telegram_jobs()
             queue_identity_by_job = {
                 id(job): identity for identity, job in claimed_telegram_jobs
@@ -168,7 +168,7 @@ class Pipeline:
                     self._progress_started = True
             for index, job in enumerate(all_jobs, start=1):
                 job_started = time.perf_counter()
-                self._job_progress_state = {"status": "AI SKIPPED", "score": None}
+                self._job_progress_state = {"status": "AI PENDING", "score": None}
                 logger.info(
                     "%s [%d/%d] Processing job %r from %s",
                     PREFIX, index, total, job.title, job.source,
@@ -186,7 +186,31 @@ class Pipeline:
                     self.stats.jobs_failed += 1
                     self._record_error(f"{job.source}:{job.source_job_id} {type(e).__name__}: {e}")
                     queue_identity = queue_identity_by_job.get(id(job))
-                    if queue_identity:
+                    if isinstance(e, RetryableAIError):
+                        error_text = f"{type(e).__name__}: {e}"
+                        if queue_identity:
+                            attempts = self.repo.telegram_job_attempts(queue_identity)
+                            exhausted = attempts >= self.config.ai.assessment_max_attempts
+                            state = "failed" if exhausted else "retrying"
+                            self._persist_assessment_state(job, None, state, error_text)
+                            if exhausted:
+                                self.repo.fail_telegram_job(queue_identity, error_text)
+                            else:
+                                retry_delay = self.repo.retry_telegram_job(
+                                    queue_identity, error_text
+                                )
+                                logger.warning(
+                                    "%s Telegram assessment retry %d/%d in %ss",
+                                    PREFIX, attempts, self.config.ai.assessment_max_attempts,
+                                    retry_delay,
+                                )
+                            self._job_progress_state = {
+                                "status": "AI FAILED" if exhausted else "AI RETRYING",
+                                "score": None,
+                            }
+                        else:
+                            self._persist_assessment_state(job, None, "failed", error_text)
+                    elif queue_identity:
                         retry_delay = self.repo.retry_telegram_job(
                             queue_identity, f"{type(e).__name__}: {e}"
                         )
@@ -308,6 +332,7 @@ class Pipeline:
 
     async def _process_job(self, job: Job, index: int = 1, total: int = 1) -> None:
         tag = f"[{index}/{total}]"
+        resume_assessment = False
 
         # Stage 3: dedup. Fingerprint catches the same posting reached through
         # another source; source id catches a Telegram repost under a new title.
@@ -325,28 +350,60 @@ class Pipeline:
             self._merge_repost(existing, job)
             self.stats.jobs_duplicate += 1
             existing_verdict = existing.verdict_model()
-            if existing_verdict is not None:
-                self._job_progress_state = {
-                    "status": "AI SKIPPED",
-                    "score": existing_verdict.match_score,
-                }
-            logger.info(
-                "%s %s Stage 3 dedup skipped %r: existing job %s (%.3fs)",
-                PREFIX, tag, job.title, existing.id, time.perf_counter() - dedup_started,
+            assessment_status = (existing.match_result or {}).get("assessment_status")
+            same_message = (
+                existing.source == job.source
+                and existing.source_job_id == job.source_job_id
             )
-            # A repost proves the opening is still live: if an earlier alert
-            # never got out (Telegram was down), this is our retry.
-            await self._retry_failed_alert(existing)
-            return
-        logger.info("%s %s Stage 3 dedup passed (%.3fs)", PREFIX, tag, time.perf_counter() - dedup_started)
+            resume_assessment = same_message and (
+                assessment_status in {"pending", "retrying"}
+                or (existing.match_result or {}).get("ai_status") == "skipped"
+                or (
+                    existing.match_result is None
+                    and existing.ai_decision is None
+                    and not existing.raw_data.get("filter_status")
+                )
+            )
+            if resume_assessment:
+                job.match_result = existing.match_result
+                job.ai_decision = existing.ai_decision
+                job.raw_data.update(existing.raw_data)
+                logger.info(
+                    "%s %s Resuming %s assessment for existing job %s",
+                    PREFIX, tag, assessment_status or "pending", existing.id,
+                )
+            else:
+                if existing_verdict is not None:
+                    self._job_progress_state = {
+                        "status": "AI SKIPPED",
+                        "score": existing_verdict.match_score,
+                    }
+                logger.info(
+                    "%s %s Stage 3 dedup skipped %r: existing job %s (%.3fs)",
+                    PREFIX, tag, job.title, existing.id, time.perf_counter() - dedup_started,
+                )
+                # A repost proves the opening is still live: if an earlier alert
+                # never got out (Telegram was down), this is our retry.
+                await self._retry_failed_alert(existing)
+                return
+        else:
+            logger.info("%s %s Stage 3 dedup passed (%.3fs)", PREFIX, tag, time.perf_counter() - dedup_started)
 
         # Stage 4: deterministic filters (filters.yaml)
         filter_started = time.perf_counter()
-        filters = apply_filters(job, self.config.filters, self.profile)
+        filters = apply_filters(job, self.config.filters)
         if not filters.passed:
             self.stats.jobs_filtered += 1
             job.raw_data["filter_status"] = filters.status
             job.raw_data["filter_reason"] = filters.reason
+            job.match_result = {
+                "assessment_status": "not_required",
+                "match": False,
+                "match_score": None,
+                "priority": Priority.P3.value,
+                "reason": filters.reason,
+                "reject_reasons": [filters.reason] if filters.reason else [],
+            }
             if self.repo.upsert_job(job):
                 self.stats.jobs_new += 1
             logger.info(
@@ -367,22 +424,7 @@ class Pipeline:
         self._job_progress_state = {"status": "AI SKIPPED", "score": evidence.score}
         self.stats.jobs_rule_scored += 1
         self.stats.jobs_rule_strong += int(evidence.score >= self.config.match_min_score)
-        if evidence.hard_reject:
-            self.stats.jobs_filtered += 1
-            verdict = combine(evidence, self.config)
-            job.match_result = verdict.model_dump(mode="json")
-            job.raw_data["deterministic_score"] = verdict.deterministic_score
-            job.raw_data["ai_status"] = verdict.ai_status
-            if self.repo.upsert_job(job):
-                self.stats.jobs_new += 1
-            logger.info(
-                "%s %s Stage 4 profile eligibility rejected %r: %s",
-                PREFIX, tag, job.title, evidence.reject_reasons[0],
-            )
-            return
-
-        # Stage 5a: cheap link gate BEFORE paying for an AI call. A post whose
-        # only link is a channel/shortener/aggregator can never be applied to.
+        # Application quality affects notification eligibility, not assessment.
         quality = self._application_quality(job)
         self._stamp(job, quality)
         if not quality.usable:
@@ -394,77 +436,57 @@ class Pipeline:
             if self.repo.upsert_job(job):
                 self.stats.jobs_new += 1
             logger.info(
-                "%s %s Stage 5 pre-LLM skipped %r: unusable application link (%s); stored=%s",
-                PREFIX, tag, job.title, quality.reason, job.id,
+                "%s %s Stage 5 application link is not directly usable for %r (%s)",
+                PREFIX, tag, job.title, quality.reason,
             )
-            return
+
+        assessment_inserted = self._persist_assessment_state(
+            job, evidence, "retrying" if resume_assessment else "pending"
+        )
 
         # Stage 5b: hybrid matching. Deterministic profile evidence first
         # (free, auditable), then the model's semantic judgement, then one
         # verdict that storage, notifications and the dashboard all read.
-        if self.ai_matcher is not None and not _should_call_ai(evidence, self.config):
-            self.stats.jobs_ai_skipped += 1
-            verdict = combine(evidence, self.config)
+        self.stats.jobs_matching_attempted += 1
+        ai_started = time.perf_counter()
+        if self.ai_matcher is not None:
             logger.info(
-                "%s %s AI request skipped for %r: deterministic evidence below call threshold (score=%d)",
-                PREFIX, tag, job.title, evidence.score,
+                "%s %s AI request started for %r (provider=%s, model=%s)",
+                PREFIX, tag, job.title,
+                getattr(self.ai_matcher, "provider_name", "unknown"),
+                getattr(self.ai_matcher, "model", "unknown"),
             )
-            self._job_progress_state = {"status": "AI SKIPPED", "score": evidence.score}
-            job.match_result = verdict.model_dump(mode="json")
-            job.raw_data["deterministic_score"] = verdict.deterministic_score
-            job.raw_data["ai_status"] = verdict.ai_status
-            if self.ai_progress_callback:
+        else:
+            logger.info("%s %s Deterministic matching started for %r", PREFIX, tag, job.title)
+        if self.ai_matcher is not None and self.ai_progress_callback:
+            self._emit_ai_progress("sending_ai", job=job)
+        verdict = await self._match(job, tag, evidence)
+        logger.info(
+            "%s %s Matching completed for %r in %.3fs: matched=%s score=%d priority=%s ai_status=%s",
+            PREFIX, tag, job.title, time.perf_counter() - ai_started,
+            verdict.match, verdict.match_score, verdict.priority.value, verdict.ai_status,
+        )
+        if self.ai_progress_callback:
+            if self.ai_matcher is None:
+                self._job_progress_state = {"status": "AI SKIPPED", "score": evidence.score}
                 self._emit_ai_progress(
                     "skipped",
                     job=job,
                     rule_score=evidence.score,
                 )
-            if not verdict.match:
-                self.stats.jobs_below_match += 1
-                if self.repo.upsert_job(job):
-                    self.stats.jobs_new += 1
-                return
-        else:
-            self.stats.jobs_matching_attempted += 1
-            ai_started = time.perf_counter()
-            if self.ai_matcher is not None:
-                logger.info(
-                    "%s %s AI request started for %r (provider=%s, model=%s)",
-                    PREFIX, tag, job.title,
-                    getattr(self.ai_matcher, "provider_name", "unknown"),
-                    getattr(self.ai_matcher, "model", "unknown"),
-                )
             else:
-                logger.info("%s %s Deterministic matching started for %r", PREFIX, tag, job.title)
-            if self.ai_matcher is not None and self.ai_progress_callback:
-                self._emit_ai_progress("sending_ai", job=job)
-            verdict = await self._match(job, tag, evidence)
-            logger.info(
-                "%s %s Matching completed for %r in %.3fs: matched=%s score=%d priority=%s ai_status=%s",
-                PREFIX, tag, job.title, time.perf_counter() - ai_started,
-                verdict.match, verdict.match_score, verdict.priority.value, verdict.ai_status,
-            )
-            if self.ai_progress_callback:
-                if self.ai_matcher is None:
-                    self._job_progress_state = {"status": "AI SKIPPED", "score": evidence.score}
-                    self._emit_ai_progress(
-                        "skipped",
-                        job=job,
-                        rule_score=evidence.score,
-                    )
-                else:
-                    is_ai_error = verdict.ai_status == "failed"
-                    self._job_progress_state = {
-                        "status": "AI ERROR" if is_ai_error else (
-                            "MATCHED" if verdict.match else "NOT MATCHED"
-                        ),
-                        "score": verdict.match_score,
-                    }
-                    self._emit_ai_progress(
-                        "ai_error" if is_ai_error else "ai_response",
-                        job=job,
-                        verdict=verdict,
-                    )
+                is_ai_error = verdict.ai_status == "failed"
+                self._job_progress_state = {
+                    "status": "AI ERROR" if is_ai_error else (
+                        "MATCHED" if verdict.match else "NOT MATCHED"
+                    ),
+                    "score": verdict.match_score,
+                }
+                self._emit_ai_progress(
+                    "ai_error" if is_ai_error else "ai_response",
+                    job=job,
+                    verdict=verdict,
+                )
         if not verdict.match:
             self.stats.jobs_below_match += 1
             if self.repo.upsert_job(job):
@@ -479,15 +501,22 @@ class Pipeline:
         self._priority_counts[verdict.priority.value] += 1
 
         # Stage 6: light-touch availability check on the application page
-        self.stats.jobs_verification_attempted += 1
-        verification_started = time.perf_counter()
-        logger.info("%s %s Stage 6 application verification started for %r", PREFIX, tag, job.title)
-        status, quality = await self._verify(job, tag)
-        logger.info(
-            "%s %s Stage 6 application verification completed for %r in %.3fs: status=%s quality=%s",
-            PREFIX, tag, job.title, time.perf_counter() - verification_started,
-            status.value, quality.quality,
-        )
+        if quality.usable:
+            self.stats.jobs_verification_attempted += 1
+            verification_started = time.perf_counter()
+            logger.info("%s %s Stage 6 application verification started for %r", PREFIX, tag, job.title)
+            status, quality = await self._verify(job, tag)
+            logger.info(
+                "%s %s Stage 6 application verification completed for %r in %.3fs: status=%s quality=%s",
+                PREFIX, tag, job.title, time.perf_counter() - verification_started,
+                status.value, quality.quality,
+            )
+        else:
+            status = ApplicationStatus.UNKNOWN
+            logger.info(
+                "%s %s Stage 6 verification skipped for %r: no usable application link",
+                PREFIX, tag, job.title,
+            )
         self._stamp(job, quality)
         job.application_status = status
         if status is ApplicationStatus.OPEN:
@@ -498,9 +527,10 @@ class Pipeline:
             self.stats.jobs_unverified += 1
 
         # Stage 7: store, then decide about alerting
-        is_new = self.repo.upsert_job(job)
-        if is_new:
+        inserted_now = self.repo.upsert_job(job)
+        if inserted_now:
             self.stats.jobs_new += 1
+        is_new = inserted_now or assessment_inserted or resume_assessment
         logger.info(
             "%s %s Stage 7 persistence completed for %r: inserted=%s application_status=%s",
             PREFIX, tag, job.title, is_new, job.application_status.value,
@@ -609,28 +639,34 @@ class Pipeline:
 
         decision: Optional[AIResponse] = None
         if self.ai_matcher is None:
-            logger.debug("%s Stage 5: AI disabled - scoring on profile evidence only", PREFIX)
+            raise RetryableAIError("AI provider is not configured")
         else:
             args = (job, self.profile, evidence) if self._matcher_takes_evidence else (job, self.profile)
             decision = await self.ai_matcher.match(*args)  # never raises
             self.stats.ai_provider = getattr(self.ai_matcher, "provider_name", self.stats.ai_provider)
-            job.ai_decision = decision.model_dump()
-            if decision.degraded:
+            if (
+                decision.degraded
+                or decision.relevant is None
+                or decision.match_score is None
+                or decision.priority is None
+            ):
                 self.stats.ai_failures += 1
-                self._record_error(f"AI degraded ({job.source}/{job.source_job_id}): {decision.error}")
+                error = decision.error or "provider returned an incomplete assessment"
+                self._record_error(f"AI degraded ({job.source}/{job.source_job_id}): {error}")
                 logger.warning(
-                    "%s AI provider failed for %r (%s); continuing with profile evidence",
-                    PREFIX, job.title, decision.error or "unknown error",
+                    "%s AI provider failed for %r (%s); assessment will be retried",
+                    PREFIX, job.title, error,
                 )
-                if job.source == "telegram":
-                    raise RetryableAIError("AI evaluation failed; Telegram message remains queued")
-            elif decision.relevant:
+                raise RetryableAIError(error)
+            job.ai_decision = decision.model_dump(mode="json")
+            if decision.relevant:
                 self.stats.jobs_ai_matched += 1
             else:
                 self.stats.jobs_ai_rejected += 1
 
         verdict = combine(evidence, self.config, decision, getattr(self.ai_matcher, "model", None))
         job.match_result = verdict.model_dump(mode="json")
+        job.raw_data["assessment_status"] = verdict.assessment_status
         # Mirrors for the dashboard's existing flat readers.
         job.raw_data["deterministic_score"] = verdict.deterministic_score
         job.raw_data["ai_status"] = verdict.ai_status
@@ -642,7 +678,64 @@ class Pipeline:
             "n/a" if verdict.ai_score is None else f"{verdict.ai_score}%",
             verdict.reason[:140] or "no reason given",
         )
+        if self.repo.upsert_job(job):
+            self.stats.jobs_new += 1
         return verdict
+
+    def _persist_assessment_state(
+        self, job: Job, evidence, status: str, error: Optional[str] = None
+    ) -> bool:
+        if evidence is not None:
+            result = combine(evidence, self.config).model_dump(mode="json")
+        else:
+            result = dict(job.match_result or {})
+        result.update({
+            "assessment_status": status,
+            "match": None,
+            "match_score": None,
+            "ai_status": "failed" if status == "failed" else "skipped",
+            "ai_score": None,
+            "ai_priority": None,
+            "ai_error": error if status == "failed" else None,
+        })
+        signals = result.setdefault("signals", {})
+        ai_signals = signals.setdefault("ai", {})
+        ai_signals.update({
+            "status": status,
+            "score": None,
+            "priority": None,
+            "relevant": None,
+            "error": error,
+        })
+        job.match_result = result
+        job.ai_decision = None
+        job.raw_data["assessment_status"] = status
+        job.raw_data["ai_status"] = result["ai_status"]
+        if error:
+            job.raw_data["ai_error"] = error
+        else:
+            job.raw_data.pop("ai_error", None)
+        inserted = self.repo.upsert_job(job)
+        if inserted:
+            self.stats.jobs_new += 1
+        return inserted
+
+    def _queue_existing_assessments(self) -> None:
+        """Backfill persisted Telegram jobs that predate explicit assessment states."""
+        for job in self.repo.get_active_jobs(limit=1000, hours=24):
+            result = job.match_result or {}
+            status = result.get("assessment_status")
+            needs_assessment = (
+                status in {"pending", "retrying"}
+                or result.get("ai_status") == "skipped"
+                or (
+                    job.match_result is None
+                    and job.ai_decision is None
+                    and not job.raw_data.get("filter_status")
+                )
+            )
+            if needs_assessment:
+                self.repo.enqueue_existing_assessment(job)
 
     async def _verify(self, job: Job, tag: str):
         """Stage 6: reachability of the application page (best effort)."""
@@ -762,19 +855,6 @@ async def run_single_scan(
         config, repo, ai_matcher, notifier, diagnostic_output, ai_progress_callback
     )
     return await pipeline.run_scan()
-
-
-def _should_call_ai(evidence, config: Config) -> bool:
-    """Keep strong and uncertain candidates for semantic judgement; skip clear misses."""
-    if evidence.hard_reject:
-        return False
-    if evidence.role_match is True:
-        return True
-    if evidence.score >= config.match_min_score:
-        return True
-    if evidence.role_match is None:
-        return True
-    return False
 
 
 

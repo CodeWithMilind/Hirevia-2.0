@@ -151,9 +151,12 @@ class JobResponse(BaseModel):
     deterministic_score: Optional[int] = None
     ai_score: Optional[int] = None
     ai_status: Optional[str] = None
+    assessment_status: Optional[str] = None
     ai_error: Optional[str] = None
     matched_skills: List[str] = []
     missing_skills: List[str] = []
+    fresher_eligible: Optional[bool] = None
+    ai_rejection_reasons: List[str] = []
     match_reason: str = ""
     hard_reject: bool = False
     degraded: bool = False
