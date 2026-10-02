@@ -559,6 +559,40 @@ def test_dashboard_distinguishes_incomplete_assessments_from_unmatched(
         web_state.WebUIState._instance = None
 
 
+@pytest.mark.parametrize(
+    ("raw_data", "expected_status"),
+    [({"filter_status": "FILTERED"}, "not_required"), ({}, "unscored")],
+)
+def test_dashboard_does_not_infer_pending_without_an_explicit_assessment(
+    tmp_path, raw_data, expected_status
+):
+    repo = JobRepository(tmp_path / f"assessment-fallback-{expected_status}.db")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    job = Job(
+        source="telegram",
+        source_job_id=expected_status,
+        title="Backend Developer",
+        company="Example",
+        location="Remote",
+        description="Python role",
+        url="https://t.me/jobs_alpha/legacy",
+        raw_data=raw_data,
+    )
+    repo.upsert_job(job)
+
+    try:
+        state = web_state.initialize_web_state(Config(), repo)
+        displayed = state.get_jobs()["jobs"][0]
+        assert displayed["assessment_status"] == expected_status
+        assert displayed["match_status"] == (
+            "unmatched" if expected_status == "not_required" else "unscored"
+        )
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
+
+
 def test_yaml_validation_rejects_invalid_yaml():
     with pytest.raises(HTTPException) as error:
         routes._validate_yaml("filters.yaml", "roles: [unterminated")
@@ -1662,22 +1696,11 @@ def test_web_monitor_scan_and_job_actions_write_backend_logs(monkeypatch, tmp_pa
         web_state.WebUIState._instance = None
 
 
-def test_log_api_lists_and_downloads_only_managed_files(monkeypatch, tmp_path):
-    log_directory = tmp_path / "private-logs"
-    log_directory.mkdir()
-    current = log_directory / "hirevia.log"
-    current.write_text("service log data", encoding="utf-8")
-    (log_directory / "other.txt").write_text("not downloadable", encoding="utf-8")
-    monkeypatch.setenv("HIREVIA_LOG_DIR", str(log_directory))
+def test_log_file_endpoints_are_not_exposed():
+    paths = {route.path for route in routes.router.routes}
 
-    files = asyncio.run(routes.list_log_files())
-    response = asyncio.run(routes.download_log_file("hirevia.log"))
-
-    assert [item["name"] for item in files] == ["hirevia.log"]
-    assert files[0]["size_bytes"] == len("service log data")
-    assert Path(response.path) == current
-    with pytest.raises(HTTPException, match="Log file not found"):
-        asyncio.run(routes.download_log_file("..\\secrets.env"))
+    assert "/logs" not in paths
+    assert "/logs/{filename}" not in paths
 
 
 def test_delete_all_jobs_route_keeps_telegram_history(monkeypatch, tmp_path):

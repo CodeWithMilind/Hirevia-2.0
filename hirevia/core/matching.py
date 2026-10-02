@@ -400,7 +400,7 @@ def analyze(job: Job, profile: CandidateProfile) -> MatchEvidence:
     evidence.text = text
     evidence.job_skills = job_skills(job)
 
-    _score_skills(profile, text, evidence)
+    _score_skills(profile, text, evidence, getattr(job, "title", ""))
     _score_role(job, profile, evidence)
     _score_experience(profile, text, evidence)
     _score_location(job, profile, evidence)
@@ -425,8 +425,105 @@ def _profile_skills(profile: CandidateProfile) -> List[str]:
     return out
 
 
-def _score_skills(profile: CandidateProfile, text: str, evidence: MatchEvidence) -> None:
-    wanted = _profile_skills(profile)
+# Role-specific skill pools keep unrelated profile skills out of a job's
+# denominator. The pools are intersected with skills actually present in the
+# candidate profile, so this does not invent candidate skills.
+ROLE_SKILL_POOLS: Dict[str, List[str]] = {
+    "python_backend": [
+        "Python", "FastAPI", "Flask", "Django", "SQL", "MySQL",
+        "PostgreSQL", "MongoDB", "REST API", "Git", "Docker",
+    ],
+    "ai_ml": [
+        "Python", "Machine Learning", "Deep Learning",
+        "Artificial Intelligence", "TensorFlow", "PyTorch",
+        "NumPy", "Pandas",
+    ],
+    "data_scientist": [
+        "Python", "Machine Learning", "Deep Learning",
+        "Artificial Intelligence", "Data Analysis", "Pandas",
+        "NumPy", "TensorFlow", "PyTorch", "SQL",
+    ],
+    "data_analyst": [
+        "Python", "SQL", "Data Analysis", "Pandas", "NumPy",
+        "Power BI", "Excel",
+    ],
+    "full_stack": [
+        "JavaScript", "React", "Node.js", "Python", "SQL",
+        "MySQL", "PostgreSQL", "MongoDB", "REST API", "Git",
+    ],
+    "devops": ["Python", "AWS", "Azure", "Docker", "Git"],
+    "qa": ["Python", "Selenium", "Testing", "Java", "SQL"],
+}
+
+
+def _role_skill_families(job_title: str) -> List[str]:
+    """Infer relevant skill families from the job title, not its full description."""
+    title = re.sub(r"[^a-z0-9+#.]+", " ", str(job_title or "").lower()).strip()
+    families: List[str] = []
+
+    # Specific data roles must be checked before the broader AI/ML family.
+    if "data analyst" in title or "bi analyst" in title or "business intelligence analyst" in title:
+        families.append("data_analyst")
+    elif "data scientist" in title or "data science" in title:
+        families.append("data_scientist")
+
+    if any(term in title for term in (
+        "machine learning", " ml ", " ai ", "ai engineer",
+        "artificial intelligence", "deep learning", "genai",
+        "generative ai", "llm", "nlp",
+    )):
+        families.append("ai_ml")
+
+    if any(term in title for term in (
+        "backend", "back end", "back-end", "python developer",
+        "api developer", "server side", "server-side",
+    )):
+        families.append("python_backend")
+
+    if any(term in title for term in (
+        "full stack", "fullstack", "full-stack", "frontend",
+        "front end", "front-end", "web developer",
+    )):
+        families.append("full_stack")
+
+    if any(term in title for term in (
+        "devops", "sre", "site reliability", "platform engineer",
+        "cloud engineer", "infrastructure engineer",
+    )):
+        families.append("devops")
+
+    if any(term in title for term in (
+        "qa", "quality assurance", "test engineer", "software tester",
+    )):
+        families.append("qa")
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(families))
+
+
+def _skills_for_job(profile: CandidateProfile, job_title: str) -> List[str]:
+    """Return only declared profile skills relevant to the detected job family."""
+    all_skills = _profile_skills(profile)
+    families = _role_skill_families(job_title)
+    if not families:
+        # Unknown/generic titles retain the previous all-profile-skills behavior.
+        return all_skills
+
+    relevant = {
+        normalize_skill(skill)
+        for family in families
+        for skill in ROLE_SKILL_POOLS.get(family, [])
+    }
+    return [skill for skill in all_skills if skill in relevant]
+
+
+def _score_skills(
+    profile: CandidateProfile,
+    text: str,
+    evidence: MatchEvidence,
+    job_title: str = "",
+) -> None:
+    wanted = _skills_for_job(profile, job_title)
     if not wanted:
         evidence.add("skills", NEUTRAL, "profile declares no skills - skill relevance is neutral")
         return

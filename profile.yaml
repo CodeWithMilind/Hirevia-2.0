@@ -1,105 +1,87 @@
-name: "Milind Chaudhari"
+candidate:
+  experience_level: fresher
+  max_experience_years: 1
 
-summary: >-
-  Fresher interested in Python development, backend development, AI/ML,
-  data science, automation, and software engineering roles.
+  preferred_roles:
+    - Python Developer
+    - Backend Developer
+    - AI Engineer
+    - Machine Learning Engineer
+    - Data Scientist
+    - Data Analyst
 
-candidate_type: "fresher"
-experience_years: 0
-target_max_experience_years: 2
-graduation_year: 2026
-accept_fresher: true
-internship_preference: true
+  role_categories:
+    - software_development
+    - artificial_intelligence
+    - data
+    - cloud
+    - testing
+    - it_support
 
-education: "MCA"
-degree: "MCA"
+  preferred_locations:
+    - Pune
+    - Remote
 
-skill_groups:
-  languages:
+  employment_types:
+    - Full-time
+    - Internship
+
+  keywords:
     - Python
-    - Java
-    - JavaScript
-    - SQL
-  frameworks:
     - FastAPI
     - Flask
     - Django
+    - Java
+    - C++
+    - JavaScript
     - React
-  ai_ml:
-    - Machine Learning
-    - Deep Learning
-    - Scikit-learn
-    - Natural Language Processing
-    - Generative AI
-  data_science:
-    - Data Science
-    - Data Analysis
-    - Pandas
-    - NumPy
-    - Matplotlib
-    - Jupyter
-  backend:
-    - REST API
+    - Node.js
+    - SQL
     - MySQL
     - PostgreSQL
     - MongoDB
-    - Testing
-  tools:
+    - REST API
     - Git
+    - Machine Learning
+    - Deep Learning
+    - Artificial Intelligence
+    - Data Analysis
+    - Pandas
+    - NumPy
+    - TensorFlow
+    - PyTorch
+    - Power BI
+    - Excel
+    - AWS
+    - Azure
     - Docker
-    - Linux
     - Selenium
+    - Testing
 
-tools: []
-
-projects:
-  - "Data4Viz: AI-powered data analysis and visualization platform using FastAPI and Next.js"
-  - "Vizion: Python library for automated EDA and visualization"
-  - "Hirevia: AI-powered job hunting and job monitoring agent"
-  - "Machine learning prediction and classification projects"
-  - "Python automation and web scraping projects"
-
-preferred_roles:
-  - Python Developer
-  - Python Backend Developer
-  - Backend Developer
-  - Software Developer
-  - Software Engineer
-  - AI Engineer
-  - AI/ML Engineer
-  - ML Engineer
-  - Data Scientist
-  - Data Analyst
-  - GenAI Engineer
-  - Automation Developer
-  - Python Automation Developer
-  - Full Stack Developer
-
-role_families:
-  - python_backend
-  - ai_ml
-  - data
-  - full_stack
-  - qa
-
-preferred_locations:
-  - Pune
-  - Maharashtra
-  - India
-  - Remote
-
-remote_preference: "preferred"
-
-employment_types:
-  - full_time
-  - internship
-  - contract
-
-preferred_companies: []
-avoid_companies: []
-avoid_roles: []
-
-salary_min: 0
-salary_max: 2000000
-
-notice_period_days: 30
+matching:
+  p1_threshold: 70
+  p2_threshold: 40
+  p3_threshold: 1
+  fields_to_match:
+    - title
+    - description
+    - skills
+  use_ai_for_scoring: false
+  keyword_aliases:
+    PostgreSQL:
+      - Postgres
+    REST API:
+      - RESTful API
+      - RESTful APIs
+      - REST APIs
+    Machine Learning:
+      - Machine-learning
+      - ML
+      - ML models
+    JavaScript:
+      - JS
+    Node.js:
+      - NodeJS
+      - Node JS
+    Power BI:
+      - PowerBI

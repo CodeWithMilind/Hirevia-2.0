@@ -1,23 +1,19 @@
 """API routes for Web UI"""
 
 import os
-import re
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
-from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Query, Body
-from fastapi.responses import FileResponse
 import yaml
 from pydantic import ValidationError
 
 from hirevia.ai.providers import provider_status
 from hirevia.config import AIConfig, FilterConfig, SourcesConfig
-from hirevia.core.models import CandidateProfile
-from hirevia.profile.profile import validate_profile
+from hirevia.core.keyword_matching import parse_keyword_configuration
 from hirevia.sources.telegram_config import TelegramChannel, TelegramSettings
 from hirevia.web.state import get_web_state
 from hirevia.web.api.models import (
@@ -44,7 +40,6 @@ from hirevia.web.api.models import (
 
 router = APIRouter()
 CONFIG_FILE_NAMES = ("profile.yaml", "filters.yaml", "sources.yaml", "telegram.yaml", "ai.yaml")
-LOG_FILENAME_RE = re.compile(r"^hirevia\.log(?:\.\d+)?$")
 
 
 def _state():
@@ -62,20 +57,6 @@ async def _reload_configuration(state, *, env_keys=()) -> None:
             status_code=503,
             detail="Configuration was saved, but the worker did not apply it. Check worker status and retry.",
         ) from error
-
-
-def _log_directory() -> Path:
-    return Path(os.getenv("HIREVIA_LOG_DIR", "logs")).expanduser().resolve()
-
-
-def _available_log_files():
-    directory = _log_directory()
-    if not directory.is_dir():
-        return []
-    return sorted(
-        (path for path in directory.iterdir() if LOG_FILENAME_RE.fullmatch(path.name) and path.is_file()),
-        key=lambda path: path.name,
-    )
 
 
 @router.get("/status", response_model=SystemStatusResponse)
@@ -127,29 +108,6 @@ async def get_sources():
     """Get source status"""
     state = _state()
     return state.get_source_status()
-
-
-@router.get("/logs")
-async def list_log_files():
-    return [
-        {
-            "name": path.name,
-            "size_bytes": path.stat().st_size,
-            "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
-        }
-        for path in _available_log_files()
-    ]
-
-
-@router.get("/logs/{filename}")
-async def download_log_file(filename: str):
-    if not LOG_FILENAME_RE.fullmatch(filename):
-        raise HTTPException(status_code=404, detail="Log file not found")
-    directory = _log_directory()
-    candidate = (directory / filename).resolve()
-    if candidate.parent != directory or not candidate.is_file():
-        raise HTTPException(status_code=404, detail="Log file not found")
-    return FileResponse(candidate, media_type="text/plain", filename=filename)
 
 
 @router.get("/queue/status")
@@ -329,8 +287,8 @@ def _validate_yaml(filename: str, content: str) -> list[str]:
         if not isinstance(payload, dict):
             raise ValueError("YAML document must contain a mapping at the root")
         if filename == "profile.yaml":
-            profile = CandidateProfile.model_validate(payload)
-            return validate_profile(profile)
+            parse_keyword_configuration(payload)
+            return []
         if filename == "filters.yaml":
             FilterConfig.model_validate(payload)
         elif filename == "sources.yaml":

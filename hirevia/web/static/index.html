@@ -18,7 +18,6 @@
             <button class="nav-item" data-view="telegram"><span class="nav-icon">◉</span><span>Telegram</span></button>
             <button class="nav-item" data-view="ai"><span class="nav-icon">⌘</span><span>AI &amp; Models</span></button>
             <button class="nav-item" data-view="config"><span class="nav-icon">⚙</span><span>Configuration</span></button>
-            <button class="nav-item" data-view="logs"><span class="nav-icon">≡</span><span>Logs</span></button>
             <button class="nav-item" data-view="system"><span class="nav-icon">◌</span><span>System</span></button>
         </nav>
         <div class="rail-footer"><span class="live-dot" id="railDot"></span><span id="railStatus">Connecting</span><span class="rail-version">2.0</span></div>
@@ -81,10 +80,6 @@
             <section class="view" id="view-config">
                 <div class="view-heading"><div><div class="eyebrow">SOURCE FILES</div><h1>Configuration</h1></div></div>
                 <div class="config-layout"><nav class="config-files" id="configFiles" aria-label="Configuration files"><div class="empty-state">Loading files…</div></nav><div class="editor-pane"><div class="editor-heading"><strong id="editorFilename">Select a configuration file</strong><span class="form-message" id="configMessage" role="status"></span></div><textarea id="yamlEditor" spellcheck="false" aria-label="YAML configuration"></textarea><div class="form-actions"><button class="button quiet" id="validateYaml" disabled>Validate</button><button class="button primary" id="saveYaml" disabled>Save</button></div></div></div>
-            </section>
-
-            <section class="view" id="view-logs">
-                <div class="view-heading"><div><div class="eyebrow">SERVER FILES</div><h1>Logs</h1></div></div><div class="log-list" id="logFiles"><div class="empty-state">Loading log files…</div></div>
             </section>
 
             <section class="view" id="view-system">

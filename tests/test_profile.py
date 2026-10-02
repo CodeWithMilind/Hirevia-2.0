@@ -120,8 +120,8 @@ def test_broken_yaml_falls_back_without_raising(tmp_path):
     assert profile.candidate_type == "fresher"
 
 
-def test_profile_is_inherited_from_filters_when_present(tmp_path):
-    """A missing profile.yaml must not leave the matcher blind."""
+def test_profile_preferences_are_not_inherited_from_filters(tmp_path):
+    """filters.yaml is not a fallback source for candidate preferences."""
     from hirevia.config import FilterConfig
 
     filters = FilterConfig(
@@ -133,11 +133,35 @@ def test_profile_is_inherited_from_filters_when_present(tmp_path):
     )
     profile = load_profile(tmp_path / "missing.yaml", filters)
 
+    assert profile.preferred_roles == []
+    assert profile.preferred_locations == []
+    assert profile.employment_types == []
+    assert profile.skills == []
+    assert profile.target_max_experience_years == 2
+
+
+def test_nested_candidate_preferences_load_for_existing_profile_consumers(tmp_path):
+    path = write_profile(
+        tmp_path,
+        {
+            "candidate": {
+                "experience_level": "fresher",
+                "max_experience_years": 1,
+                "preferred_roles": ["Python Developer"],
+                "preferred_locations": ["Pune"],
+                "keywords": ["Python", "SQL"],
+            },
+            "matching": {"p1_threshold": 70},
+        },
+    )
+
+    profile = load_profile(path)
+
+    assert profile.candidate_type == "fresher"
+    assert profile.target_max_experience_years == 1
     assert profile.preferred_roles == ["Python Developer"]
     assert profile.preferred_locations == ["Pune"]
-    assert profile.employment_types == ["full_time"]
-    assert set(profile.skills) >= {"Python", "SQL"}
-    assert profile.target_max_experience_years == 3
+    assert profile.skills == ["Python", "SQL"]
 
 
 # --- validation ---------------------------------------------------------------

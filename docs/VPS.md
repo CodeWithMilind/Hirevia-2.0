@@ -53,7 +53,7 @@ Then open `http://127.0.0.1:8000`. For public access, retain the loopback bind a
 
 On a new install the monitor is stopped. Log into Telegram in the dashboard, wait for channel validation to finish, then select **Start Monitor**. Select **Stop Monitor** to stop collection without logging out. The desired state is stored in the shared jobs database; restarting either service or rebooting the VPS resumes a previously running monitor, but leaves a manually stopped monitor stopped. Logout clears desired running state and removes the dedicated Telethon session.
 
-Use the dashboard Logs page to download the current or rotated application log. The log directory is `/var/log/hirevia`; database and Telegram session files remain under `/var/lib/hirevia` and are separate.
+Application log files are stored and rotated under `/var/log/hirevia`; they are not exposed through the dashboard or API. Database and Telegram session files remain under `/var/lib/hirevia` and are separate.
 
 Operational commands:
 
@@ -65,7 +65,7 @@ sudo systemctl start hirevia-worker.service
 sudo journalctl -u hirevia-worker.service -n 100 --no-pager
 ```
 
-The journal contains concise service output. Rotating application logs are managed by Hirevia and downloadable from the authorized Logs API.
+The journal contains concise service output. For diagnostics, use `journalctl` or inspect the current and rotated application logs directly on the VPS.
 
 ## Update
 

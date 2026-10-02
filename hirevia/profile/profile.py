@@ -6,10 +6,9 @@ locations: both read this model, so updating the candidate is a one-file change.
 
 Location precedence: explicit argument > PROFILE_PATH env > ./profile.yaml
 
-A missing or unreadable profile never breaks a scan: load_profile() falls back
-to the baseline candidate below, enriched with whatever filters.yaml already
-declares (roles / locations / employment / experience ceiling), and logs one
-warning telling the user how to fix it.
+A missing or unreadable profile never breaks profile loading: load_profile()
+uses the baseline candidate below. Candidate matching preferences are never
+inherited from filters.yaml.
 """
 
 import logging
@@ -83,7 +82,7 @@ def load_profile(
         logger.warning("[Profile] %s is empty - using baseline profile", path)
         return _baseline_profile(filters)
 
-    profile = _build_profile(data, filters)
+    profile = _build_profile(data)
     for warning in validate_profile(profile):
         logger.warning("[Profile] %s: %s", path.name, warning)
     logger.debug(
@@ -96,7 +95,7 @@ def load_profile(
 
 def build_profile(data: Dict[str, Any], filters=None) -> CandidateProfile:
     """Public entry point used by tests and tooling."""
-    return _build_profile(data, filters)
+    return _build_profile(data)
 
 # --------------------------------------------------------------------------
 # Validation
@@ -146,16 +145,24 @@ def validate_profile(profile: CandidateProfile) -> List[str]:
 # --------------------------------------------------------------------------
 
 def _baseline_profile(filters=None) -> CandidateProfile:
-    data = dict(BASELINE)
-    _inherit_from_filters(data, filters)
-    return _build_profile(data, filters=None)
+    return _build_profile(dict(BASELINE))
 
 
 def _build_profile(data: Dict[str, Any], filters=None) -> CandidateProfile:
+    data = dict(data)
+    candidate = data.pop("candidate", None)
+    data.pop("matching", None)
+    if isinstance(candidate, dict):
+        data.update(candidate)
+        if "candidate_type" not in data and candidate.get("experience_level") is not None:
+            data["candidate_type"] = candidate["experience_level"]
+        if "target_max_experience_years" not in data and candidate.get("max_experience_years") is not None:
+            data["target_max_experience_years"] = candidate["max_experience_years"]
+        if "skills" not in candidate:
+            data["skills"] = candidate.get("keywords", [])
+
     payload: Dict[str, Any] = dict(BASELINE)
     payload.update({k: v for k, v in data.items() if v is not None})
-
-    _inherit_from_filters(payload, filters)
 
     for key in ("name", "summary", "education", "degree", "candidate_type",
                 "remote_preference", "max_seniority"):
@@ -186,32 +193,6 @@ def _build_profile(data: Dict[str, Any], filters=None) -> CandidateProfile:
     )
 
     return CandidateProfile(**payload)
-
-
-def _inherit_from_filters(payload: Dict[str, Any], filters) -> None:
-    """Fill profile gaps from filters.yaml so one missing file cannot leave the
-    matcher blind. Anything the profile already declares always wins."""
-    if filters is None:
-        return
-
-    def wanted(key: str, value) -> None:
-        current = payload.get(key)
-        if (current in (None, "", [], {}) or current == BASELINE.get(key)) and value:
-            payload[key] = list(value)
-
-    wanted("preferred_roles", getattr(filters, "roles", None))
-    wanted("preferred_locations", getattr(filters, "locations", None))
-    wanted("employment_types", getattr(filters, "employment", None))
-    wanted("skills", getattr(filters, "skills", None))
-
-    experience = getattr(filters, "experience", None) or {}
-    if isinstance(experience, dict):
-        if experience.get("max_years") is not None:
-            payload["target_max_experience_years"] = _int(
-                experience.get("max_years"), payload.get("target_max_experience_years")
-            )
-        if experience.get("fresher") is not None:
-            payload["accept_fresher"] = _bool(experience.get("fresher"), True)
 
 def _text(value) -> str:
     if value is None:

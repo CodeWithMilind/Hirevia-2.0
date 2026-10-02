@@ -142,12 +142,20 @@ class JobResponse(BaseModel):
     ai_decision: Optional[Dict[str, Any]] = None
     freshness_minutes: Optional[int] = None
     match_status: Optional[str] = None
-    match_score: Optional[int] = None
+    match_score: Optional[float] = None
     match_priority: Optional[str] = None
     # Phase 7 hybrid verdict (deterministic evidence + AI). Declared here so
     # JobResponse does not silently drop them: pydantic ignores undeclared
     # fields, and the dashboard would lose the evidence behind the score.
     match_result: Optional[Dict[str, Any]] = None
+    keyword_match_result: Optional[Dict[str, Any]] = None
+    keyword_match_percentage: Optional[float] = None
+    keyword_priority: Optional[str] = None
+    matched_keywords: List[str] = Field(default_factory=list)
+    unmatched_keywords: List[str] = Field(default_factory=list)
+    matched_keyword_count: int = 0
+    total_keyword_count: int = 0
+    matching_method: Optional[str] = None
     deterministic_score: Optional[int] = None
     ai_score: Optional[int] = None
     ai_status: Optional[str] = None

@@ -27,6 +27,7 @@ from hirevia.config import Config
 from hirevia.core.dedup import compute_fingerprint
 from hirevia.core.filtering import apply_filters
 from hirevia.core.freshness import freshness_label, sort_by_freshness
+from hirevia.core.keyword_matching import load_keyword_configuration, match_keywords
 from hirevia.core.matching import analyze, combine
 from hirevia.core.models import AIResponse, ApplicationStatus, Job, MatchResult, Priority, ScanStats
 from hirevia.core.verification import UrlQuality, classify_application_url, verify_application
@@ -86,7 +87,8 @@ class Pipeline:
         self.diagnostic_output = diagnostic_output
         self.ai_progress_callback = ai_progress_callback
         self.registry = SourceRegistry(config)
-        self.profile = load_profile(self.config.profile_path, self.config.filters)
+        self.profile = load_profile(self.config.profile_path)
+        self.keyword_configuration = load_keyword_configuration(self.config.profile_path)
         self.stats = ScanStats()
         self.stats.ai_provider = getattr(ai_matcher, "provider_name", "disabled") if ai_matcher else "disabled"
         self._matcher_takes_evidence = _accepts_evidence(ai_matcher)
@@ -333,6 +335,8 @@ class Pipeline:
     async def _process_job(self, job: Job, index: int = 1, total: int = 1) -> None:
         tag = f"[{index}/{total}]"
         resume_assessment = False
+        keyword_result = match_keywords(job, self.keyword_configuration)
+        job.raw_data["keyword_match"] = keyword_result.model_dump(mode="json")
 
         # Stage 3: dedup. Fingerprint catches the same posting reached through
         # another source; source id catches a Telegram repost under a new title.
@@ -389,6 +393,26 @@ class Pipeline:
         else:
             logger.info("%s %s Stage 3 dedup passed (%.3fs)", PREFIX, tag, time.perf_counter() - dedup_started)
 
+        evidence = analyze(job, self.profile)
+        logger.debug(
+            "%s Keyword diagnostics title=%r matched_keywords=%s matched_keyword_count=%d "
+            "total_keyword_count=%d keyword_match_percentage=%s role_match=%s "
+            "location_match=%s experience_compatibility=%s employment_type_match=%s "
+            "final_score=%s final_classification=%s",
+            PREFIX,
+            job.title,
+            keyword_result.matched_keywords,
+            keyword_result.matched_keyword_count,
+            keyword_result.total_keyword_count,
+            keyword_result.match_percentage,
+            evidence.role_match,
+            evidence.location_match,
+            evidence.experience_match,
+            evidence.employment_match,
+            keyword_result.match_percentage,
+            keyword_result.priority,
+        )
+
         # Stage 4: deterministic filters (filters.yaml)
         filter_started = time.perf_counter()
         filters = apply_filters(job, self.config.filters)
@@ -420,7 +444,6 @@ class Pipeline:
             PREFIX, tag, job.title, filters.status, time.perf_counter() - filter_started,
         )
 
-        evidence = analyze(job, self.profile)
         self._job_progress_state = {"status": "AI SKIPPED", "score": evidence.score}
         self.stats.jobs_rule_scored += 1
         self.stats.jobs_rule_strong += int(evidence.score >= self.config.match_min_score)
@@ -596,6 +619,8 @@ class Pipeline:
             existing.raw_data["source_channels"] = merged
         if job.application_url and not existing.application_url:
             existing.application_url = str(job.application_url)
+        if isinstance(job.raw_data.get("keyword_match"), dict):
+            existing.raw_data["keyword_match"] = job.raw_data["keyword_match"]
         existing.last_seen = datetime.utcnow()
         try:
             self.repo.upsert_job(existing)
@@ -722,20 +747,24 @@ class Pipeline:
 
     def _queue_existing_assessments(self) -> None:
         """Backfill persisted Telegram jobs that predate explicit assessment states."""
-        for job in self.repo.get_active_jobs(limit=1000, hours=24):
+        for job in self.repo.get_active_jobs(limit=1000):
             result = job.match_result or {}
             status = result.get("assessment_status")
-            needs_assessment = (
-                status in {"pending", "retrying"}
-                or result.get("ai_status") == "skipped"
-                or (
-                    job.match_result is None
+            if job.raw_data.get("filter_status") or status == "not_required":
+                continue
+            if status in {"completed", "failed"}:
+                continue
+            needs_assessment = status in {"pending", "retrying"}
+            if status is None:
+                needs_assessment = result.get("ai_status") == "skipped" or (
+                    result.get("ai_status") not in {"ok", "failed"}
                     and job.ai_decision is None
-                    and not job.raw_data.get("filter_status")
                 )
-            )
-            if needs_assessment:
-                self.repo.enqueue_existing_assessment(job)
+            if needs_assessment and self.repo.enqueue_existing_assessment(job):
+                result["assessment_status"] = "pending"
+                job.match_result = result
+                job.raw_data["assessment_status"] = "pending"
+                self.repo.upsert_job(job)
 
     async def _verify(self, job: Job, tag: str):
         """Stage 6: reachability of the application page (best effort)."""

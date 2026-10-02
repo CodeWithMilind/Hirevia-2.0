@@ -881,6 +881,29 @@ def test_legacy_skipped_telegram_job_is_backfilled_without_duplicate(repo):
         assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
 
 
+def test_legacy_assessment_backfill_queues_only_eligible_jobs_once(repo):
+    legacy = make_job(message_id="legacy-no-link")
+    legacy.match_result = {"deterministic_score": 31}
+    filtered = make_job(message_id="legacy-filtered")
+    filtered.raw_data["filter_status"] = "FILTERED"
+    completed = make_job(message_id="legacy-completed")
+    completed.match_result = {"ai_status": "ok", "match_score": 82}
+    for job in (legacy, filtered, completed):
+        repo.upsert_job(job)
+
+    matcher = FakeMatcher()
+    pipeline = build_pipeline([FakeSource([])], repo, matcher)
+    run(pipeline)
+    run(pipeline)
+
+    assert matcher.calls == [legacy.title]
+    assert repo.get_telegram_queue_status()["queued"] == 0
+    stored_legacy = repo.get_by_source_id(legacy.source, legacy.source_job_id)
+    stored_filtered = repo.get_by_source_id(filtered.source, filtered.source_job_id)
+    assert stored_legacy.match_result["assessment_status"] == "completed"
+    assert stored_filtered.match_result is None
+
+
 def test_p3_below_threshold_is_not_alerted(repo):
     source = FakeSource([make_job(apply="https://boards.greenhouse.io/acme/jobs/7")])
     marginal = FakeMatcher(default=AIResponse(relevant=True, priority=Priority.P3, match_score=61,

@@ -67,13 +67,12 @@ function expiresLabel(value) {
 function setActiveView(name, refresh = true) {
   document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === `view-${name}`));
   document.querySelectorAll(".nav-item[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === name && (name !== "telegram" || button.classList.contains("sub-item"))));
-  const titles = { jobs: "Jobs", telegram: "Telegram", ai: "AI & Models", config: "Configuration", logs: "Logs", system: "System" };
+  const titles = { jobs: "Jobs", telegram: "Telegram", ai: "AI & Models", config: "Configuration", system: "System" };
   $("pageTitle").textContent = titles[name] || "Jobs";
   $("shell").classList.remove("mobile-open");
   if (name === "telegram" && refresh) loadTelegram();
   if (name === "ai") loadAI();
   if (name === "config") loadConfigFiles();
-  if (name === "logs") loadLogs();
   if (name === "system") loadStatus();
 }
 
@@ -88,7 +87,9 @@ function jobCard(job) {
   const meta = node("div", "job-meta");
   [job.experience, job.employment_type?.replaceAll("_", " "), job.source, relativeTime(job.detected_at), expiresLabel(job.expires_at)].filter(Boolean).forEach((text) => meta.append(node("span", "", text)));
   details.append(meta);
-  const skills = Array.isArray(job.matched_skills) && job.matched_skills.length ? job.matched_skills : job.skills;
+  const skills = Array.isArray(job.matched_keywords) && job.matched_keywords.length
+    ? job.matched_keywords
+    : Array.isArray(job.matched_skills) && job.matched_skills.length ? job.matched_skills : job.skills;
   if (Array.isArray(skills) && skills.length) {
     const tags = node("div", "job-skills");
     skills.slice(0, 5).forEach((skill) => tags.append(node("span", "skill-tag", skill)));
@@ -97,7 +98,10 @@ function jobCard(job) {
   card.append(details);
 
   const side = node("div", "job-side");
-  side.append(node("span", "match-score", typeof job.match_score === "number" ? `${job.match_score}% match` : `${job.assessment_status || "pending"} assessment`));
+  const scoreLabel = job.matching_method === "yaml_keyword"
+    ? typeof job.match_score === "number" ? `${job.match_score.toFixed(1)}% keyword match` : "Unscored · no keywords"
+    : typeof job.match_score === "number" ? `${job.match_score}% legacy assessment` : `${job.assessment_status || "unscored"} assessment`;
+  side.append(node("span", "match-score", scoreLabel));
   if (["unmatched", "pending", "retrying", "failed"].includes(job.match_status)) {
     side.append(node("span", `match-status ${job.match_status}`, job.match_status));
   }
@@ -177,37 +181,6 @@ async function loadStatus() {
   $("systemSources").textContent = (status.sources || []).filter((source) => source.enabled).map((source) => source.name).join(", ") || "None enabled";
 }
 
-async function loadLogs() {
-  const files = await api("/api/logs");
-  const list = $("logFiles");
-  list.replaceChildren();
-  if (!files.length) list.append(node("div", "empty-state", "No log files available."));
-  files.forEach((file) => {
-    const row = node("div", "source-row");
-    const identity = node("div", "source-identity");
-    identity.append(node("strong", "", file.name), node("span", "source-state", `${file.size_bytes} bytes · ${relativeTime(file.modified_at)}`));
-    const download = node("a", "button quiet", "Download");
-    download.href = `/api/logs/${encodeURIComponent(file.name)}`;
-    download.addEventListener("click", async (event) => {
-      event.preventDefault();
-      try {
-        const response = await fetch(download.href, {
-          headers: { ...(sessionStorage.getItem("hireviaAdminToken") ? { Authorization: `Bearer ${sessionStorage.getItem("hireviaAdminToken")}` } : {}) },
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const blobUrl = URL.createObjectURL(await response.blob());
-        const anchor = document.createElement("a");
-        anchor.href = blobUrl;
-        anchor.download = file.name;
-        anchor.click();
-        URL.revokeObjectURL(blobUrl);
-      } catch (error) { notify(`Could not download log: ${error.message}`); }
-    });
-    row.append(identity, download);
-    list.append(row);
-  });
-}
-
 async function loadQueueStatus() {
   const queue = await api("/api/queue/status");
   $("systemQueue").textContent = `${queue.queued} queued · ${queue.processing} processing`;
@@ -217,7 +190,6 @@ async function loadQueueStatus() {
 
 async function poll() {
   const tasks = [loadStatus(), loadJobs(), loadCounts(), loadQueueStatus(), loadTelegram()];
-  if ($("view-logs").classList.contains("active")) tasks.push(loadLogs());
   try { await Promise.all(tasks); } catch (error) { $("railStatus").textContent = error.message; }
 }
 
@@ -262,6 +234,9 @@ function showJob(job) {
   const facts = [
     ["Company", job.company], ["Location", job.location], ["Experience", job.experience],
     ["Match status", job.match_status], ["Priority", job.match_priority],
+    ["Matching method", job.matching_method],
+    ["Keyword match", typeof job.keyword_match_percentage === "number" ? `${job.keyword_match_percentage.toFixed(1)}%` : "Unscored"],
+    ["Matched keyword count", `${job.matched_keyword_count} / ${job.total_keyword_count}`],
     ["Assessment status", job.assessment_status],
     ["Final score", typeof job.match_score === "number" ? `${job.match_score}%` : "—"],
     ["Deterministic score", typeof job.deterministic_score === "number" ? `${job.deterministic_score}%` : "—"],
@@ -286,6 +261,8 @@ function showJob(job) {
     body.append(node("p", "", job.match_reason));
   }
   for (const [label, values] of [
+    ["Matched keywords", job.matched_keywords],
+    ["Unmatched configured keywords", job.unmatched_keywords],
     ["Matched skills", job.matched_skills],
     ["Missing skills", job.missing_skills],
     ["AI rejection reasons", job.ai_rejection_reasons],
