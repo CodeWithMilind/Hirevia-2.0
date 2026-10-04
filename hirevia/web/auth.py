@@ -22,6 +22,8 @@ SESSION_TTL_SECONDS = 8 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_LOCKOUT_SECONDS = 15 * 60
 MAX_LOGIN_ATTEMPTS = 5
+ADMIN_PASSWORD_MIN_LENGTH = 12
+ADMIN_PASSWORD_MAX_LENGTH = 1024
 
 
 class AuthConfigurationError(RuntimeError):
@@ -92,6 +94,13 @@ def verify_password(password_hash: str, password: str) -> bool:
         return password_hasher.verify(password_hash, password)
     except (InvalidHashError, VerificationError, VerifyMismatchError):
         return False
+
+
+def validate_admin_password(password: str) -> bool:
+    return (
+        isinstance(password, str)
+        and ADMIN_PASSWORD_MIN_LENGTH <= len(password) <= ADMIN_PASSWORD_MAX_LENGTH
+    )
 
 
 def _connect(database_path: Path) -> sqlite3.Connection:
@@ -169,6 +178,38 @@ def create_initial_admin(
         )
         connection.commit()
         return True
+
+
+def reset_admin_password(
+    password: str,
+    *,
+    database_path: Optional[Path] = None,
+) -> bool:
+    """Replace the existing admin password and revoke sessions atomically."""
+    if not validate_admin_password(password):
+        raise ValueError(
+            f"Admin password must be between {ADMIN_PASSWORD_MIN_LENGTH} and "
+            f"{ADMIN_PASSWORD_MAX_LENGTH} characters"
+        )
+
+    stored_hash = hash_password(password)
+    with _connection(database_path or _database_path()) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            result = connection.execute(
+                "UPDATE admins SET password_hash = ? WHERE id = 1",
+                (stored_hash,),
+            )
+            if result.rowcount != 1:
+                connection.rollback()
+                return False
+            connection.execute("DELETE FROM sessions")
+            connection.commit()
+            return True
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
 
 
 def _remove_bootstrap_password(env_file: Optional[Path]) -> None:

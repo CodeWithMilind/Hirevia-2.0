@@ -8,6 +8,8 @@ For automatic setup, set `HIREVIA_ADMIN_EMAIL` and `HIREVIA_ADMIN_PASSWORD` in t
 
 Startup is safe to repeat. Existing admin email and password hashes are never updated from environment values, including when those values change. Changing the bootstrap variables is not a password-reset mechanism. The manual `auth create-admin` command also refuses to replace an existing admin.
 
+To reset the existing admin password, run `python -m hirevia auth reset-password` from the web service's working directory. The command reads the configured auth database path, prompts twice without echoing the input, requires 12-1024 characters, and invalidates existing sessions only after the password hash is updated successfully. It never writes the password to the environment file. Use `--env-file PATH` when the web service uses a non-default environment file.
+
 The default auth database is `hirevia_auth.db` in the working directory. Set an absolute path for a service deployment so restarts use the same protected database. Keep it separate from `HIREVIA_DB_PATH` and preserve it across application updates.
 
 ## Windows Setup

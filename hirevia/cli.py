@@ -414,6 +414,92 @@ def auth_create_admin(env_file: Path) -> None:
     click.echo(f"Initial admin created in the auth database. No plaintext password was written.")
 
 
+def _resolve_web_auth_database_path(env_file: Path) -> Path:
+    from dotenv import dotenv_values
+
+    env_settings = dotenv_values(env_file)
+    if "HIREVIA_AUTH_DB_PATH" in os.environ:
+        configured = os.environ["HIREVIA_AUTH_DB_PATH"]
+    elif "HIREVIA_AUTH_DB_PATH" in env_settings:
+        configured = env_settings["HIREVIA_AUTH_DB_PATH"]
+    else:
+        configured = "hirevia_auth.db"
+    database_path = Path(configured).expanduser()
+    if not database_path.is_absolute():
+        database_path = Path.cwd() / database_path
+    return database_path.resolve()
+
+
+@auth.command("reset-password")
+@click.option(
+    "--env-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=lambda: Path(os.getenv("HIREVIA_ENV_FILE", ".env")),
+    show_default=True,
+    help="Environment file used by the web service.",
+)
+def auth_reset_password(env_file: Path) -> None:
+    """Set a new password for the existing dashboard administrator."""
+    import sqlite3
+
+    from hirevia.web.auth import (
+        ADMIN_PASSWORD_MAX_LENGTH,
+        ADMIN_PASSWORD_MIN_LENGTH,
+        admin_exists,
+        reset_admin_password,
+        validate_admin_password,
+    )
+
+    database_path = _resolve_web_auth_database_path(env_file)
+    try:
+        if not database_path.exists():
+            raise click.ClickException(
+                "No admin account exists. Run `python -m hirevia auth create-admin` first."
+            )
+        if not database_path.is_file():
+            raise sqlite3.OperationalError("auth database path is not a file")
+        if not admin_exists(database_path):
+            raise click.ClickException(
+                "No admin account exists. Run `python -m hirevia auth create-admin` first."
+            )
+    except sqlite3.Error:
+        raise click.ClickException(
+            "The authentication database is unavailable; no password was changed."
+        ) from None
+
+    try:
+        password = click.prompt("New admin password", hide_input=True)
+        confirmation = click.prompt("Confirm new admin password", hide_input=True)
+    except (click.Abort, EOFError, KeyboardInterrupt):
+        raise click.ClickException(
+            "Invalid or incomplete terminal input; no password was changed."
+        ) from None
+
+    if password != confirmation:
+        raise click.ClickException("Password confirmation did not match; no password was changed.")
+    if not validate_admin_password(password):
+        raise click.ClickException(
+            f"Password must be between {ADMIN_PASSWORD_MIN_LENGTH} and "
+            f"{ADMIN_PASSWORD_MAX_LENGTH} characters; no password was changed."
+        )
+
+    try:
+        if not reset_admin_password(password, database_path=database_path):
+            raise click.ClickException(
+                "No admin account exists. Run `python -m hirevia auth create-admin` first."
+            )
+    except sqlite3.Error:
+        raise click.ClickException(
+            "The authentication database is unavailable; no password was changed."
+        ) from None
+    except ValueError:
+        raise click.ClickException(
+            "The new password does not meet the password requirements; no password was changed."
+        ) from None
+
+    click.echo("Admin password reset successfully. Existing sessions were invalidated.")
+
+
 @cli.group(invoke_without_command=True)
 @click.pass_context
 def worker(ctx) -> None:
