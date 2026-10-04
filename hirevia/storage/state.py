@@ -588,7 +588,6 @@ class JobRepository:
     def _posix_pid_is_alive(pid: int) -> bool:
         try:
             os.kill(pid, 0)
-            return True
         except (OverflowError, ValueError):
             return False
         except OSError as error:
@@ -597,6 +596,20 @@ class JobRepository:
             if isinstance(error, ProcessLookupError) or error.errno == errno.ESRCH:
                 return False
             return False
+        proc_stat = Path(f"/proc/{pid}/stat")
+        if proc_stat.is_file():
+            try:
+                process_state = (
+                    proc_stat.read_text(encoding="ascii")
+                    .rsplit(")", 1)[1]
+                    .split(None, 1)[0]
+                )
+            except (OSError, IndexError):
+                pass
+            else:
+                if process_state in {"Z", "X"}:
+                    return False
+        return True
 
     @staticmethod
     def _windows_pid_is_alive(pid: int) -> bool:
@@ -780,14 +793,24 @@ class JobRepository:
             conn.commit()
         return command_id
 
-    def claim_worker_commands(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def claim_worker_commands(
+        self, limit: int = 10, *, commands: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
         with self._get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                "SELECT * FROM worker_commands WHERE status = 'PENDING' "
-                "ORDER BY created_at LIMIT ?",
-                (max(1, min(int(limit), 50)),),
-            ).fetchall()
+            query = "SELECT * FROM worker_commands WHERE status = 'PENDING'"
+            params = []
+            if commands is not None:
+                allowed = list(dict.fromkeys(str(command).upper() for command in commands))
+                if not allowed:
+                    conn.rollback()
+                    return []
+                placeholders = ", ".join("?" for _ in allowed)
+                query += f" AND command IN ({placeholders})"
+                params.extend(allowed)
+            query += " ORDER BY created_at LIMIT ?"
+            params.append(max(1, min(int(limit), 50)))
+            rows = conn.execute(query, params).fetchall()
             claimed = []
             for row in rows:
                 conn.execute(

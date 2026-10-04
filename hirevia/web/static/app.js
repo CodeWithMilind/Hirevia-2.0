@@ -202,11 +202,16 @@ async function poll() {
 }
 
 async function control(path, successMessage) {
+  const button = path === "/api/start" ? $("startButton") : path === "/api/stop" ? $("stopButton") : null;
+  if (button) button.disabled = true;
   try {
     const result = await api(path, { method: "POST", body: "{}" });
-    notify(result.message || successMessage);
+    notify(result.success === false ? result.message || "Operation was not confirmed." : result.message || successMessage);
+  } catch (error) {
+    notify(error.message);
+  } finally {
     await poll();
-  } catch (error) { notify(error.message); }
+  }
 }
 
 async function saveJob(id, saved) {

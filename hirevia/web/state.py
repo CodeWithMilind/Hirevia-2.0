@@ -201,6 +201,7 @@ class WebUIState:
         self.telegram_source_validation_at: Optional[datetime] = None
         self.telegram_validation_complete = False
         self.monitor_start_error: Optional[str] = None
+        self.monitor_stop_error: Optional[str] = None
         self.last_cleanup_at: Optional[datetime] = None
         self.cleanup_error: Optional[str] = None
         self.ai_health_state = "untested"
@@ -671,20 +672,54 @@ class WebUIState:
     
     async def stop_scanner(self, persist_desired: bool = True):
         """Stop the background scanner"""
+        self.monitor_stop_error = None
         if not self.external_worker:
             return await self.worker_runtime.stop_scanner(persist_desired)
 
-        self._sync_external_worker_status()
         if persist_desired:
             self.repo.set_source_state("system", "monitor_desired", "stopped")
 
         runtime = self._sync_external_worker_status()
         if not runtime.get("alive"):
-            return False
-        try:
-            await self._send_worker_command("STOP")
-        except Exception as error:
+            if (
+                runtime.get("status") == "STOPPED"
+                and runtime.get("monitor_status") == "STOPPED"
+                and runtime.get("desired_monitoring", "stopped") == "stopped"
+            ):
+                self.monitor_state = "STOPPED"
+                return True
+            self.monitor_stop_error = (
+                "Monitor worker is unavailable; stop was not confirmed."
+            )
             self.monitor_state = "ERROR"
+            return False
+        if (
+            not self.is_running
+            and runtime.get("status") == "RUNNING"
+            and runtime.get("monitor_status") == "STOPPED"
+            and runtime.get("desired_monitoring", "stopped") == "stopped"
+        ):
+            self.monitor_state = "STOPPED"
+            return True
+        try:
+            result = await self._send_worker_command("STOP")
+            if result.get("stopped") is not True:
+                raise RuntimeError("Worker did not confirm the stopped state")
+        except Exception as error:
+            error_message = str(error).casefold()
+            if "timeout" in error_message or "did not complete stop" in error_message:
+                self.monitor_stop_error = (
+                    "Monitor worker did not acknowledge STOP before the timeout; "
+                    "the state is unconfirmed."
+                )
+            elif "runtimeerror" in error_message or "command failed" in error_message:
+                self.monitor_stop_error = (
+                    "Monitor worker rejected STOP; the state is unconfirmed."
+                )
+            else:
+                self.monitor_stop_error = (
+                    "Monitor worker is unavailable; stop was not confirmed."
+                )
             self.add_activity(
                 f"Monitor worker stop failed ({type(error).__name__})", "error"
             )
@@ -692,11 +727,17 @@ class WebUIState:
         deadline = asyncio.get_running_loop().time() + 20
         while asyncio.get_running_loop().time() < deadline:
             runtime = self._sync_external_worker_status()
-            if runtime.get("monitor_status") == "STOPPED":
+            if (
+                runtime.get("alive")
+                and runtime.get("monitor_status") == "STOPPED"
+                and runtime.get("desired_monitoring", "stopped") == "stopped"
+            ):
                 self.add_activity("Independent monitor worker stopped")
                 return True
             await asyncio.sleep(0.1)
-        self.monitor_state = "ERROR"
+        self.monitor_stop_error = (
+            "STOP was acknowledged, but the worker has not confirmed STOPPED."
+        )
         self.add_activity("Monitor worker did not stop before timeout", "error")
         return False
     
@@ -747,7 +788,12 @@ class WebUIState:
         queue_status = self.repo.get_telegram_queue_status()
         status_value = self.monitor_state
         if self.external_worker and (not worker or not worker.get("alive")):
-            status_value = "ERROR" if self.repo.get_source_state("system", "monitor_desired", "stopped") == "running" else "STOPPED"
+            desired = self.repo.get_source_state("system", "monitor_desired", "stopped")
+            status_value = (
+                "ERROR"
+                if desired == "running" or (worker and worker.get("status") == "ERROR")
+                else "STOPPED"
+            )
         return {
             "status": (
                 SystemStatus.SCANNING.value if self.is_scanning

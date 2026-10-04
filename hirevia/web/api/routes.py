@@ -158,22 +158,63 @@ async def stop_scanner():
     """Stop the background scanner"""
     state = _state()
     if getattr(state, "external_worker", False):
-        state._sync_external_worker_status()
+        worker = state._sync_external_worker_status()
+        desired = worker.get("desired_monitoring", "stopped")
+        confirmed_stopped = (
+            worker.get("status") == "STOPPED"
+            and worker.get("monitor_status") == "STOPPED"
+            and desired == "stopped"
+        )
+        if not worker.get("alive"):
+            if confirmed_stopped:
+                return StartStopResponse(
+                    success=True,
+                    message="Monitor already stopped",
+                    status=SystemStatus.STOPPED,
+                )
+            raise HTTPException(
+                status_code=503,
+                detail="Monitor worker is unavailable; stop was not confirmed.",
+            )
     
     if not state.is_running:
-        state.add_activity("Monitor stop requested while already stopped", "warning")
-        return StartStopResponse(
-            success=False,
-            message="Scanner not running",
-            status=SystemStatus.STOPPED,
-        )
+        if not getattr(state, "external_worker", False):
+            return StartStopResponse(
+                success=True,
+                message="Monitor already stopped",
+                status=SystemStatus.STOPPED,
+            )
+        if (
+            worker.get("status") == "RUNNING"
+            and worker.get("monitor_status") == "STOPPED"
+            and desired == "stopped"
+        ):
+            return StartStopResponse(
+                success=True,
+                message="Monitor already stopped",
+                status=SystemStatus.STOPPED,
+            )
     
     success = await state.stop_scanner()
+    if not success:
+        raise HTTPException(
+            status_code=503,
+            detail=state.monitor_stop_error or "Monitor stop was not confirmed.",
+        )
     status = state.get_status()
+    if (
+        status.get("is_running", False)
+        or status.get("is_scanning", False)
+        or status["status"] != "STOPPED"
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="STOP was acknowledged, but the backend has not confirmed STOPPED.",
+        )
     
     return StartStopResponse(
-        success=success,
-        message="Scanner stopped" if success else "Failed to stop scanner",
+        success=True,
+        message="Monitor stopped",
         status=SystemStatus(status["status"]),
     )
 

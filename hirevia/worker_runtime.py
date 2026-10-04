@@ -199,15 +199,25 @@ class WorkerRuntime:
         self.is_running = False
         if self.scanner_stop:
             self.scanner_stop.set()
-        if self.continuous_telegram_source is not None:
-            await self.continuous_telegram_source.stop_continuous_monitoring()
-            self.continuous_telegram_source = None
-        if self.scanner_task:
+        scanner_task = self.scanner_task
+        interrupted_scan = bool(
+            self.is_scanning
+            and scanner_task is not None
+            and not scanner_task.done()
+        )
+        if scanner_task and scanner_task is not asyncio.current_task():
+            if interrupted_scan:
+                scanner_task.cancel()
             try:
-                await self.scanner_task
+                await scanner_task
             except asyncio.CancelledError:
                 logger.warning("Monitor worker was cancelled during shutdown")
             self.scanner_task = None
+        if self.continuous_telegram_source is not None:
+            await self.continuous_telegram_source.stop_continuous_monitoring()
+            self.continuous_telegram_source = None
+        if interrupted_scan:
+            state.repo.recover_processing_queue()
 
         if rebuild_pipeline:
             self.pipeline = self.pipeline_factory(

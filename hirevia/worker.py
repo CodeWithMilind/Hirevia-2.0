@@ -142,9 +142,10 @@ class WorkerService:
                     pass
 
     async def _process_commands(self) -> None:
-        if self.runtime.is_scanning:
-            return
-        for command in self.repo.claim_worker_commands(limit=1):
+        allowed_commands = ("STOP", "SHUTDOWN") if self.runtime.is_scanning else None
+        for command in self.repo.claim_worker_commands(
+            limit=1, commands=allowed_commands
+        ):
             name = command["command"].upper()
             command_id = command["id"]
             arguments = command.get("arguments") or {}
@@ -156,12 +157,14 @@ class WorkerService:
                         raise RuntimeError(
                             self.state.monitor_start_error or "Monitor did not start"
                         )
+                    self._publish_runtime()
                     result = {"running": True}
                 elif name == "STOP":
                     self.repo.set_source_state("system", "monitor_desired", "stopped")
                     await self._reconcile_desired_state()
-                    if self.runtime.is_running:
+                    if self.runtime.is_running or self.runtime.is_scanning:
                         raise RuntimeError("Monitor did not stop")
+                    self._publish_runtime()
                     result = {"stopped": True}
                 elif name == "SCAN_24H":
                     stats = await self.runtime.trigger_scan(

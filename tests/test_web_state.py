@@ -7,6 +7,7 @@ from hirevia.web import state as web_state
 from hirevia.web import main as web_main
 import asyncio
 import logging
+import os
 from click.testing import CliRunner
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -310,10 +311,129 @@ def test_stopping_an_already_stopped_monitor_is_logged(monkeypatch, tmp_path, ca
     with caplog.at_level(logging.WARNING, logger="hirevia.web.state"):
         result = asyncio.run(routes.stop_scanner())
 
-    assert result.success is False
-    assert "Web action: Monitor stop requested while already stopped" in caplog.text
+    assert result.success is True
+    assert result.status.value == "STOPPED"
     web_state._web_state = None
     web_state.WebUIState._instance = None
+
+
+def test_external_stop_reports_unavailable_worker_without_queueing(monkeypatch, tmp_path):
+    repo = JobRepository(tmp_path / "unavailable-worker.db")
+    stale_pid = 2_000_000_000
+    assert repo.claim_worker_lease(stale_pid)
+    repo.update_worker_runtime(stale_pid, "RUNNING", monitor_status="SCANNING")
+    repo.set_source_state("system", "monitor_desired", "stopped")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    state = web_state.WebUIState(config=Config(), repo=repo)
+    state.external_worker = True
+    monkeypatch.setattr(routes, "_state", lambda: state)
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(routes.stop_scanner())
+
+    assert error.value.status_code == 503
+    assert "worker is unavailable" in error.value.detail.casefold()
+    assert repo.get_worker_runtime()["status"] == "ERROR"
+    with repo._get_conn() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM worker_commands WHERE command = 'STOP'"
+        ).fetchone()[0] == 0
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+
+
+def test_external_stop_returns_stopped_only_after_worker_confirmation(
+    monkeypatch, tmp_path
+):
+    repo = JobRepository(tmp_path / "confirmed-stop.db")
+    pid = os.getpid()
+    assert repo.claim_worker_lease(pid)
+    repo.update_worker_runtime(pid, "RUNNING", monitor_status="SCANNING")
+    repo.set_source_state("system", "monitor_desired", "running")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    state = web_state.WebUIState(config=Config(), repo=repo)
+    state.external_worker = True
+
+    async def acknowledge_stop(command, *_args, **_kwargs):
+        assert command == "STOP"
+        repo.set_source_state("system", "monitor_desired", "stopped")
+        repo.update_worker_runtime(pid, "RUNNING", monitor_status="STOPPED")
+        return {"stopped": True}
+
+    state._send_worker_command = acknowledge_stop
+    monkeypatch.setattr(routes, "_state", lambda: state)
+    try:
+        result = asyncio.run(routes.stop_scanner())
+
+        assert result.success is True
+        assert result.status.value == "STOPPED"
+        assert result.message == "Monitor stopped"
+        assert state.get_status()["status"] == "STOPPED"
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
+
+
+@pytest.mark.parametrize(
+    ("worker_error", "expected_message"),
+    [
+        ("Worker did not complete STOP within 0.01 seconds", "timeout"),
+        ("RuntimeError", "rejected STOP"),
+    ],
+)
+def test_external_stop_reports_unacknowledged_command(monkeypatch, tmp_path, worker_error, expected_message):
+    from hirevia.worker_process import WorkerProcessError
+
+    repo = JobRepository(tmp_path / "stop-command-error.db")
+    pid = os.getpid()
+    assert repo.claim_worker_lease(pid)
+    repo.update_worker_runtime(pid, "RUNNING", monitor_status="SCANNING")
+    repo.set_source_state("system", "monitor_desired", "running")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    state = web_state.WebUIState(config=Config(), repo=repo)
+    state.external_worker = True
+
+    async def fail_command(*_args, **_kwargs):
+        raise WorkerProcessError(worker_error)
+
+    state._send_worker_command = fail_command
+    monkeypatch.setattr(routes, "_state", lambda: state)
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(routes.stop_scanner())
+
+    assert error.value.status_code == 503
+    assert expected_message.casefold() in error.value.detail.casefold()
+    assert repo.get_source_state("system", "monitor_desired") == "stopped"
+    assert state.get_status()["status"] == "SCANNING"
+
+
+def test_dashboard_reports_unavailable_stale_scanner_as_error(monkeypatch, tmp_path):
+    repo = JobRepository(tmp_path / "stale-scanner-status.db")
+    stale_pid = 2_000_000_000
+    assert repo.claim_worker_lease(stale_pid)
+    repo.update_worker_runtime(stale_pid, "RUNNING", monitor_status="SCANNING")
+    repo.set_source_state("system", "monitor_desired", "stopped")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    state = web_state.WebUIState(config=Config(), repo=repo)
+    state.external_worker = True
+    monkeypatch.setattr(routes, "_state", lambda: state)
+
+    try:
+        status = asyncio.run(routes.get_status())
+
+        assert status.status.value == "ERROR"
+        assert status.is_running is False
+        assert status.is_scanning is False
+        assert status.worker_alive is False
+        assert status.monitor_desired == "stopped"
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
 
 
 def test_service_launcher_injects_one_runtime_and_starts_web_server(monkeypatch, tmp_path, capsys, caplog):

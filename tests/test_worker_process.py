@@ -56,6 +56,20 @@ def test_process_executable_lookup_identifies_current_python():
     assert Path(executable).name.casefold().startswith("python")
 
 
+def test_posix_pid_liveness_treats_zombie_as_exited():
+    if os.name == "nt" or not Path("/proc").is_dir():
+        return
+
+    child_pid = os.fork()
+    if child_pid == 0:
+        os._exit(0)
+    try:
+        os.waitid(os.P_PID, child_pid, os.WEXITED | os.WNOWAIT)
+        assert JobRepository._posix_pid_is_alive(child_pid) is False
+    finally:
+        os.waitpid(child_pid, 0)
+
+
 def test_repository_connections_close_and_wal_checkpoint_cleanly(tmp_path):
     repo = JobRepository(tmp_path / "wal.db")
 
@@ -259,6 +273,23 @@ def test_systemd_mode_controller_never_spawns_missing_worker(monkeypatch, tmp_pa
     else:
         raise AssertionError("systemd mode reported an absent worker as running")
 
+
+def test_managed_worker_environment_never_spawns_local_worker(monkeypatch, tmp_path):
+    monkeypatch.delenv("HIREVIA_WORKER_MODE", raising=False)
+    monkeypatch.setenv("HIREVIA_WORKER_MANAGED", "1")
+
+    class MissingWorkerRepository:
+        db_path = tmp_path / "managed-env.db"
+
+        def get_worker_runtime(self):
+            return {"pid": None, "status": "STOPPED", "alive": False}
+
+    spawned = []
+    controller = WorkerProcessController(
+        MissingWorkerRepository(),
+        popen=lambda *args, **kwargs: spawned.append((args, kwargs)),
+    )
+
     assert controller.spawn_enabled is False
     assert spawned == []
 
@@ -422,7 +453,89 @@ def test_worker_crash_releases_stale_lease_and_can_restart(monkeypatch, tmp_path
     assert repo.get_worker_runtime()["status"] == "STOPPED"
 
 
-def test_graceful_shutdown_waits_for_in_progress_scan(tmp_path):
+def test_start_and_stop_commands_are_acknowledged_during_in_progress_scan(monkeypatch, tmp_path):
+    configure_worker_environment(monkeypatch, tmp_path)
+    monkeypatch.delenv("TELEGRAM_SESSION_NAME", raising=False)
+    config = Config()
+    config.sources.sources["telegram"].enabled = False
+    repo = JobRepository(tmp_path / "stop-during-scan.db")
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    state = web_state.WebUIState(config=config, repo=repo)
+    scan_started = asyncio.Event()
+    release_scan = asyncio.Event()
+    scan_cancelled = asyncio.Event()
+
+    class BlockingPipeline:
+        registry = SimpleNamespace(get_source=lambda _name: None)
+
+        async def run_scan(self):
+            scan_started.set()
+            try:
+                await release_scan.wait()
+                return ScanStats()
+            finally:
+                scan_cancelled.set()
+
+    state.worker_runtime.pipeline_factory = lambda *_args: BlockingPipeline()
+    service = WorkerService(state, poll_seconds=0.01)
+
+    async def stop_during_scan():
+        try:
+            assert repo.claim_worker_lease(service.pid)
+            start_id = repo.enqueue_worker_command("START")
+            await service._process_commands()
+            start_command = repo.get_worker_command(start_id)
+            assert start_command["status"] == "COMPLETED"
+            assert start_command["result"] == {"running": True}
+
+            await asyncio.wait_for(scan_started.wait(), timeout=1)
+            assert state.worker_runtime.is_scanning
+            assert repo.get_worker_runtime()["monitor_status"] == "SCANNING"
+            job = Job(
+                source="telegram",
+                source_job_id="interrupted-1",
+                title="Python Developer",
+                company="Example",
+                location="Remote",
+                description="Test-only queued item",
+                url="https://t.me/example/1",
+            )
+            assert repo.enqueue_telegram_job(job)
+            assert len(repo.claim_telegram_jobs(limit=1)) == 1
+
+            scan_id = repo.enqueue_worker_command("SCAN_24H")
+            repo.set_source_state("system", "monitor_desired", "stopped")
+            stop_id = repo.enqueue_worker_command("STOP")
+            await asyncio.wait_for(service._process_commands(), timeout=1)
+
+            stop_command = repo.get_worker_command(stop_id)
+            assert stop_command["status"] == "COMPLETED"
+            assert stop_command["result"] == {"stopped": True}
+            assert repo.get_worker_command(scan_id)["status"] == "PENDING"
+            assert scan_cancelled.is_set()
+            assert state.worker_runtime.is_running is False
+            assert state.worker_runtime.is_scanning is False
+            assert state.worker_runtime.monitor_state == "STOPPED"
+            assert repo.get_source_state("system", "monitor_desired") == "stopped"
+            assert repo.get_worker_runtime()["monitor_status"] == "STOPPED"
+            with repo._get_conn() as connection:
+                queue_status = connection.execute(
+                    "SELECT status FROM processing_queue"
+                ).fetchone()[0]
+            assert queue_status == "QUEUED"
+        finally:
+            release_scan.set()
+            if state.worker_runtime.scanner_task is not None:
+                await state.worker_runtime.stop_scanner(persist_desired=False)
+            repo.release_worker_lease(service.pid)
+            web_state._web_state = None
+            web_state.WebUIState._instance = None
+
+    asyncio.run(stop_during_scan())
+
+
+def test_graceful_shutdown_interrupts_in_progress_scan(tmp_path):
     repo = JobRepository(tmp_path / "drain.db")
     repo.set_source_state("system", "monitor_desired", "running")
     shutdown_id = repo.enqueue_worker_command("SHUTDOWN")
@@ -459,24 +572,73 @@ def test_graceful_shutdown_waits_for_in_progress_scan(tmp_path):
     state = ActiveScanState()
     service = WorkerService(state, poll_seconds=0.01)
 
-    async def drain_scan():
+    async def stop_worker():
         task = asyncio.create_task(service.run())
         for _ in range(200):
-            if repo.get_worker_runtime()["status"] == "RUNNING":
+            command = repo.get_worker_command(shutdown_id)
+            if command and command["status"] == "COMPLETED":
                 break
             await asyncio.sleep(0.01)
-        assert repo.get_worker_command(shutdown_id)["status"] == "PENDING"
-        assert state.stop_calls == 0
-
-        state.is_scanning = False
         assert await asyncio.wait_for(task, timeout=5) == 0
+        assert repo.get_worker_command(shutdown_id)["status"] == "COMPLETED"
+        assert state.stop_calls == 1
+        assert state.is_scanning is False
 
-    asyncio.run(drain_scan())
+    asyncio.run(stop_worker())
 
-    assert state.stop_calls == 1
     assert state.close_calls == 1
-    assert repo.get_worker_command(shutdown_id)["status"] == "COMPLETED"
     assert repo.get_worker_runtime()["status"] == "STOPPED"
+
+
+def test_worker_restart_keeps_persisted_stopped_state(monkeypatch, tmp_path):
+    configure_worker_environment(monkeypatch, tmp_path)
+    config = Config()
+    config.sources.sources["telegram"].enabled = False
+    repo = JobRepository(tmp_path / "restart-stopped.db")
+    repo.set_source_state("system", "monitor_desired", "stopped")
+    stale_pid = 2_000_000_000
+    assert repo.claim_worker_lease(stale_pid)
+    repo.release_worker_lease(stale_pid, "STOPPED")
+
+    web_state._web_state = None
+    web_state.WebUIState._instance = None
+    state = web_state.WebUIState(config=config, repo=repo)
+    pipeline_calls = []
+
+    def unexpected_pipeline(*_args):
+        pipeline_calls.append(True)
+        raise AssertionError("Stopped worker restart must not create a scan pipeline")
+
+    state.worker_runtime.pipeline_factory = unexpected_pipeline
+    service = WorkerService(state, poll_seconds=0.01)
+
+    async def restart_without_monitoring():
+        task = asyncio.create_task(service.run())
+        for _ in range(100):
+            runtime = repo.get_worker_runtime()
+            if runtime["alive"] and runtime["status"] == "RUNNING":
+                break
+            await asyncio.sleep(0.01)
+        assert runtime["alive"] is True
+        assert runtime["monitor_status"] == "STOPPED"
+        assert runtime["desired_monitoring"] == "stopped"
+        assert state.worker_runtime.is_running is False
+        assert pipeline_calls == []
+
+        shutdown_id = repo.enqueue_worker_command("SHUTDOWN")
+        assert await asyncio.wait_for(task, timeout=2) == 0
+        assert repo.get_worker_command(shutdown_id)["status"] == "COMPLETED"
+
+    try:
+        asyncio.run(restart_without_monitoring())
+    finally:
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
+    runtime = repo.get_worker_runtime()
+    assert runtime["status"] == "STOPPED"
+    assert runtime["monitor_status"] == "STOPPED"
+    assert runtime["desired_monitoring"] == "stopped"
+    assert pipeline_calls == []
 
 
 def test_worker_reload_applies_latest_yaml_while_stopped(monkeypatch, tmp_path):
