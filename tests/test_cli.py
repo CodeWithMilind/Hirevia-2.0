@@ -24,7 +24,8 @@ from hirevia import cli as cli_module
 from hirevia.cli import _print_stats, _resolve_nvidia_key, cli
 from hirevia.config import Config
 from hirevia.core.models import ApplicationStatus, EmploymentType, Job, ScanStats
-from hirevia.sources.telegram_config import TelegramChannel
+from hirevia.sources.telegram_config import TelegramChannel, load_telegram_credentials
+from hirevia.sources.telegram_session_lock import TelegramSessionLock
 from hirevia.sources.telegram_extract import TgMessage
 from hirevia.sources.telegram_source import TelegramSource
 from hirevia.storage.state import JobRepository, resolve_database_path
@@ -91,6 +92,30 @@ def test_worker_lifecycle_cli_commands(monkeypatch, tmp_path):
     assert "Worker is stopped" in stopped.output
     assert restarted.exit_code == 0, restarted.output
     assert "Worker: RUNNING" in restarted.output
+
+
+def test_telegram_login_cli_refuses_session_owned_by_another_process(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("TELEGRAM_API_ID", "12345")
+    monkeypatch.setenv("TELEGRAM_API_HASH", "test-api-hash")
+    monkeypatch.setenv("TELEGRAM_SESSION_DIR", str(tmp_path / "sessions"))
+    credentials = load_telegram_credentials()
+    assert credentials is not None
+    lock = TelegramSessionLock(credentials.session_path)
+    assert lock.try_acquire()
+
+    def unexpected_client(*_args, **_kwargs):
+        raise AssertionError("CLI must not access a session owned by another process")
+
+    monkeypatch.setattr("telethon.TelegramClient", unexpected_client)
+    try:
+        result = CliRunner().invoke(cli, ["telegram-login"])
+
+        assert result.exit_code == 1
+        assert "session is in use" in result.output
+    finally:
+        lock.release()
 
 
 def test_doctor_reports_database_and_api_without_mutating_database(

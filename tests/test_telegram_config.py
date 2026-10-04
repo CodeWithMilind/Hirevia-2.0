@@ -150,6 +150,17 @@ def test_credentials_from_env(monkeypatch, tmp_path):
     assert creds.session_path == tmp_path / "tgstate" / "hirevia"
 
 
+def test_relative_session_directory_is_stable_across_working_directories(monkeypatch, tmp_path):
+    from hirevia.sources.telegram_config import TelegramCredentials
+
+    credentials = TelegramCredentials(api_id=123456, api_hash="test-hash")
+    original_path = credentials.session_path
+    monkeypatch.chdir(tmp_path)
+
+    assert original_path.is_absolute()
+    assert credentials.session_path == original_path
+
+
 def test_credentials_reject_non_numeric_id(monkeypatch):
     monkeypatch.setenv("TELEGRAM_API_ID", "not-a-number")
     monkeypatch.setenv("TELEGRAM_API_HASH", "abc")

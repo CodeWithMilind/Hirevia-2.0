@@ -879,6 +879,7 @@ def telegram_login():
     telegram.yaml - job alerts still go out over the separate Bot API.
     """
     from hirevia.sources.telegram_config import load_telegram_credentials, load_telegram_settings
+    from hirevia.sources.telegram_session_lock import TelegramSessionLock
 
     try:
         from telethon import TelegramClient
@@ -895,6 +896,13 @@ def telegram_login():
 
     credentials.session_path.parent.mkdir(parents=True, exist_ok=True)
     console.print(f"[dim]Session file: {credentials.session_path} (private - never commit it)[/dim]")
+    session_lock = TelegramSessionLock(credentials.session_path)
+    if not session_lock.try_acquire():
+        console.print(
+            "[red]Telegram session is in use by another Hirevia process. "
+            "Stop the monitor before using CLI login.[/red]"
+        )
+        sys.exit(1)
 
     async def _login():
         client = TelegramClient(
@@ -924,7 +932,10 @@ def telegram_login():
         finally:
             await client.disconnect()
 
-    asyncio.run(_login())
+    try:
+        asyncio.run(_login())
+    finally:
+        session_lock.release()
 
 
 @cli.command()

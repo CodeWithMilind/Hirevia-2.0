@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover
         return False
 
 logger = logging.getLogger(__name__)
+_APPLICATION_ROOT = Path(__file__).resolve().parents[2]
 
 USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 
@@ -49,7 +50,10 @@ class TelegramCredentials(BaseModel):
 
     @property
     def session_path(self) -> Path:
-        return Path(self.session_dir) / self.session_name
+        session_dir = Path(self.session_dir).expanduser()
+        if not session_dir.is_absolute():
+            session_dir = _APPLICATION_ROOT / session_dir
+        return (session_dir / self.session_name).resolve()
 
     def __str__(self) -> str:  # defensive: even str() must not leak the hash
         return f"TelegramCredentials(api_id={self.api_id}, session={self.session_name})"

@@ -1360,6 +1360,9 @@ class WebUIState:
             )
             self.telegram_login_client = client
             await client.connect()
+            if await client.is_user_authorized():
+                return await self._complete_telegram_authentication(client)
+
             sent_code = await client.send_code_request(phone)
             self.telegram_login_phone = phone
             self.telegram_phone_code_hash = sent_code.phone_code_hash

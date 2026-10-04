@@ -1093,6 +1093,7 @@ def _make_fake_telegram_client(*, code_error=None, password_error=None):
     class FakeClient:
         def __init__(self):
             self.connected = False
+            self.authorized = False
             self.sign_in_calls = []
             self.send_calls = []
             self.password_error = password_error
@@ -1120,6 +1121,10 @@ def _make_fake_telegram_client(*, code_error=None, password_error=None):
                 raise type(code_error, (Exception,), {})()
             if "password" in kwargs and self.password_error:
                 raise type(self.password_error, (Exception,), {})()
+            self.authorized = True
+
+        async def is_user_authorized(self):
+            return self.authorized
 
         async def get_me(self):
             return SimpleNamespace(first_name="Hirevia", last_name="User", username="hirevia_user")
@@ -1147,6 +1152,47 @@ def _configure_fake_telegram_login(monkeypatch, tmp_path, client):
     web_state._web_state = None
     web_state.WebUIState._instance = None
     return credentials
+
+
+def test_dashboard_reuses_authorized_session_without_requesting_otp(
+    monkeypatch, tmp_path
+):
+    from hirevia.sources import telegram_source
+
+    client = _make_fake_telegram_client()
+    client.authorized = True
+    credentials = _configure_fake_telegram_login(monkeypatch, tmp_path, client)
+    session_file = Path(f"{credentials.session_path}.session")
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_bytes(b"authorized-session-preserved")
+    state = web_state.initialize_web_state(
+        Config(), JobRepository(tmp_path / "authorized-session.db")
+    )
+
+    async def validated_sources(**_kwargs):
+        return {
+            "authenticated": True,
+            "validation_complete": True,
+            "sources": [],
+            "account": {"name": "Hirevia User", "username": "hirevia_user"},
+        }
+
+    state.validate_telegram_sources = validated_sources
+
+    try:
+        result = asyncio.run(state.begin_telegram_phone_login("+12025550123"))
+
+        assert result["success"] is True
+        assert result["login_state"] == "connected"
+        assert client.send_calls == []
+        assert client.sign_in_calls == []
+        assert state.telegram_authenticated is True
+        assert session_file.read_bytes() == b"authorized-session-preserved"
+    finally:
+        asyncio.run(state._release_telegram_auth_session(resume_worker=False))
+        telegram_source._shared_client = None
+        web_state._web_state = None
+        web_state.WebUIState._instance = None
 
 
 def test_phone_otp_authentication_uses_hash_and_verifies_account(monkeypatch, tmp_path, caplog):
