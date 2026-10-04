@@ -42,6 +42,18 @@ def clean_env(monkeypatch, tmp_path):
     yield
 
 
+def test_cli_help_commands():
+    runner = CliRunner()
+
+    root_help = runner.invoke(cli, ["--help"])
+    admin_help = runner.invoke(cli, ["auth", "create-admin", "--help"])
+
+    assert root_help.exit_code == 0, root_help.output
+    assert "Usage:" in root_help.output
+    assert admin_help.exit_code == 0, admin_help.output
+    assert "--env-file" in admin_help.output
+
+
 def test_database_path_uses_environment_unless_overridden(monkeypatch, tmp_path):
     configured = tmp_path / "data" / "hirevia.db"
     explicit = tmp_path / "other.db"
