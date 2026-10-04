@@ -1,0 +1,61 @@
+:root {
+  color-scheme: dark;
+  --bg: #17191b;
+  --panel: #222526;
+  --border: #383c3e;
+  --text: #f0eee9;
+  --muted: #a1a5a3;
+  --quiet: #777e7b;
+  --green: #b4cb8a;
+  --green-ink: #26301b;
+  --red: #e29b92;
+  --mono: "IBM Plex Mono", Consolas, monospace;
+  --sans: "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { min-height: 100%; margin: 0; }
+body {
+  min-height: 100vh;
+  background-color: var(--bg);
+  background-image: linear-gradient(rgba(255,255,255,.018) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.018) 1px, transparent 1px);
+  background-size: 44px 44px;
+  color: var(--text);
+  font: 14px/1.5 var(--sans);
+}
+button, input { font: inherit; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+.login-layout { min-height: 100vh; display: grid; grid-template-columns: 1fr minmax(300px, 440px) 1fr; align-items: center; padding: 60px 30px 82px; }
+.login-panel { grid-column: 2; width: 100%; padding: 37px 38px 25px; border: 1px solid var(--border); background: rgba(34,37,38,.96); box-shadow: 0 22px 60px rgba(0,0,0,.22); animation: arrive .35s ease both; }
+.brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; font-size: 12px; font-weight: 700; }
+.brand-mark { width: 29px; height: 29px; display: grid; place-items: center; border: 1px solid var(--green); color: var(--green); font: 500 15px var(--mono); }
+.login-heading { margin: 43px 0 26px; }
+.eyebrow { margin: 0 0 9px; color: var(--green); font: 10px var(--mono); }
+h1 { margin: 0; font-size: 26px; line-height: 1.2; font-weight: 600; }
+.subtitle { margin: 9px 0 0; color: var(--muted); }
+form { display: grid; gap: 19px; }
+.field { display: grid; gap: 7px; color: var(--muted); font-size: 12px; }
+.field input { width: 100%; height: 43px; padding: 0 12px; border: 1px solid var(--border); border-radius: 3px; background: #191b1d; color: var(--text); }
+.field input:focus { border-color: #829663; outline: 0; box-shadow: 0 0 0 2px rgba(180,203,138,.12); }
+.password-wrap { position: relative; display: block; }
+.password-wrap input { padding-right: 58px; }
+.password-toggle { position: absolute; top: 0; right: 4px; height: 43px; padding: 0 9px; border: 0; background: transparent; color: var(--green); font-size: 11px; cursor: pointer; }
+.login-error { min-height: 18px; margin: -7px 0 -6px; color: var(--red); font-size: 12px; }
+.submit-button { position: relative; width: 100%; min-height: 43px; display: flex; align-items: center; justify-content: center; gap: 9px; border: 1px solid var(--green); border-radius: 3px; background: var(--green); color: var(--green-ink); font-weight: 600; cursor: pointer; }
+.submit-button:hover:not(:disabled) { background: #c4d99f; }
+.submit-button:disabled { opacity: .72; cursor: wait; }
+.button-spinner { display: none; width: 14px; height: 14px; border: 2px solid rgba(38,48,27,.25); border-top-color: var(--green-ink); border-radius: 50%; animation: spin .7s linear infinite; }
+.submit-button.loading .button-spinner { display: inline-block; }
+.login-footnote { margin: 24px 0 0; padding-top: 15px; border-top: 1px solid var(--border); color: var(--quiet); font: 10px var(--mono); }
+.login-rail { position: fixed; right: 30px; bottom: 21px; left: 30px; display: flex; justify-content: space-between; color: var(--quiet); font: 9px var(--mono); }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes arrive { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
+@media (max-width: 560px) {
+  .login-layout { grid-template-columns: 1fr; align-items: center; padding: 28px 18px 70px; }
+  .login-panel { grid-column: 1; padding: 30px 24px 21px; }
+  .login-heading { margin-top: 34px; }
+  .login-rail { right: 18px; left: 18px; font-size: 8px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+}

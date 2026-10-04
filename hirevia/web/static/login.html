@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <title>Sign in | Hirevia</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/login.css">
+</head>
+<body>
+    <main class="login-layout">
+        <section class="login-panel" aria-labelledby="loginTitle">
+            <a class="brand" href="/login" aria-label="Hirevia sign in">
+                <span class="brand-mark" aria-hidden="true">H</span>
+                <span>HIREVIA</span>
+            </a>
+            <div class="login-heading">
+                <p class="eyebrow">ADMIN ACCESS</p>
+                <h1 id="loginTitle">Welcome back</h1>
+                <p class="subtitle">Sign in to your Hirevia workspace.</p>
+            </div>
+            <form id="loginForm" novalidate>
+                <label class="field" for="email">
+                    <span>Email</span>
+                    <input id="email" name="email" type="email" autocomplete="username" inputmode="email" maxlength="254" required autofocus>
+                </label>
+                <label class="field" for="password">
+                    <span>Password</span>
+                    <span class="password-wrap">
+                        <input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" required>
+                        <button class="password-toggle" id="togglePassword" type="button" aria-label="Show password" aria-pressed="false">Show</button>
+                    </span>
+                </label>
+                <p class="login-error" id="loginError" role="alert" aria-live="polite"></p>
+                <button class="submit-button" id="submitButton" type="submit">
+                    <span class="button-label">Sign in</span>
+                    <span class="button-spinner" aria-hidden="true"></span>
+                </button>
+            </form>
+            <p class="login-footnote">Authorized administrators only</p>
+        </section>
+        <div class="login-rail" aria-hidden="true"><span>OPPORTUNITY INTELLIGENCE</span><span>HIREVIA · 2.0</span></div>
+    </main>
+    <script src="/static/login.js" defer></script>
+</body>
+</html>

@@ -201,9 +201,9 @@ python -m hirevia status
 
 ## Security
 
-- The web server binds to localhost by default. Non-local binding requires `HIREVIA_ADMIN_TOKEN`; API calls use bearer authentication and the browser prompts for the token.
-- Put the token in the server's `.env` file, keep it private, and put remote access behind a TLS reverse proxy. Do not expose an unauthenticated administrative interface directly to the internet.
-- API keys and Telegram API/session credentials are not returned by the web API. Keep `.env` and `sessions/` private and out of source control.
+- The web server binds to localhost by default. Dashboard access uses a database-backed admin account and HttpOnly session cookie. The first startup can bootstrap the admin from `HIREVIA_ADMIN_EMAIL` and the one-time `HIREVIA_ADMIN_PASSWORD` setting; remote access requires HTTPS behind a trusted reverse proxy.
+- Keep `.env`, the auth database, API keys, and Telegram API/session credentials private and out of source control. Preserve the auth database across updates; changing bootstrap settings does not change the existing admin. See [AUTHENTICATION.md](AUTHENTICATION.md) for setup and deployment details.
+- API keys and Telegram API/session credentials are not returned by the web API. Keep `sessions/` private and out of source control.
 - OTPs and 2FA passwords are submitted only to the login endpoints and are never written to configuration files. SQLite is configured for WAL mode and busy timeouts.
 - Set `HIREVIA_HOST` and `HIREVIA_PORT` to configure the bind address and port. For example, a reverse proxy may connect to a loopback-bound Hirevia server on the VPS.
 - Ubuntu systemd installation, data paths, TLS proxy guidance, and restart behavior are documented in [docs/VPS.md](docs/VPS.md).

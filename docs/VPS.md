@@ -20,10 +20,17 @@ Copy the non-secret YAML configuration files (`telegram.yaml`, `profile.yaml`, `
 TELEGRAM_API_ID=your_telegram_api_id
 TELEGRAM_API_HASH=your_telegram_api_hash
 TELEGRAM_SESSION_DIR=/var/lib/hirevia/sessions
-HIREVIA_ADMIN_TOKEN=replace_with_a_long_random_admin_token
+HIREVIA_ENV_FILE=/etc/hirevia/hirevia.env
+HIREVIA_ADMIN_EMAIL=admin@example.com
+HIREVIA_ADMIN_PASSWORD=choose-a-strong-one-time-password
+HIREVIA_AUTH_DB_PATH=/var/lib/hirevia/auth.db
+HIREVIA_SESSION_SECRET=
+HIREVIA_ENV=production
+HIREVIA_COOKIE_SECURE=true
+HIREVIA_ALLOWED_HOSTS=hirevia.example.com
 ```
 
-Add the active model's API key and provider/model settings to this file when needed. Do not put OTPs, 2FA passwords, or Telegram session contents in it. Restrict the file:
+The first web startup hashes the initial password, stores the admin in the separate auth database, generates a session secret if missing, and removes the plaintext password setting from this file. Later changes to the bootstrap email or password do not replace the existing database admin. Keep the auth database under `/var/lib/hirevia`; it is separate from the jobs database. Add the active model's API key and provider/model settings to this file when needed. Do not put OTPs, 2FA passwords, or Telegram session contents in it. Restrict the file:
 
 ```bash
 sudo chown hirevia:hirevia /etc/hirevia/hirevia.env
@@ -47,11 +54,11 @@ The web service binds to `127.0.0.1:8000`. Reach it through an SSH tunnel:
 ssh -L 8000:127.0.0.1:8000 hirevia-vps
 ```
 
-Then open `http://127.0.0.1:8000`. For public access, retain the loopback bind and configure a TLS reverse proxy to `127.0.0.1:8000`. Do not expose port 8000 directly. The `HIREVIA_ADMIN_TOKEN` protects API routes; send it as an Authorization Bearer token. The dashboard asks for it on first API use.
+Then open `http://127.0.0.1:8000`. For public access, retain the loopback bind and configure a TLS reverse proxy to `127.0.0.1:8000`. Do not expose port 8000 directly. The login page uses a server-validated HttpOnly session cookie; the reverse proxy must preserve the public `Host` header and forward HTTPS requests. `HIREVIA_ALLOWED_HOSTS` must include the public hostname.
 
 ## Monitor controls and recovery
 
-On a new install the monitor is stopped. Log into Telegram in the dashboard, wait for channel validation to finish, then select **Start Monitor**. Select **Stop Monitor** to stop collection without logging out. The desired state is stored in the shared jobs database; restarting either service or rebooting the VPS resumes a previously running monitor, but leaves a manually stopped monitor stopped. Logout clears desired running state and removes the dedicated Telethon session.
+On a new install the monitor is stopped. Log into Telegram in the dashboard, wait for channel validation to finish, then select **Start Monitor**. Select **Stop Monitor** to stop collection without disconnecting Telegram. The desired state is stored in the shared jobs database; restarting either service or rebooting the VPS resumes a previously running monitor, but leaves a manually stopped monitor stopped. Dashboard sign-out only revokes the web session; it does not stop the worker or disconnect Telegram.
 
 Application log files are stored and rotated under `/var/log/hirevia`; they are not exposed through the dashboard or API. Database and Telegram session files remain under `/var/lib/hirevia` and are separate.
 

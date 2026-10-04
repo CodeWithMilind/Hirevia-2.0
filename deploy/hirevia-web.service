@@ -9,9 +9,11 @@ User=hirevia
 Group=hirevia
 WorkingDirectory=/etc/hirevia
 EnvironmentFile=-/etc/hirevia/hirevia.env
+Environment=HIREVIA_ENV_FILE=/etc/hirevia/hirevia.env
 Environment=HIREVIA_HOST=127.0.0.1
 Environment=HIREVIA_PORT=8000
 Environment=HIREVIA_DB_PATH=/var/lib/hirevia/hirevia.db
+Environment=HIREVIA_AUTH_DB_PATH=/var/lib/hirevia/auth.db
 Environment=TELEGRAM_SESSION_DIR=/var/lib/hirevia/sessions
 Environment=HIREVIA_LOG_DIR=/var/log/hirevia
 Environment=HIREVIA_WORKER_MANAGED=1

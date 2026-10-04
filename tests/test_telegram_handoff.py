@@ -125,7 +125,7 @@ def test_worker_releases_for_dashboard_then_reacquires_after_auth(tmp_path, monk
 
 
 class FakeDashboardTelegramClient:
-    def __init__(self, *, otp_error=None, authorized=True):
+    def __init__(self, *, otp_error=None, authorized=False):
         self.connected = False
         self.authorized = authorized
         self.otp_error = otp_error
@@ -572,7 +572,7 @@ def test_external_invalid_otp_preserves_session_and_keeps_worker_paused(
 def test_external_logout_uses_lock_and_worker_reports_disconnected(
     monkeypatch, tmp_path
 ):
-    client = FakeDashboardTelegramClient()
+    client = FakeDashboardTelegramClient(authorized=True)
     monkeypatch.setattr(telethon, "TelegramClient", lambda *_args: client)
     credentials, repo, pid, worker_state, _, dashboard_state = prepare_external_handoff(
         monkeypatch, tmp_path

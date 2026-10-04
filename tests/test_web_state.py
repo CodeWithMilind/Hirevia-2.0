@@ -21,7 +21,24 @@ from hirevia.notifications.telegram import PriorityTelegramNotifier
 from hirevia.sources.telegram_config import load_telegram_settings
 from hirevia.web.api import routes
 from hirevia.web.api.models import AISettingsRequest, ConfigFileRequest, SaveJobRequest, TelegramSourceUpdate
+from hirevia.web.auth import hash_password
 from hirevia.web.main import app
+
+
+def configure_web_admin(monkeypatch, tmp_path):
+    monkeypatch.setenv("HIREVIA_ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("HIREVIA_ADMIN_PASSWORD_HASH", hash_password("test-password-strong"))
+    monkeypatch.setenv("HIREVIA_SESSION_SECRET", "web-test-session-secret-long-enough-for-hmac")
+    monkeypatch.setenv("HIREVIA_AUTH_DB_PATH", str(tmp_path / "auth.db"))
+    monkeypatch.setenv("HIREVIA_COOKIE_SECURE", "false")
+
+
+def login_web_admin(client):
+    response = client.post(
+        "/auth/login",
+        json={"email": "admin@example.com", "password": "test-password-strong"},
+    )
+    assert response.status_code == 200, response.text
 
 
 def test_web_state_uses_injected_config_repository_and_matcher(tmp_path):
@@ -147,46 +164,71 @@ def test_service_startup_failure_is_logged_with_traceback(monkeypatch, caplog):
     assert "Hirevia launcher stopped" in caplog.text
 
 
-def test_nonlocal_service_requires_an_admin_token(monkeypatch):
-    monkeypatch.delenv("HIREVIA_ADMIN_TOKEN", raising=False)
+def test_nonlocal_service_requires_admin_authentication(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HIREVIA_AUTH_DB_PATH", str(tmp_path / "auth.db"))
+    for name in (
+        "HIREVIA_ADMIN_EMAIL",
+        "HIREVIA_ADMIN_PASSWORD",
+        "HIREVIA_ADMIN_PASSWORD_HASH",
+        "HIREVIA_SESSION_SECRET",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HIREVIA_COOKIE_SECURE", "true")
     monkeypatch.setattr(cli_module, "load_config", lambda: Config())
 
     result = CliRunner().invoke(cli_module.cli, ["web", "--host", "0.0.0.0"])
 
     assert result.exit_code != 0
-    assert "requires HIREVIA_ADMIN_TOKEN" in result.output
+    assert "requires configured admin authentication" in result.output
 
 
-def test_admin_token_protects_web_api_without_exposing_the_token(monkeypatch, tmp_path):
+def test_admin_session_protects_web_api_without_exposing_credentials(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HIREVIA_ADMIN_TOKEN", "test-admin-token")
+    configure_web_admin(monkeypatch, tmp_path)
     web_state._web_state = None
     web_state.WebUIState._instance = None
 
     try:
         with TestClient(app) as client:
             denied = client.get("/api/config")
-            allowed = client.get(
-                "/api/config", headers={"Authorization": "Bearer test-admin-token"}
-            )
+            login_web_admin(client)
+            allowed = client.get("/api/config")
 
         assert denied.status_code == 401
-        assert "test-admin-token" not in denied.text
         assert allowed.status_code == 200
-        assert "test-admin-token" not in allowed.text
+        assert "test-password-strong" not in allowed.text
     finally:
         web_state._web_state = None
         web_state.WebUIState._instance = None
 
 
+def test_nonlocal_service_accepts_secure_initial_admin_bootstrap(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HIREVIA_AUTH_DB_PATH", str(tmp_path / "auth.db"))
+    monkeypatch.setenv("HIREVIA_ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("HIREVIA_ADMIN_PASSWORD", "bootstrap-password")
+    monkeypatch.setenv("HIREVIA_COOKIE_SECURE", "true")
+    monkeypatch.setattr(cli_module, "load_config", lambda: Config())
+    monkeypatch.setattr(cli_module, "_port_owner", lambda *_args: "other-service")
+
+    result = CliRunner().invoke(cli_module.cli, ["web", "--host", "0.0.0.0"])
+
+    assert result.exit_code != 0
+    assert "configured admin authentication" not in result.output
+    assert "already occupied" in result.output
+
+
 def test_status_api_exposes_monitor_lifecycle_state(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
+    configure_web_admin(monkeypatch, tmp_path)
     web_state._web_state = None
     web_state.WebUIState._instance = None
     web_state.initialize_web_state(Config(), JobRepository(tmp_path / "status.db"))
 
     try:
         with TestClient(app) as client:
+            login_web_admin(client)
             response = client.get("/api/status")
 
         assert response.status_code == 200
@@ -199,6 +241,7 @@ def test_status_api_exposes_monitor_lifecycle_state(monkeypatch, tmp_path):
 
 def test_stats_api_exposes_matching_and_priority_diagnostics(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
+    configure_web_admin(monkeypatch, tmp_path)
     web_state._web_state = None
     web_state.WebUIState._instance = None
     state = web_state.initialize_web_state(Config(), JobRepository(tmp_path / "stats.db"))
@@ -213,6 +256,7 @@ def test_stats_api_exposes_matching_and_priority_diagnostics(monkeypatch, tmp_pa
 
     try:
         with TestClient(app) as client:
+            login_web_admin(client)
             response = client.get("/api/stats")
 
         assert response.status_code == 200
@@ -748,6 +792,8 @@ def test_telegram_first_launch_without_session_blocks_monitor_start(monkeypatch,
     from hirevia.sources.telegram_config import TelegramAuthError
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setenv("TELEGRAM_SESSION_NAME", "web-state-test")
     web_state._web_state = None
     web_state.WebUIState._instance = None
 
@@ -771,6 +817,7 @@ def test_telegram_first_launch_without_session_blocks_monitor_start(monkeypatch,
         assert state.scanner_task is None
         assert state.monitor_start_error == "Connect a Telegram account before starting monitoring"
     finally:
+        state.worker_runtime.release_telegram_session()
         web_state._web_state = None
         web_state.WebUIState._instance = None
 
@@ -779,6 +826,8 @@ def test_monitor_starts_after_telegram_authentication_and_validation(monkeypatch
     from hirevia.sources import telegram_source
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setenv("TELEGRAM_SESSION_NAME", "web-state-test")
     (tmp_path / "telegram.yaml").write_text(
         "telegram:\n  channels:\n    - username: jobs_alpha\n", encoding="utf-8"
     )
@@ -853,6 +902,7 @@ def test_monitor_starts_after_telegram_authentication_and_validation(monkeypatch
         asyncio.run(start_then_stop())
         assert state.is_running is False
     finally:
+        state.worker_runtime.release_telegram_session()
         web_state._web_state = None
         web_state.WebUIState._instance = None
 
@@ -1429,9 +1479,11 @@ def test_service_startup_preserves_session_and_closes_clients(monkeypatch, tmp_p
         Config(), JobRepository(tmp_path / "startup-session.db")
     )
     app.state.auto_start_monitoring = False
+    configure_web_admin(monkeypatch, tmp_path)
 
     try:
         with TestClient(app) as client:
+            login_web_admin(client)
             status = client.get("/api/telegram/config").json()
 
         assert closed == [True, True]

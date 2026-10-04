@@ -23,6 +23,7 @@ wheels/
 # Virtual environments
 .venv/
 .env
+*.env.lock
 venv/
 env/
 ENV/

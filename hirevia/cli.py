@@ -299,10 +299,29 @@ def _run_web_service(host: Optional[str] = None, port: Optional[int] = None) -> 
         loopback = ipaddress.ip_address(host).is_loopback
     except ValueError:
         loopback = host.casefold() == "localhost"
-    if not loopback and not os.getenv("HIREVIA_ADMIN_TOKEN", "").strip():
-        raise click.ClickException(
-            "Non-local web binding requires HIREVIA_ADMIN_TOKEN; use a TLS reverse proxy for remote access"
+    if not loopback:
+        from hirevia.web.auth import admin_exists
+
+        production = os.getenv("HIREVIA_ENV", "").strip().casefold() == "production"
+        cookie_secure = os.getenv("HIREVIA_COOKIE_SECURE")
+        if cookie_secure is None:
+            cookie_secure = production
+        else:
+            cookie_secure = cookie_secure.strip().casefold() not in {"0", "false", "no", "off", ""}
+        if not cookie_secure:
+            raise click.ClickException(
+                "Non-local web binding requires HIREVIA_COOKIE_SECURE=true and a TLS reverse proxy"
+            )
+
+        bootstrap_configured = bool(os.getenv("HIREVIA_ADMIN_EMAIL")) and (
+            os.getenv("HIREVIA_ADMIN_PASSWORD") is not None
+            or bool(os.getenv("HIREVIA_ADMIN_PASSWORD_HASH"))
         )
+        session_secret_valid = len(os.getenv("HIREVIA_SESSION_SECRET", "").encode("utf-8")) >= 32
+        if not bootstrap_configured and not (admin_exists() and session_secret_valid):
+            raise click.ClickException(
+                "Non-local web binding requires configured admin authentication"
+            )
     owner = _port_owner(host, port)
     if owner:
         if owner == "hirevia-web":
@@ -339,6 +358,60 @@ def _run_web_service(host: Optional[str] = None, port: Optional[int] = None) -> 
 def web(host: Optional[str], port: Optional[int]) -> None:
     """Run the web interface for administration or debugging."""
     run_service(host, port)
+
+
+@cli.group()
+def auth() -> None:
+    """Configure admin access for the web dashboard."""
+
+
+@auth.command("create-admin")
+@click.option(
+    "--env-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=Path(".env"),
+    show_default=True,
+    help="Environment file used by the web service.",
+)
+def auth_create_admin(env_file: Path) -> None:
+    """Set the initial admin email and Argon2id password hash."""
+    import secrets
+
+    from dotenv import dotenv_values, set_key, unset_key
+
+    from hirevia.web.auth import admin_exists, create_initial_admin
+
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_values = dotenv_values(env_file)
+    configured_db = (
+        env_values.get("HIREVIA_AUTH_DB_PATH")
+        or os.getenv("HIREVIA_AUTH_DB_PATH")
+        or str(env_file.parent / "hirevia_auth.db")
+    )
+    database_path = Path(configured_db).expanduser()
+    if not database_path.is_absolute():
+        database_path = (env_file.parent / database_path).resolve()
+    if admin_exists(database_path):
+        raise click.ClickException("An admin already exists; existing credentials were not changed")
+
+    email = click.prompt("Admin email").strip().casefold()
+    if not email or len(email) > 254 or "@" not in email:
+        raise click.ClickException("Enter a valid admin email address")
+    password = click.prompt("Admin password", hide_input=True, confirmation_prompt=True)
+
+    env_file.touch(mode=0o600, exist_ok=True)
+    if not create_initial_admin(email, password=password, database_path=database_path):
+        raise click.ClickException("An admin already exists; existing credentials were not changed")
+    set_key(str(env_file), "HIREVIA_ADMIN_EMAIL", email)
+    set_key(str(env_file), "HIREVIA_AUTH_DB_PATH", str(database_path))
+    if not dotenv_values(env_file).get("HIREVIA_SESSION_SECRET"):
+        set_key(str(env_file), "HIREVIA_SESSION_SECRET", secrets.token_urlsafe(48))
+    if "HIREVIA_ADMIN_PASSWORD" in dotenv_values(env_file):
+        unset_key(str(env_file), "HIREVIA_ADMIN_PASSWORD")
+    os.environ.pop("HIREVIA_ADMIN_PASSWORD", None)
+    if os.name != "nt":
+        env_file.chmod(0o600)
+    click.echo(f"Initial admin created in the auth database. No plaintext password was written.")
 
 
 @cli.group(invoke_without_command=True)

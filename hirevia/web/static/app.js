@@ -4,7 +4,6 @@ const $ = (id) => document.getElementById(id);
 const state = { priority: "", matchStatus: "", search: "", page: 0, limit: 25, total: 0, jobs: [], status: null, configFile: null, ai: null, telegram: null, telegramMembership: null };
 let searchTimer;
 let toastTimer;
-let adminTokenPrompt;
 let telegramResendTimer;
 
 function node(tag, className, text) {
@@ -14,26 +13,32 @@ function node(tag, className, text) {
   return element;
 }
 
-async function api(path, options = {}, promptForToken = true) {
-  const token = sessionStorage.getItem("hireviaAdminToken");
+async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
-    headers: { Accept: "application/json", ...(options.body ? { "Content-Type": "application/json" } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.headers || {}) },
+    credentials: "same-origin",
+    headers: { Accept: "application/json", ...(options.body ? { "Content-Type": "application/json" } : {}), ...(options.headers || {}) },
   });
-  if (response.status === 401 && promptForToken) {
-    sessionStorage.removeItem("hireviaAdminToken");
-    adminTokenPrompt ||= Promise.resolve(window.prompt("Hirevia admin token"));
-    const entered = await adminTokenPrompt;
-    adminTokenPrompt = null;
-    if (entered) {
-      sessionStorage.setItem("hireviaAdminToken", entered);
-      return api(path, options, false);
-    }
-  }
   let payload = null;
   try { payload = await response.json(); } catch (_) { /* retain status text */ }
+  if (response.status === 401) {
+    window.location.replace("/login");
+    throw new Error("Your session has expired. Sign in again.");
+  }
   if (!response.ok) throw new Error(payload?.detail || `HTTP ${response.status}`);
   return payload;
+}
+
+async function logoutAdmin() {
+  const button = $("adminLogout");
+  button.disabled = true;
+  try {
+    await fetch("/auth/logout", { method: "POST", credentials: "same-origin", headers: { Accept: "application/json" } });
+    window.location.replace("/login");
+  } catch (_) {
+    button.disabled = false;
+    notify("Could not sign out. Please try again.");
+  }
 }
 
 function notify(message) {
@@ -636,6 +641,7 @@ function bind() {
   }));
   $("railToggle").addEventListener("click", () => $("shell").classList.toggle("collapsed"));
   $("mobileRailToggle").addEventListener("click", () => $("shell").classList.toggle("mobile-open"));
+  $("adminLogout").addEventListener("click", logoutAdmin);
   $("jobSearch").addEventListener("input", () => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(async () => {
